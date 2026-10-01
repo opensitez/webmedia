@@ -102,6 +102,31 @@ const B_SUB_MB_TYPE_CODES: [&str; 13] = [
     "11110", "11111",
 ];
 
+const fn code_tree<const N: usize>(codes: [&str; N]) -> [i8; 256] {
+    let mut tree = [-1; 256];
+    tree[1] = 0;
+    let mut kind = 0;
+    while kind < N {
+        let code = codes[kind].as_bytes();
+        let mut node = 1;
+        let mut bit = 0;
+        while bit < code.len() {
+            node = node * 2 + (code[bit] == b'1') as usize;
+            if tree[node] == -1 {
+                tree[node] = 0;
+            }
+            bit += 1;
+        }
+        tree[node] = (kind + 1) as i8;
+        kind += 1;
+    }
+    tree
+}
+
+const INTRA_MB_TYPE_TREE: [i8; 256] = code_tree(INTRA_MB_TYPE_CODES);
+const B_MB_TYPE_TREE: [i8; 256] = code_tree(B_MB_TYPE_CODES);
+const B_SUB_MB_TYPE_TREE: [i8; 256] = code_tree(B_SUB_MB_TYPE_CODES);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Context {
     pub state: u8,
@@ -132,6 +157,8 @@ impl Context {
 pub struct CabacDecoder<'a> {
     rbsp: &'a [u8],
     bit: usize,
+    current_byte: u8,
+    bits_remaining: u8,
     range: u32,
     offset: u32,
 }
@@ -2181,8 +2208,8 @@ impl CabacDecoder<'_> {
                     break;
                 }
                 magnitude_minus1 += 1;
-                if magnitude_minus1 == 14 {
-                    let mut extra_bits = 0u32;
+            if magnitude_minus1 == 14 {
+                let mut extra_bits = 0u32;
                     while self.bypass()? != 0 {
                         extra_bits += 1;
                         if extra_bits > 20 {
@@ -2367,21 +2394,24 @@ impl CabacDecoder<'_> {
         if self.terminate()? {
             return Ok(25);
         }
-        let mut code = String::from("10");
-        while code.len() < 7 {
-            let bin_idx = code.len();
+        let mut code = [0u8; 7];
+        code[..2].copy_from_slice(b"10");
+        let mut code_len = 2;
+        let mut node = 6usize;
+        while code_len < 7 {
+            let bin_idx = code_len;
             let ctx_idx = match bin_idx {
                 2 => 6,
                 3 => 7,
                 4 => {
-                    if code.as_bytes()[3] == b'1' {
+                    if code[3] == b'1' {
                         8
                     } else {
                         9
                     }
                 }
                 5 => {
-                    if code.as_bytes()[3] == b'1' {
+                    if code[3] == b'1' {
                         9
                     } else {
                         10
@@ -2390,17 +2420,14 @@ impl CabacDecoder<'_> {
                 _ => 10,
             };
             let bit = self.decision(&mut contexts.0[ctx_idx - 3])?;
-            code.push(char::from(b'0' + bit));
-            if let Some(kind) = INTRA_MB_TYPE_CODES
-                .iter()
-                .position(|candidate| *candidate == code)
-            {
-                return Ok(kind as u8);
+            code[code_len] = b'0' + bit;
+            code_len += 1;
+            node = node * 2 + bit as usize;
+            let kind = INTRA_MB_TYPE_TREE[node];
+            if kind > 0 {
+                return Ok((kind - 1) as u8);
             }
-            if !INTRA_MB_TYPE_CODES
-                .iter()
-                .any(|candidate| candidate.starts_with(&code))
-            {
+            if kind < 0 {
                 return Err(AvcError::InvalidData("invalid CABAC I macroblock type"));
             }
         }
@@ -2507,27 +2534,27 @@ impl<'a> CabacDecoder<'a> {
             if self.terminate()? {
                 return Ok(30);
             }
-            let mut code = String::from("10");
-            while code.len() < 7 {
-                let bin_idx = code.len();
+            let mut code = [0u8; 7];
+            code[..2].copy_from_slice(b"10");
+            let mut code_len = 2;
+            let mut node = 6usize;
+            while code_len < 7 {
+                let bin_idx = code_len;
                 let context = match bin_idx {
                     2 => 1,
                     3 => 2,
-                    4 if code.as_bytes()[3] == b'1' => 2,
+                    4 if code[3] == b'1' => 2,
                     _ => 3,
                 };
                 let bit = self.decision(&mut contexts.p_intra_type[context - 1])?;
-                code.push(char::from(b'0' + bit));
-                if let Some(kind) = INTRA_MB_TYPE_CODES
-                    .iter()
-                    .position(|candidate| *candidate == code)
-                {
-                    return Ok(kind as u8 + 5);
+                code[code_len] = b'0' + bit;
+                code_len += 1;
+                node = node * 2 + bit as usize;
+                let kind = INTRA_MB_TYPE_TREE[node];
+                if kind > 0 {
+                    return Ok((kind - 1) as u8 + 5);
                 }
-                if !INTRA_MB_TYPE_CODES
-                    .iter()
-                    .any(|candidate| candidate.starts_with(&code))
-                {
+                if kind < 0 {
                     return Err(AvcError::InvalidData("invalid CABAC P intra type"));
                 }
             }
@@ -2559,6 +2586,7 @@ impl<'a> CabacDecoder<'a> {
         let mut code = [0u8; 7];
         code[0] = b'1';
         let mut code_len = 1;
+        let mut node = 3usize;
         while code_len < code.len() {
             let bin_idx = code_len;
             let context = match bin_idx {
@@ -2569,11 +2597,10 @@ impl<'a> CabacDecoder<'a> {
             let bit = self.decision(&mut contexts.b_type[context])?;
             code[code_len] = b'0' + bit;
             code_len += 1;
-            let prefix = &code[..code_len];
-            if let Some(kind) = B_MB_TYPE_CODES
-                .iter()
-                .position(|candidate| candidate.as_bytes() == prefix)
-            {
+            node = node * 2 + bit as usize;
+            let kind = B_MB_TYPE_TREE[node];
+            if kind > 0 {
+                let kind = (kind - 1) as usize;
                 if kind != 23 {
                     return Ok(kind as u8);
                 }
@@ -2586,6 +2613,7 @@ impl<'a> CabacDecoder<'a> {
                 let mut suffix = [0u8; 7];
                 suffix[..2].copy_from_slice(b"10");
                 let mut suffix_len = 2;
+                let mut suffix_node = 6usize;
                 while suffix_len < suffix.len() {
                     let suffix_bin = suffix_len;
                     let suffix_context = match suffix_bin {
@@ -2597,26 +2625,18 @@ impl<'a> CabacDecoder<'a> {
                     let value = self.decision(&mut contexts.b_type[suffix_context])?;
                     suffix[suffix_len] = b'0' + value;
                     suffix_len += 1;
-                    let suffix_prefix = &suffix[..suffix_len];
-                    if let Some(intra_kind) = INTRA_MB_TYPE_CODES
-                        .iter()
-                        .position(|candidate| candidate.as_bytes() == suffix_prefix)
-                    {
-                        return Ok(23 + intra_kind as u8);
+                    suffix_node = suffix_node * 2 + value as usize;
+                    let intra_kind = INTRA_MB_TYPE_TREE[suffix_node];
+                    if intra_kind > 0 {
+                        return Ok(22 + intra_kind as u8);
                     }
-                    if !INTRA_MB_TYPE_CODES
-                        .iter()
-                        .any(|candidate| candidate.as_bytes().starts_with(suffix_prefix))
-                    {
+                    if intra_kind < 0 {
                         return Err(AvcError::InvalidData("invalid CABAC B intra type"));
                     }
                 }
                 return Err(AvcError::InvalidData("CABAC B intra type too long"));
             }
-            if !B_MB_TYPE_CODES
-                .iter()
-                .any(|candidate| candidate.as_bytes().starts_with(prefix))
-            {
+            if kind < 0 {
                 return Err(AvcError::InvalidData("invalid CABAC B macroblock type"));
             }
         }
@@ -2631,25 +2651,22 @@ impl<'a> CabacDecoder<'a> {
         let mut code = [0u8; 6];
         code[0] = b'1';
         let mut code_len = 1;
+        let mut node = 3usize;
         while code_len < code.len() {
             let context = match code_len {
                 1 => 1,
                 2 if code[1] != b'0' => 2,
                 _ => 3,
             };
-            code[code_len] = b'0' + self.decision(&mut contexts.b_sub_type[context])?;
+            let bit = self.decision(&mut contexts.b_sub_type[context])?;
+            code[code_len] = b'0' + bit;
             code_len += 1;
-            let prefix = &code[..code_len];
-            if let Some(kind) = B_SUB_MB_TYPE_CODES
-                .iter()
-                .position(|candidate| candidate.as_bytes() == prefix)
-            {
-                return Ok(kind as u8);
+            node = node * 2 + bit as usize;
+            let kind = B_SUB_MB_TYPE_TREE[node];
+            if kind > 0 {
+                return Ok((kind - 1) as u8);
             }
-            if !B_SUB_MB_TYPE_CODES
-                .iter()
-                .any(|candidate| candidate.as_bytes().starts_with(prefix))
-            {
+            if kind < 0 {
                 return Err(AvcError::InvalidData("invalid CABAC B sub-macroblock type"));
             }
         }
@@ -2677,6 +2694,8 @@ impl<'a> CabacDecoder<'a> {
         let mut decoder = Self {
             rbsp,
             bit: 0,
+            current_byte: 0,
+            bits_remaining: 0,
             range: 0x1fe,
             offset: 0,
         };
@@ -2687,16 +2706,40 @@ impl<'a> CabacDecoder<'a> {
     }
 
     fn read_bit(&mut self) -> Result<u8, AvcError> {
-        let byte = *self.rbsp.get(self.bit / 8).ok_or(AvcError::Incomplete)?;
-        let bit = (byte >> (7 - self.bit % 8)) & 1;
+        if self.bits_remaining == 0 {
+            self.current_byte = *self.rbsp.get(self.bit / 8).ok_or(AvcError::Incomplete)?;
+            self.bits_remaining = 8;
+        }
+        let bit = self.current_byte >> 7;
+        self.current_byte <<= 1;
+        self.bits_remaining -= 1;
         self.bit += 1;
         Ok(bit)
     }
 
+    fn read_bits(&mut self, mut count: u32) -> Result<u32, AvcError> {
+        debug_assert!(count <= 7);
+        let mut value = 0u32;
+        while count != 0 {
+            if self.bits_remaining == 0 {
+                self.current_byte = *self.rbsp.get(self.bit / 8).ok_or(AvcError::Incomplete)?;
+                self.bits_remaining = 8;
+            }
+            let take = count.min(u32::from(self.bits_remaining));
+            value = (value << take) | u32::from(self.current_byte >> (8 - take));
+            self.current_byte <<= take;
+            self.bits_remaining -= take as u8;
+            self.bit += take as usize;
+            count -= take;
+        }
+        Ok(value)
+    }
+
     fn renormalize(&mut self) -> Result<(), AvcError> {
-        while self.range < 0x100 {
-            self.range <<= 1;
-            self.offset = (self.offset << 1) | u32::from(self.read_bit()?);
+        if self.range < 0x100 {
+            let shift = self.range.leading_zeros() - 23;
+            self.range <<= shift;
+            self.offset = (self.offset << shift) | self.read_bits(shift)?;
         }
         Ok(())
     }
@@ -2753,6 +2796,61 @@ impl<'a> CabacDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macroblock_code_trees_preserve_codewords_and_prefixes() {
+        for (codes, tree) in [
+            (&INTRA_MB_TYPE_CODES[..], &INTRA_MB_TYPE_TREE),
+            (&B_MB_TYPE_CODES[..], &B_MB_TYPE_TREE),
+            (&B_SUB_MB_TYPE_CODES[..], &B_SUB_MB_TYPE_TREE),
+        ] {
+            for (kind, code) in codes.iter().enumerate() {
+                let mut node = 1usize;
+                for (index, bit) in code.bytes().enumerate() {
+                    node = node * 2 + usize::from(bit == b'1');
+                    assert_eq!(tree[node], if index + 1 == code.len() { kind as i8 + 1 } else { 0 });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_bits_match_single_bits_across_byte_boundaries() {
+        let bytes = [0xa5, 0x17, 0xe3, 0x6c, 0x91, 0x4b, 0xd0];
+        for prefix in 0..8 {
+            for count in 1..=7 {
+                let mut single = CabacDecoder::new(&bytes).unwrap();
+                let mut batch = CabacDecoder::new(&bytes).unwrap();
+                for _ in 0..prefix {
+                    assert_eq!(single.read_bit().unwrap(), batch.read_bit().unwrap());
+                }
+                let mut expected = 0u32;
+                for _ in 0..count {
+                    expected = (expected << 1) | u32::from(single.read_bit().unwrap());
+                }
+                assert_eq!(batch.read_bits(count).unwrap(), expected);
+                assert_eq!(batch.consumed_bits(), single.consumed_bits());
+                assert_eq!(batch.read_bit().unwrap(), single.read_bit().unwrap());
+            }
+        }
+        let mut truncated = CabacDecoder::new(&bytes[..2]).unwrap();
+        truncated.read_bit().unwrap();
+        assert!(matches!(truncated.read_bits(7), Err(AvcError::Incomplete)));
+    }
+
+    #[test]
+    #[ignore = "run explicitly when measuring CABAC bit input"]
+    fn benchmark_cabac_bit_input() {
+        let bytes = vec![0xa5u8; 1024 * 1024];
+        let start = std::time::Instant::now();
+        let mut decoder = CabacDecoder::new(&bytes).unwrap();
+        let mut sum = 0u64;
+        for _ in 0..(bytes.len() * 8 - 9) {
+            sum += u64::from(decoder.read_bit().unwrap());
+        }
+        std::hint::black_box(sum);
+        eprintln!("CABAC {} bits: {:?}", decoder.consumed_bits(), start.elapsed());
+    }
 
     #[test]
     fn inter_luma16_ac_contexts_follow_2005_initialization_tables() {

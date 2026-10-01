@@ -460,12 +460,15 @@ pub fn decode_cabac_p_2005(
     let slice = parse_cabac_inter_slice(nal, sps, &pps.core)?;
     if std::env::var_os("WEBMEDIA_TRACE_P").is_some() {
         eprintln!(
-            "P header: type={} first_mb={} active_refs={} available_refs={} frame_num={} reorder={:?} reference_frames={:?}",
+            "P header: type={} first_mb={} active_refs={} available_refs={} frame_num={} poc_lsb={} qp={} cabac_init={} reorder={:?} reference_frames={:?}",
             slice.slice_type,
             slice.first_mb,
             slice.ref_idx_l0,
             references.len(),
             slice.frame_num,
+            slice.pic_order_cnt_lsb,
+            slice.slice_qp,
+            slice.cabac_init_idc,
             slice.reorder_l0,
             references
                 .iter()
@@ -532,6 +535,9 @@ pub fn decode_cabac_p_2005(
     let mut qp_contexts = MbQpContexts::new(slice.slice_qp)?;
     let mut qp = slice.slice_qp;
     let mut previous_qp_delta_nonzero = false;
+    let trace_failing_p = std::env::var_os("WEBMEDIA_TRACE_P_MB").is_some()
+        && slice.frame_num == 9
+        && matches!(slice.pic_order_cnt_lsb, 2 | 40);
     for y in 0..height_mbs {
         for x in 0..width_mbs {
             let index = y * width_mbs + x;
@@ -548,6 +554,13 @@ pub fn decode_cabac_p_2005(
                 left.map(|mb| mb.skipped),
                 above.map(|mb| mb.skipped),
             )?;
+            if trace_failing_p
+                && (slice.pic_order_cnt_lsb == 40 && index <= 130
+                    || slice.pic_order_cnt_lsb == 2
+                        && ((460..=470).contains(&index) || (580..=604).contains(&index)))
+            {
+                eprintln!("P MB {index}: skipped={skipped} bits={}", decoder.consumed_bits());
+            }
             let above_bottom = above
                 .filter(|mb| !mb.intra16 && !mb.intra_nxn)
                 .map(|mb| mb.motion[2]);
@@ -606,6 +619,13 @@ pub fn decode_cabac_p_2005(
                 )
             } else {
                 let kind = decoder.p_inter_mb_type(&mut inter)?;
+                if trace_failing_p
+                    && (slice.pic_order_cnt_lsb == 40 && index <= 130
+                        || slice.pic_order_cnt_lsb == 2
+                            && ((460..=470).contains(&index) || (580..=604).contains(&index)))
+                {
+                    eprintln!("P MB {index}: kind={kind} bits={}", decoder.consumed_bits());
+                }
                 if kind >= 5 {
                     let intra_kind = kind - 5;
                     if intra_kind == 0 {
@@ -787,6 +807,9 @@ pub fn decode_cabac_p_2005(
                         });
                         let ended = decoder.terminate()?;
                         if ended != (index + 1 == states.len()) {
+                            if std::env::var_os("WEBMEDIA_TRACE_P").is_some() {
+                                eprintln!("P slice ended={ended} at MB {index}, bits={}", decoder.consumed_bits());
+                            }
                             return Err(AvcError::Unsupported(
                                 "P picture has multiple or incomplete slices",
                             ));
@@ -912,6 +935,9 @@ pub fn decode_cabac_p_2005(
                     });
                     let ended = decoder.terminate()?;
                     if ended != (index + 1 == states.len()) {
+                        if std::env::var_os("WEBMEDIA_TRACE_P").is_some() {
+                            eprintln!("P slice ended={ended} at MB {index}, bits={}", decoder.consumed_bits());
+                        }
                         return Err(AvcError::Unsupported(
                             "P picture has multiple or incomplete slices",
                         ));
@@ -1400,6 +1426,9 @@ pub fn decode_cabac_p_2005(
             });
             let ended = decoder.terminate()?;
             if ended != (index + 1 == states.len()) {
+                if std::env::var_os("WEBMEDIA_TRACE_P").is_some() {
+                    eprintln!("P slice ended={ended} at MB {index}, bits={}", decoder.consumed_bits());
+                }
                 return Err(AvcError::Unsupported(
                     "P picture has multiple or incomplete slices",
                 ));
@@ -1544,6 +1573,9 @@ pub fn decode_cabac_b_2005(
             last_reference.pic_order_cnt_lsb,
         )),
     )?;
+    if std::env::var_os("WEBMEDIA_TRACE_B").is_some() {
+        eprintln!("B picture poc={poc} poc_lsb={}", slice.pic_order_cnt_lsb);
+    }
     let (list0, list1) = b_reference_lists(references, poc);
     if list0.len() < slice.ref_idx_l0 as usize || list1.len() < slice.ref_idx_l1 as usize {
         return Err(AvcError::Unsupported("B reference list length"));
@@ -1795,6 +1827,12 @@ pub fn decode_cabac_b_2005(
                 });
                 let ended = decoder.terminate()?;
                 if ended != (index + 1 == states.len()) {
+                    if trace_b {
+                        eprintln!(
+                            "B intra-nxn termination at {index}: ended={ended} bits={}",
+                            decoder.consumed_bits()
+                        );
+                    }
                     return Err(AvcError::Unsupported(
                         "B picture has multiple or incomplete slices",
                     ));
@@ -2220,45 +2258,32 @@ pub fn decode_cabac_b_2005(
                     )?;
                 }
             }
-            let mut predicted = [(); 4].map(|_| InterMacroblock {
-                luma: [0; 256],
-                cb: [0; 64],
-                cr: [0; 64],
-            });
-            for region in 0..4 {
-                let list0_block = if let Some((ref_index, vector)) = motion[region].l0 {
+            let mut block = if motion.iter().all(|&cell| cell == motion[0]) {
+                let list0_block = if let Some((ref_index, vector)) = motion[0].l0 {
                     let source = list0
                         .get(ref_index as usize)
                         .ok_or(AvcError::Unsupported("B list0 index"))?;
-                    Some(predict_inter_8x8(
-                        &references[*source],
-                        x,
-                        y,
-                        vector,
-                        region,
+                    Some(predict_inter_16x16(
+                        &references[*source], x, y, vector, None, 0, ref_index as usize,
                     )?)
                 } else {
                     None
                 };
-                let list1_block = if let Some((ref_index, vector)) = motion[region].l1 {
+                let list1_block = if let Some((ref_index, vector)) = motion[0].l1 {
                     let source = list1
                         .get(ref_index as usize)
                         .ok_or(AvcError::Unsupported("B list1 index"))?;
-                    Some(predict_inter_8x8(
-                        &references[*source],
-                        x,
-                        y,
-                        vector,
-                        region,
+                    Some(predict_inter_16x16(
+                        &references[*source], x, y, vector, None, 1, ref_index as usize,
                     )?)
                 } else {
                     None
                 };
-                predicted[region] = match (list0_block, list1_block) {
+                match (list0_block, list1_block) {
                     (Some(block0), Some(block1)) => {
                         let weights = if pps.core.weighted_bipred_idc == 2 {
-                            let source0 = list0[motion[region].l0.unwrap().0 as usize];
-                            let source1 = list1[motion[region].l1.unwrap().0 as usize];
+                            let source0 = list0[motion[0].l0.unwrap().0 as usize];
+                            let source1 = list1[motion[0].l1.unwrap().0 as usize];
                             Some(implicit_b_weights(
                                 poc,
                                 references[source0].pic_order_cnt,
@@ -2267,15 +2292,61 @@ pub fn decode_cabac_b_2005(
                         } else {
                             None
                         };
-                        blend_b_region(&block0, &block1, region, weights)
+                        blend_b_macroblocks(&block0, &block1, weights)
                     }
                     (Some(block), None) | (None, Some(block)) => block,
-                    (None, None) => {
-                        return Err(AvcError::InvalidData("B block without prediction"));
-                    }
-                };
-            }
-            let mut block = combine_8x8(&predicted);
+                    (None, None) => return Err(AvcError::InvalidData("B block without prediction")),
+                }
+            } else {
+                let mut predicted = [InterRegion {
+                    luma: [0; 64],
+                    cb: [0; 16],
+                    cr: [0; 16],
+                }; 4];
+                for region in 0..4 {
+                    let list0_block = if let Some((ref_index, vector)) = motion[region].l0 {
+                        let source = list0
+                            .get(ref_index as usize)
+                            .ok_or(AvcError::Unsupported("B list0 index"))?;
+                        Some(predict_inter_8x8_region(
+                            &references[*source], x, y, vector, region,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let list1_block = if let Some((ref_index, vector)) = motion[region].l1 {
+                        let source = list1
+                            .get(ref_index as usize)
+                            .ok_or(AvcError::Unsupported("B list1 index"))?;
+                        Some(predict_inter_8x8_region(
+                            &references[*source], x, y, vector, region,
+                        )?)
+                    } else {
+                        None
+                    };
+                    predicted[region] = match (list0_block, list1_block) {
+                        (Some(block0), Some(block1)) => {
+                            let weights = if pps.core.weighted_bipred_idc == 2 {
+                                let source0 = list0[motion[region].l0.unwrap().0 as usize];
+                                let source1 = list1[motion[region].l1.unwrap().0 as usize];
+                                Some(implicit_b_weights(
+                                    poc,
+                                    references[source0].pic_order_cnt,
+                                    references[source1].pic_order_cnt,
+                                ))
+                            } else {
+                                None
+                            };
+                            blend_b_compact(&block0, &block1, weights)
+                        }
+                        (Some(block), None) | (None, Some(block)) => block,
+                        (None, None) => {
+                            return Err(AvcError::InvalidData("B block without prediction"));
+                        }
+                    };
+                }
+                assemble_inter_regions(&predicted)
+            };
             add_luma_residual(&mut block, &luma_residual, qp)?;
             if coded.chroma != 0 {
                 add_chroma_residual(
@@ -2393,6 +2464,37 @@ pub struct InterMacroblock {
     pub cr: [u8; 64],
 }
 
+#[derive(Clone, Copy)]
+struct InterRegion {
+    luma: [u8; 64],
+    cb: [u8; 16],
+    cr: [u8; 16],
+}
+
+fn assemble_inter_regions(regions: &[InterRegion; 4]) -> InterMacroblock {
+    let mut block = InterMacroblock {
+        luma: [0; 256],
+        cb: [0; 64],
+        cr: [0; 64],
+    };
+    for (region, part) in regions.iter().enumerate() {
+        let luma_x = region % 2 * 8;
+        let luma_y = region / 2 * 8;
+        let chroma_x = region % 2 * 4;
+        let chroma_y = region / 2 * 4;
+        for row in 0..8 {
+            let target = (luma_y + row) * 16 + luma_x;
+            block.luma[target..target + 8].copy_from_slice(&part.luma[row * 8..row * 8 + 8]);
+        }
+        for row in 0..4 {
+            let target = (chroma_y + row) * 8 + chroma_x;
+            block.cb[target..target + 4].copy_from_slice(&part.cb[row * 4..row * 4 + 4]);
+            block.cr[target..target + 4].copy_from_slice(&part.cr[row * 4..row * 4 + 4]);
+        }
+    }
+    block
+}
+
 /// H.264 8.4.2.3.2, implicit weighting for two short-term frame references.
 pub(super) fn implicit_b_weights(current_poc: i32, poc0: i32, poc1: i32) -> (i32, i32) {
     let td = (poc1 - poc0).clamp(-128, 127);
@@ -2410,12 +2512,12 @@ pub(super) fn implicit_b_weights(current_poc: i32, poc0: i32, poc1: i32) -> (i32
     }
 }
 
-#[cfg(test)]
 pub(super) fn blend_b_macroblocks(
     list0: &InterMacroblock,
     list1: &InterMacroblock,
     weights: Option<(i32, i32)>,
 ) -> InterMacroblock {
+    #[cfg(not(target_arch = "aarch64"))]
     let blend = |a: u8, b: u8| -> u8 {
         match weights {
             Some((w0, w1)) => {
@@ -2429,22 +2531,31 @@ pub(super) fn blend_b_macroblocks(
         cb: [0; 64],
         cr: [0; 64],
     };
-    for (output, (&a, &b)) in block
-        .luma
-        .iter_mut()
-        .zip(list0.luma.iter().zip(&list1.luma))
-    {
-        *output = blend(a, b);
-    }
-    for (output, (&a, &b)) in block.cb.iter_mut().zip(list0.cb.iter().zip(&list1.cb)) {
-        *output = blend(a, b);
-    }
-    for (output, (&a, &b)) in block.cr.iter_mut().zip(list0.cr.iter().zip(&list1.cr)) {
-        *output = blend(a, b);
+    for (output, first, second) in [
+        (&mut block.luma[..], &list0.luma[..], &list1.luma[..]),
+        (&mut block.cb[..], &list0.cb[..], &list1.cb[..]),
+        (&mut block.cr[..], &list0.cr[..], &list1.cr[..]),
+    ] {
+        #[cfg(target_arch = "aarch64")]
+        for start in (0..output.len()).step_by(8) {
+            unsafe {
+                blend_b_luma_row_neon(
+                    &first[start..start + 8],
+                    &second[start..start + 8],
+                    &mut output[start..start + 8],
+                    weights,
+                );
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        for (target, (&a, &b)) in output.iter_mut().zip(first.iter().zip(second)) {
+            *target = blend(a, b);
+        }
     }
     block
 }
 
+#[cfg(test)]
 fn blend_b_region(
     list0: &InterMacroblock,
     list1: &InterMacroblock,
@@ -2468,6 +2579,16 @@ fn blend_b_region(
     let y = region / 2;
     for row in 0..8 {
         let start = (y * 8 + row) * 16 + x * 8;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            blend_b_luma_row_neon(
+                &list0.luma[start..start + 8],
+                &list1.luma[start..start + 8],
+                &mut block.luma[start..start + 8],
+                weights,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         for offset in start..start + 8 {
             block.luma[offset] = blend(list0.luma[offset], list1.luma[offset]);
         }
@@ -2480,6 +2601,84 @@ fn blend_b_region(
         }
     }
     block
+}
+
+fn blend_b_compact(
+    list0: &InterRegion,
+    list1: &InterRegion,
+    weights: Option<(i32, i32)>,
+) -> InterRegion {
+    let blend = |a: u8, b: u8| -> u8 {
+        match weights {
+            Some((w0, w1)) => {
+                ((i32::from(a) * w0 + i32::from(b) * w1 + 32) >> 6).clamp(0, 255) as u8
+            }
+            None => ((u16::from(a) + u16::from(b) + 1) >> 1) as u8,
+        }
+    };
+    let mut block = InterRegion {
+        luma: [0; 64],
+        cb: [0; 16],
+        cr: [0; 16],
+    };
+    for row in 0..8 {
+        let start = row * 8;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            blend_b_luma_row_neon(
+                &list0.luma[start..start + 8],
+                &list1.luma[start..start + 8],
+                &mut block.luma[start..start + 8],
+                weights,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        for index in start..start + 8 {
+            block.luma[index] = blend(list0.luma[index], list1.luma[index]);
+        }
+    }
+    for index in 0..16 {
+        block.cb[index] = blend(list0.cb[index], list1.cb[index]);
+        block.cr[index] = blend(list0.cr[index], list1.cr[index]);
+    }
+    block
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn blend_b_luma_row_neon(
+    a: &[u8],
+    b: &[u8],
+    output: &mut [u8],
+    weights: Option<(i32, i32)>,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let a = vld1_u8(a.as_ptr());
+        let b = vld1_u8(b.as_ptr());
+        let value = if let Some((w0, w1)) = weights {
+            let a = vreinterpretq_s16_u16(vmovl_u8(a));
+            let b = vreinterpretq_s16_u16(vmovl_u8(b));
+            let low = vmlal_n_s16(
+                vmull_n_s16(vget_low_s16(a), w0 as i16),
+                vget_low_s16(b),
+                w1 as i16,
+            );
+            let high = vmlal_n_s16(
+                vmull_n_s16(vget_high_s16(a), w0 as i16),
+                vget_high_s16(b),
+                w1 as i16,
+            );
+            let rounded = |sum| vshrq_n_s32::<6>(vaddq_s32(sum, vdupq_n_s32(32)));
+            vqmovun_s16(vcombine_s16(
+                vqmovn_s32(rounded(low)),
+                vqmovn_s32(rounded(high)),
+            ))
+        } else {
+            vrhadd_u8(a, b)
+        };
+        vst1_u8(output.as_mut_ptr(), value);
+    }
 }
 
 fn sample(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> i32 {
@@ -2518,6 +2717,114 @@ pub(super) struct HalfPelPlanes {
     diagonal: Vec<u8>,
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn six_tap_neon_u8(
+    taps: [std::arch::aarch64::uint8x8_t; 6],
+) -> std::arch::aarch64::int16x8_t {
+    use std::arch::aarch64::*;
+    let taps = taps.map(|tap| vreinterpretq_s16_u16(vmovl_u8(tap)));
+    vaddq_s16(
+        vsubq_s16(
+            vaddq_s16(taps[0], taps[5]),
+            vmulq_n_s16(vaddq_s16(taps[1], taps[4]), 5),
+        ),
+        vmulq_n_s16(vaddq_s16(taps[2], taps[3]), 20),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn halfpel_rows_neon(
+    plane: &[u8],
+    width: usize,
+    index: usize,
+    raw: &mut [i32],
+    horizontal_half: &mut [u8],
+    vertical_half: &mut [u8],
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let source = plane.as_ptr().add(index);
+        let horizontal = six_tap_neon_u8([
+            vld1_u8(source.sub(2)),
+            vld1_u8(source.sub(1)),
+            vld1_u8(source),
+            vld1_u8(source.add(1)),
+            vld1_u8(source.add(2)),
+            vld1_u8(source.add(3)),
+        ]);
+        let vertical = six_tap_neon_u8([
+            vld1_u8(source.sub(2 * width)),
+            vld1_u8(source.sub(width)),
+            vld1_u8(source),
+            vld1_u8(source.add(width)),
+            vld1_u8(source.add(2 * width)),
+            vld1_u8(source.add(3 * width)),
+        ]);
+        vst1q_s32(
+            raw.as_mut_ptr().add(index),
+            vmovl_s16(vget_low_s16(horizontal)),
+        );
+        vst1q_s32(
+            raw.as_mut_ptr().add(index + 4),
+            vmovl_s16(vget_high_s16(horizontal)),
+        );
+        let rounded_horizontal = vshrq_n_s16::<5>(vaddq_s16(horizontal, vdupq_n_s16(16)));
+        let rounded_vertical = vshrq_n_s16::<5>(vaddq_s16(vertical, vdupq_n_s16(16)));
+        vst1_u8(
+            horizontal_half.as_mut_ptr().add(index),
+            vqmovun_s16(rounded_horizontal),
+        );
+        vst1_u8(
+            vertical_half.as_mut_ptr().add(index),
+            vqmovun_s16(rounded_vertical),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn diagonal_row_neon(raw: &[i32], width: usize, index: usize, output: &mut [u8]) {
+    use std::arch::aarch64::*;
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn filter(taps: [int32x4_t; 6]) -> uint16x4_t {
+        let value = vaddq_s32(
+            vsubq_s32(
+                vaddq_s32(taps[0], taps[5]),
+                vmulq_n_s32(vaddq_s32(taps[1], taps[4]), 5),
+            ),
+            vmulq_n_s32(vaddq_s32(taps[2], taps[3]), 20),
+        );
+        vqmovun_s32(vshrq_n_s32::<10>(vaddq_s32(value, vdupq_n_s32(512))))
+    }
+    unsafe {
+        let source = raw.as_ptr().add(index);
+        let low = filter([
+            vld1q_s32(source.sub(2 * width)),
+            vld1q_s32(source.sub(width)),
+            vld1q_s32(source),
+            vld1q_s32(source.add(width)),
+            vld1q_s32(source.add(2 * width)),
+            vld1q_s32(source.add(3 * width)),
+        ]);
+        let source = source.add(4);
+        let high = filter([
+            vld1q_s32(source.sub(2 * width)),
+            vld1q_s32(source.sub(width)),
+            vld1q_s32(source),
+            vld1q_s32(source.add(width)),
+            vld1q_s32(source.add(2 * width)),
+            vld1q_s32(source.add(3 * width)),
+        ]);
+        vst1_u8(
+            output.as_mut_ptr().add(index),
+            vqmovn_u16(vcombine_u16(low, high)),
+        );
+    }
+}
+
 impl HalfPelPlanes {
     fn new(reference: &Yuv420Picture) -> Self {
         let width = reference.width;
@@ -2528,22 +2835,86 @@ impl HalfPelPlanes {
         let mut vertical_half = vec![0u8; width * height];
         let mut diagonal_half = vec![0u8; width * height];
         for y in 0..height {
-            for x in 0..width {
+            let mut x = 0;
+            while x < width {
                 let index = y * width + x;
-                let value = horizontal(plane, width, height, x as i32, y as i32);
+                #[cfg(target_arch = "aarch64")]
+                if y >= 2 && y + 3 < height && x >= 2 && x + 10 < width {
+                    // SAFETY: the interior bounds cover every six-tap load and eight output lanes.
+                    unsafe {
+                        halfpel_rows_neon(
+                            plane,
+                            width,
+                            index,
+                            &mut horizontal_raw,
+                            &mut horizontal_half,
+                            &mut vertical_half,
+                        );
+                    }
+                    x += 8;
+                    continue;
+                }
+                let interior = x >= 2 && x + 3 < width && y >= 2 && y + 3 < height;
+                let value = if interior {
+                    six_tap([
+                        i32::from(plane[index - 2]),
+                        i32::from(plane[index - 1]),
+                        i32::from(plane[index]),
+                        i32::from(plane[index + 1]),
+                        i32::from(plane[index + 2]),
+                        i32::from(plane[index + 3]),
+                    ])
+                } else {
+                    horizontal(plane, width, height, x as i32, y as i32)
+                };
                 horizontal_raw[index] = value;
                 horizontal_half[index] = clip((value + 16) >> 5);
-                vertical_half[index] =
-                    clip((vertical(plane, width, height, x as i32, y as i32) + 16) >> 5);
+                let vertical_value = if interior {
+                    six_tap([
+                        i32::from(plane[index - 2 * width]),
+                        i32::from(plane[index - width]),
+                        i32::from(plane[index]),
+                        i32::from(plane[index + width]),
+                        i32::from(plane[index + 2 * width]),
+                        i32::from(plane[index + 3 * width]),
+                    ])
+                } else {
+                    vertical(plane, width, height, x as i32, y as i32)
+                };
+                vertical_half[index] = clip((vertical_value + 16) >> 5);
+                x += 1;
             }
         }
         for y in 0..height {
-            for x in 0..width {
-                let taps = six_tap(std::array::from_fn(|i| {
-                    horizontal_raw
-                        [(y as i32 + i as i32 - 2).clamp(0, height as i32 - 1) as usize * width + x]
-                }));
+            let mut x = 0;
+            while x < width {
+                let index = y * width + x;
+                #[cfg(target_arch = "aarch64")]
+                if y >= 2 && y + 3 < height && x + 8 <= width {
+                    // SAFETY: all six source rows and eight output lanes are in range.
+                    unsafe { diagonal_row_neon(&horizontal_raw, width, index, &mut diagonal_half) };
+                    x += 8;
+                    continue;
+                }
+                let taps = if y >= 2 && y + 3 < height {
+                    six_tap([
+                        horizontal_raw[index - 2 * width],
+                        horizontal_raw[index - width],
+                        horizontal_raw[index],
+                        horizontal_raw[index + width],
+                        horizontal_raw[index + 2 * width],
+                        horizontal_raw[index + 3 * width],
+                    ])
+                } else {
+                    six_tap(std::array::from_fn(|i| {
+                        horizontal_raw[(y as i32 + i as i32 - 2).clamp(0, height as i32 - 1)
+                            as usize
+                            * width
+                            + x]
+                    }))
+                };
                 diagonal_half[y * width + x] = clip((taps + 512) >> 10);
+                x += 1;
             }
         }
         Self {
@@ -2564,11 +2935,8 @@ fn luma_quarter_cached(reference: &Yuv420Picture, half: &HalfPelPlanes, x4: i32,
     if x < 0 || y < 0 || x >= width as i32 - 1 || y >= height as i32 - 1 {
         return luma_quarter(&reference.luma, width, height, x4, y4);
     }
-    let at = |plane: &[u8], x: i32, y: i32| -> i32 {
-        let x = x.clamp(0, width as i32 - 1) as usize;
-        let y = y.clamp(0, height as i32 - 1) as usize;
-        i32::from(plane[y * width + x])
-    };
+    let at =
+        |plane: &[u8], x: i32, y: i32| -> i32 { i32::from(plane[y as usize * width + x as usize]) };
     let full = at(&reference.luma, x, y);
     let b = || at(&half.horizontal, x, y);
     let h = || at(&half.vertical, x, y);
@@ -2594,6 +2962,96 @@ fn luma_quarter_cached(reference: &Yuv420Picture, half: &HalfPelPlanes, x4: i32,
         (3, 3) => average(m(), s()),
         _ => unreachable!(),
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn average_luma_row_neon(a: &[u8], b: &[u8], output: &mut [u8]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        if output.len() == 16 {
+            vst1q_u8(
+                output.as_mut_ptr(),
+                vrhaddq_u8(vld1q_u8(a.as_ptr()), vld1q_u8(b.as_ptr())),
+            );
+        } else {
+            vst1_u8(
+                output.as_mut_ptr(),
+                vrhadd_u8(vld1_u8(a.as_ptr()), vld1_u8(b.as_ptr())),
+            );
+        }
+    }
+}
+
+fn predict_cached_luma_region(
+    reference: &Yuv420Picture,
+    half: &HalfPelPlanes,
+    mb_x: usize,
+    mb_y: usize,
+    region_x: usize,
+    region_y: usize,
+    span: usize,
+    motion: [i32; 2],
+    output: &mut [u8],
+    output_stride: usize,
+    output_x: usize,
+    output_y: usize,
+) -> bool {
+    let width = reference.width;
+    let height = reference.height;
+    let source_x = (mb_x * 16 + region_x) as i64 + i64::from(motion[0] >> 2);
+    let source_y = (mb_y * 16 + region_y) as i64 + i64::from(motion[1] >> 2);
+    if source_x < 0
+        || source_y < 0
+        || source_x + span as i64 >= width as i64
+        || source_y + span as i64 >= height as i64
+    {
+        return false;
+    }
+    let full = reference.luma.as_slice();
+    let horizontal = half.horizontal.as_slice();
+    let vertical = half.vertical.as_slice();
+    let diagonal = half.diagonal.as_slice();
+    let (first, first_offset, second): (&[u8], usize, Option<(&[u8], usize)>) =
+        match (motion[0].rem_euclid(4), motion[1].rem_euclid(4)) {
+            (0, 0) => (full, 0, None),
+            (0, 1) => (full, 0, Some((vertical, 0))),
+            (0, 2) => (vertical, 0, None),
+            (0, 3) => (full, width, Some((vertical, 0))),
+            (1, 0) => (full, 0, Some((horizontal, 0))),
+            (1, 1) => (horizontal, 0, Some((vertical, 0))),
+            (1, 2) => (vertical, 0, Some((diagonal, 0))),
+            (1, 3) => (vertical, 0, Some((horizontal, width))),
+            (2, 0) => (horizontal, 0, None),
+            (2, 1) => (horizontal, 0, Some((diagonal, 0))),
+            (2, 2) => (diagonal, 0, None),
+            (2, 3) => (diagonal, 0, Some((horizontal, width))),
+            (3, 0) => (full, 1, Some((horizontal, 0))),
+            (3, 1) => (horizontal, 0, Some((vertical, 1))),
+            (3, 2) => (diagonal, 0, Some((vertical, 1))),
+            (3, 3) => (vertical, 1, Some((horizontal, width))),
+            _ => unreachable!(),
+        };
+    for row in 0..span {
+        let source = (source_y as usize + row) * width + source_x as usize;
+        let target = (output_y + row) * output_stride + output_x;
+        let first = &first[source + first_offset..source + first_offset + span];
+        let destination = &mut output[target..target + span];
+        if let Some((second, offset)) = second {
+            let second = &second[source + offset..source + offset + span];
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                average_luma_row_neon(first, second, destination);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            for (out, (&a, &b)) in destination.iter_mut().zip(first.iter().zip(second)) {
+                *out = (u16::from(a) + u16::from(b) + 1 >> 1) as u8;
+            }
+        } else {
+            destination.copy_from_slice(first);
+        }
+    }
+    true
 }
 
 /// x4/y4 are absolute quarter-luma-sample coordinates, including the motion vector.
@@ -2642,12 +3100,112 @@ pub fn chroma_eighth(plane: &[u8], width: usize, height: usize, x8: i32, y8: i32
     let y = y8.div_euclid(8);
     let fx = x8.rem_euclid(8);
     let fy = y8.rem_euclid(8);
-    let a = sample(plane, width, height, x, y);
-    let b = sample(plane, width, height, x + 1, y);
-    let c = sample(plane, width, height, x, y + 1);
-    let d = sample(plane, width, height, x + 1, y + 1);
+    let (a, b, c, d) = if x >= 0 && y >= 0 && x + 1 < width as i32 && y + 1 < height as i32 {
+        let index = y as usize * width + x as usize;
+        (
+            i32::from(plane[index]),
+            i32::from(plane[index + 1]),
+            i32::from(plane[index + width]),
+            i32::from(plane[index + width + 1]),
+        )
+    } else {
+        (
+            sample(plane, width, height, x, y),
+            sample(plane, width, height, x + 1, y),
+            sample(plane, width, height, x, y + 1),
+            sample(plane, width, height, x + 1, y + 1),
+        )
+    };
     (((8 - fx) * (8 - fy) * a + fx * (8 - fy) * b + (8 - fx) * fy * c + fx * fy * d + 32) >> 6)
         as u8
+}
+
+fn predict_chroma_region(
+    reference: &Yuv420Picture,
+    x: usize,
+    y: usize,
+    motion: [i32; 2],
+    size: usize,
+    cb: &mut [u8],
+    cr: &mut [u8],
+) -> bool {
+    let width = reference.width / 2;
+    let height = reference.height / 2;
+    let base_x = x as i64 + i64::from(motion[0].div_euclid(8));
+    let base_y = y as i64 + i64::from(motion[1].div_euclid(8));
+    if base_x < 0
+        || base_y < 0
+        || base_x + size as i64 >= width as i64
+        || base_y + size as i64 >= height as i64
+    {
+        return false;
+    }
+    let fx = motion[0].rem_euclid(8);
+    let fy = motion[1].rem_euclid(8);
+    let coefficients = [
+        (8 - fx) * (8 - fy),
+        fx * (8 - fy),
+        (8 - fx) * fy,
+        fx * fy,
+    ];
+    let base = base_y as usize * width + base_x as usize;
+    #[cfg(target_arch = "aarch64")]
+    if size == 8 {
+        let weights = coefficients.map(|value| value as u16);
+        unsafe {
+            predict_chroma_rows_neon(&reference.cb, base, width, weights, cb);
+            predict_chroma_rows_neon(&reference.cr, base, width, weights, cr);
+        }
+        return true;
+    }
+    for (plane, output) in [(&reference.cb[..], cb), (&reference.cr[..], cr)] {
+        for row in 0..size {
+            let source = base + row * width;
+            let target = row * size;
+            for col in 0..size {
+                let offset = source + col;
+                output[target + col] = ((coefficients[0] * i32::from(plane[offset])
+                    + coefficients[1] * i32::from(plane[offset + 1])
+                    + coefficients[2] * i32::from(plane[offset + width])
+                    + coefficients[3] * i32::from(plane[offset + width + 1])
+                    + 32)
+                    >> 6) as u8;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn predict_chroma_rows_neon(
+    plane: &[u8],
+    base: usize,
+    width: usize,
+    weights: [u16; 4],
+    output: &mut [u8],
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        for row in 0..8 {
+            let source = plane.as_ptr().add(base + row * width);
+            let a = vmovl_u8(vld1_u8(source));
+            let b = vmovl_u8(vld1_u8(source.add(1)));
+            let c = vmovl_u8(vld1_u8(source.add(width)));
+            let d = vmovl_u8(vld1_u8(source.add(width + 1)));
+            let sum = vmlaq_n_u16(
+                vmlaq_n_u16(
+                    vmlaq_n_u16(vmulq_n_u16(a, weights[0]), b, weights[1]),
+                    c,
+                    weights[2],
+                ),
+                d,
+                weights[3],
+            );
+            let rounded = vshrn_n_u16::<6>(vaddq_u16(sum, vdupq_n_u16(32)));
+            vst1_u8(output.as_mut_ptr().add(row * 8), rounded);
+        }
+    }
 }
 
 /// Equation 8-270 for an 8-bit single-list weighted prediction sample.
@@ -2728,28 +3286,86 @@ fn predict_inter_16x16(
             .luma_half
             .get_or_init(|| HalfPelPlanes::new(reference))
     });
-    for y in 0..16 {
-        for x in 0..16 {
-            let x4 = ((mb_x * 16 + x) as i32) * 4 + motion[0];
-            let y4 = ((mb_y * 16 + y) as i32) * 4 + motion[1];
-            let value = match half {
-                Some(half) => luma_quarter_cached(reference, half, x4, y4),
-                None => luma_quarter(&reference.luma, reference.width, reference.height, x4, y4),
-            };
-            block.luma[y * 16 + x] = if let Some((table, weight)) = weight {
-                weighted_single(
-                    value,
-                    weight.luma_weight,
-                    weight.luma_offset,
-                    table.luma_denom,
-                )
-            } else {
-                value
-            };
+    let integer_x = (mb_x * 16) as i64 + i64::from(motion[0] >> 2);
+    let integer_y = (mb_y * 16) as i64 + i64::from(motion[1] >> 2);
+    if weight.is_none()
+        && motion[0] & 3 == 0
+        && motion[1] & 3 == 0
+        && integer_x >= 0
+        && integer_y >= 0
+        && integer_x + 16 <= reference.width as i64
+        && integer_y + 16 <= reference.height as i64
+    {
+        let source_x = integer_x as usize;
+        let source_y = integer_y as usize;
+        for row in 0..16 {
+            let source = (source_y + row) * reference.width + source_x;
+            block.luma[row * 16..row * 16 + 16]
+                .copy_from_slice(&reference.luma[source..source + 16]);
+        }
+    } else if weight.is_some()
+        || !half.is_some_and(|half| {
+            predict_cached_luma_region(reference, half, mb_x, mb_y, 0, 0, 16, motion, &mut block.luma, 16, 0, 0)
+        })
+    {
+        for y in 0..16 {
+            for x in 0..16 {
+                let x4 = ((mb_x * 16 + x) as i32) * 4 + motion[0];
+                let y4 = ((mb_y * 16 + y) as i32) * 4 + motion[1];
+                let value = match half {
+                    Some(half) => luma_quarter_cached(reference, half, x4, y4),
+                    None => {
+                        luma_quarter(&reference.luma, reference.width, reference.height, x4, y4)
+                    }
+                };
+                block.luma[y * 16 + x] = if let Some((table, weight)) = weight {
+                    weighted_single(
+                        value,
+                        weight.luma_weight,
+                        weight.luma_offset,
+                        table.luma_denom,
+                    )
+                } else {
+                    value
+                };
+            }
         }
     }
     let chroma_width = reference.width / 2;
     let chroma_height = reference.height / 2;
+    let chroma_source_x = mb_x as i64 * 8 + i64::from(motion[0] >> 3);
+    let chroma_source_y = mb_y as i64 * 8 + i64::from(motion[1] >> 3);
+    if weight.is_none()
+        && motion[0] & 7 == 0
+        && motion[1] & 7 == 0
+        && chroma_source_x >= 0
+        && chroma_source_y >= 0
+        && chroma_source_x + 8 <= chroma_width as i64
+        && chroma_source_y + 8 <= chroma_height as i64
+    {
+        let source_x = chroma_source_x as usize;
+        let source_y = chroma_source_y as usize;
+        for row in 0..8 {
+            let source = (source_y + row) * chroma_width + source_x;
+            let target = row * 8..row * 8 + 8;
+            block.cb[target.clone()].copy_from_slice(&reference.cb[source..source + 8]);
+            block.cr[target].copy_from_slice(&reference.cr[source..source + 8]);
+        }
+        return Ok(block);
+    }
+    if weight.is_none()
+        && predict_chroma_region(
+            reference,
+            mb_x * 8,
+            mb_y * 8,
+            motion,
+            8,
+            &mut block.cb,
+            &mut block.cr,
+        )
+    {
+        return Ok(block);
+    }
     for y in 0..8 {
         for x in 0..8 {
             let x8 = ((mb_x * 8 + x) as i32) * 8 + motion[0];
@@ -2861,34 +3477,34 @@ fn predict_p_subpartitions(
     Ok(block)
 }
 
-fn predict_inter_8x8(
+fn predict_inter_8x8_region(
     reference: &Yuv420Picture,
     mb_x: usize,
     mb_y: usize,
     motion: [i32; 2],
     region: usize,
-) -> Result<InterMacroblock, AvcError> {
+) -> Result<InterRegion, AvcError> {
     if mb_x * 16 >= reference.width || mb_y * 16 >= reference.height {
         return Err(AvcError::InvalidData("inter macroblock out of bounds"));
     }
-    let mut block = InterMacroblock {
-        luma: [0; 256],
-        cb: [0; 64],
-        cr: [0; 64],
+    let mut block = InterRegion {
+        luma: [0; 64],
+        cb: [0; 16],
+        cr: [0; 16],
     };
     if motion == [0, 0] {
         let luma_x = (region % 2) * 8;
         let luma_y = (region / 2) * 8;
-        for row in luma_y..luma_y + 8 {
-            let source = (mb_y * 16 + row) * reference.width + mb_x * 16 + luma_x;
-            block.luma[row * 16 + luma_x..row * 16 + luma_x + 8]
+        for row in 0..8 {
+            let source = (mb_y * 16 + luma_y + row) * reference.width + mb_x * 16 + luma_x;
+            block.luma[row * 8..row * 8 + 8]
                 .copy_from_slice(&reference.luma[source..source + 8]);
         }
         let chroma_x = (region % 2) * 4;
         let chroma_y = (region / 2) * 4;
-        for row in chroma_y..chroma_y + 4 {
-            let source = (mb_y * 8 + row) * (reference.width / 2) + mb_x * 8 + chroma_x;
-            let target = row * 8 + chroma_x..row * 8 + chroma_x + 4;
+        for row in 0..4 {
+            let source = (mb_y * 8 + chroma_y + row) * (reference.width / 2) + mb_x * 8 + chroma_x;
+            let target = row * 4..row * 4 + 4;
             block.cb[target.clone()].copy_from_slice(&reference.cb[source..source + 4]);
             block.cr[target].copy_from_slice(&reference.cr[source..source + 4]);
         }
@@ -2901,34 +3517,214 @@ fn predict_inter_8x8(
     });
     let luma_x = (region % 2) * 8;
     let luma_y = (region / 2) * 8;
-    for y in luma_y..luma_y + 8 {
-        for x in luma_x..luma_x + 8 {
-            let x4 = ((mb_x * 16 + x) as i32) * 4 + motion[0];
-            let y4 = ((mb_y * 16 + y) as i32) * 4 + motion[1];
-            block.luma[y * 16 + x] = match half {
-                Some(half) => luma_quarter_cached(reference, half, x4, y4),
-                None => luma_quarter(&reference.luma, reference.width, reference.height, x4, y4),
-            };
+    let integer_x = (mb_x * 16 + luma_x) as i64 + i64::from(motion[0] >> 2);
+    let integer_y = (mb_y * 16 + luma_y) as i64 + i64::from(motion[1] >> 2);
+    if motion[0] & 3 == 0
+        && motion[1] & 3 == 0
+        && integer_x >= 0
+        && integer_y >= 0
+        && integer_x + 8 <= reference.width as i64
+        && integer_y + 8 <= reference.height as i64
+    {
+        let source_x = integer_x as usize;
+        let source_y = integer_y as usize;
+        for row in 0..8 {
+            let source = (source_y + row) * reference.width + source_x;
+            let target = row * 8;
+            block.luma[target..target + 8].copy_from_slice(&reference.luma[source..source + 8]);
+        }
+    } else if !half.is_some_and(|half| {
+        predict_cached_luma_region(
+            reference,
+            half,
+            mb_x,
+            mb_y,
+            luma_x,
+            luma_y,
+            8,
+            motion,
+            &mut block.luma,
+            8,
+            0,
+            0,
+        )
+    }) {
+        for y in luma_y..luma_y + 8 {
+            for x in luma_x..luma_x + 8 {
+                let x4 = ((mb_x * 16 + x) as i32) * 4 + motion[0];
+                let y4 = ((mb_y * 16 + y) as i32) * 4 + motion[1];
+                block.luma[(y - luma_y) * 8 + x - luma_x] = match half {
+                    Some(half) => luma_quarter_cached(reference, half, x4, y4),
+                    None => {
+                        luma_quarter(&reference.luma, reference.width, reference.height, x4, y4)
+                    }
+                };
+            }
         }
     }
     let chroma_width = reference.width / 2;
     let chroma_height = reference.height / 2;
     let chroma_x = (region % 2) * 4;
     let chroma_y = (region / 2) * 4;
+    let chroma_source_x = (mb_x * 8 + chroma_x) as i64 + i64::from(motion[0] >> 3);
+    let chroma_source_y = (mb_y * 8 + chroma_y) as i64 + i64::from(motion[1] >> 3);
+    if motion[0] & 7 == 0
+        && motion[1] & 7 == 0
+        && chroma_source_x >= 0
+        && chroma_source_y >= 0
+        && chroma_source_x + 4 <= chroma_width as i64
+        && chroma_source_y + 4 <= chroma_height as i64
+    {
+        let source_x = chroma_source_x as usize;
+        let source_y = chroma_source_y as usize;
+        for row in 0..4 {
+            let source = (source_y + row) * chroma_width + source_x;
+            let target = row * 4;
+            block.cb[target..target + 4].copy_from_slice(&reference.cb[source..source + 4]);
+            block.cr[target..target + 4].copy_from_slice(&reference.cr[source..source + 4]);
+        }
+        return Ok(block);
+    }
+    if predict_chroma_region(
+        reference,
+        mb_x * 8 + chroma_x,
+        mb_y * 8 + chroma_y,
+        motion,
+        4,
+        &mut block.cb,
+        &mut block.cr,
+    ) {
+        return Ok(block);
+    }
     for y in chroma_y..chroma_y + 4 {
         for x in chroma_x..chroma_x + 4 {
             let x8 = ((mb_x * 8 + x) as i32) * 8 + motion[0];
             let y8 = ((mb_y * 8 + y) as i32) * 8 + motion[1];
-            block.cb[y * 8 + x] = chroma_eighth(&reference.cb, chroma_width, chroma_height, x8, y8);
-            block.cr[y * 8 + x] = chroma_eighth(&reference.cr, chroma_width, chroma_height, x8, y8);
+            let target = (y - chroma_y) * 4 + x - chroma_x;
+            block.cb[target] = chroma_eighth(&reference.cb, chroma_width, chroma_height, x8, y8);
+            block.cr[target] = chroma_eighth(&reference.cr, chroma_width, chroma_height, x8, y8);
         }
     }
     Ok(block)
 }
 
 #[cfg(test)]
+fn predict_inter_8x8(
+    reference: &Yuv420Picture,
+    mb_x: usize,
+    mb_y: usize,
+    motion: [i32; 2],
+    region: usize,
+) -> Result<InterMacroblock, AvcError> {
+    let mut regions = [InterRegion {
+        luma: [0; 64],
+        cb: [0; 16],
+        cr: [0; 16],
+    }; 4];
+    regions[region] = predict_inter_8x8_region(reference, mb_x, mb_y, motion, region)?;
+    Ok(assemble_inter_regions(&regions))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn benchmark_halfpel_generation_720p() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let width = 1280;
+        let height = 720;
+        let reference = Yuv420Picture {
+            width,
+            height,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: (0..width * height)
+                .map(|index| ((index * 37 + index / width * 17) & 255) as u8)
+                .collect(),
+            cb: vec![128; width * height / 4],
+            cr: vec![128; width * height / 4],
+            motion: vec![[MotionCell::default(); 4]; width * height / 256],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            black_box(HalfPelPlanes::new(black_box(&reference)));
+            times.push(start.elapsed());
+        }
+        times.sort_unstable();
+        eprintln!("720p half-pel generation median: {:?}", times[2]);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_integer_luma_row_copy() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let width = 1280;
+        let height = 720;
+        let plane: Vec<u8> = (0..width * height)
+            .map(|index| ((index * 37 + index / width * 17) & 255) as u8)
+            .collect();
+        let mut scalar_times = Vec::new();
+        let mut bulk_times = Vec::new();
+        for round in 0..6 {
+            let run = |bulk: bool| {
+                let start = Instant::now();
+                for repeat in 0..16 {
+                    for mb_y in 0..height / 16 - 1 {
+                        for mb_x in 0..width / 16 - 1 {
+                            let mut block = [0u8; 256];
+                            let source_x = mb_x * 16 + 2 + repeat % 2;
+                            let source_y = mb_y * 16 + 1;
+                            if bulk {
+                                for row in 0..16 {
+                                    let source = (source_y + row) * width + source_x;
+                                    block[row * 16..row * 16 + 16]
+                                        .copy_from_slice(&plane[source..source + 16]);
+                                }
+                            } else {
+                                for row in 0..16 {
+                                    for col in 0..16 {
+                                        block[row * 16 + col] = luma_quarter(
+                                            &plane,
+                                            width,
+                                            height,
+                                            ((source_x + col) * 4) as i32,
+                                            ((source_y + row) * 4) as i32,
+                                        );
+                                    }
+                                }
+                            }
+                            black_box(block);
+                        }
+                    }
+                }
+                start.elapsed()
+            };
+            if round % 2 == 0 {
+                scalar_times.push(run(false));
+                bulk_times.push(run(true));
+            } else {
+                bulk_times.push(run(true));
+                scalar_times.push(run(false));
+            }
+        }
+        scalar_times.sort_unstable();
+        bulk_times.sort_unstable();
+        eprintln!(
+            "integer luma scalar={:?} bulk={:?}",
+            scalar_times[scalar_times.len() / 2],
+            bulk_times[bulk_times.len() / 2]
+        );
+    }
 
     #[test]
     fn cached_halfpel_matches_direct_interpolation_at_edges_and_all_phases() {
@@ -2951,6 +3747,37 @@ mod tests {
                 assert_eq!(
                     luma_quarter_cached(&reference, &half, x4, y4),
                     luma_quarter(&reference.luma, 16, 16, x4, y4),
+                    "sample ({x4}, {y4})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_halfpel_matches_direct_interpolation_across_simd_rows() {
+        let width = 64;
+        let height = 48;
+        let reference = Yuv420Picture {
+            width,
+            height,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: (0..width * height)
+                .map(|index| ((index * 73 + index / width * 19) & 255) as u8)
+                .collect(),
+            cb: vec![128; width * height / 4],
+            cr: vec![128; width * height / 4],
+            motion: vec![[MotionCell::default(); 4]; width * height / 256],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        let half = HalfPelPlanes::new(&reference);
+        for y4 in -8..height as i32 * 4 + 8 {
+            for x4 in -8..width as i32 * 4 + 8 {
+                assert_eq!(
+                    luma_quarter_cached(&reference, &half, x4, y4),
+                    luma_quarter(&reference.luma, width, height, x4, y4),
                     "sample ({x4}, {y4})"
                 );
             }
@@ -3016,6 +3843,77 @@ mod tests {
             (weighted.luma[0], weighted.cb[0], weighted.cr[0]),
             (40, 41, 42)
         );
+    }
+
+    #[test]
+    fn b_region_blend_matches_scalar_for_signed_weights() {
+        let mut first = InterMacroblock {
+            luma: [0; 256],
+            cb: [0; 64],
+            cr: [0; 64],
+        };
+        let mut second = InterMacroblock {
+            luma: [0; 256],
+            cb: [0; 64],
+            cr: [0; 64],
+        };
+        for index in 0..256 {
+            first.luma[index] = (index * 37) as u8;
+            second.luma[index] = (index * 91 + 13) as u8;
+        }
+        for region in 0..4 {
+            for weights in [None, Some((48, 16)), Some((128, -64)), Some((-64, 128))] {
+                let actual = blend_b_region(&first, &second, region, weights);
+                let x = region % 2;
+                let y = region / 2;
+                let compact_first = InterRegion {
+                    luma: std::array::from_fn(|index| {
+                        first.luma[(y * 8 + index / 8) * 16 + x * 8 + index % 8]
+                    }),
+                    cb: std::array::from_fn(|index| {
+                        first.cb[(y * 4 + index / 4) * 8 + x * 4 + index % 4]
+                    }),
+                    cr: std::array::from_fn(|index| {
+                        first.cr[(y * 4 + index / 4) * 8 + x * 4 + index % 4]
+                    }),
+                };
+                let compact_second = InterRegion {
+                    luma: std::array::from_fn(|index| {
+                        second.luma[(y * 8 + index / 8) * 16 + x * 8 + index % 8]
+                    }),
+                    cb: std::array::from_fn(|index| {
+                        second.cb[(y * 4 + index / 4) * 8 + x * 4 + index % 4]
+                    }),
+                    cr: std::array::from_fn(|index| {
+                        second.cr[(y * 4 + index / 4) * 8 + x * 4 + index % 4]
+                    }),
+                };
+                let compact = blend_b_compact(&compact_first, &compact_second, weights);
+                for row in 0..8 {
+                    for col in 0..8 {
+                        let index = (y * 8 + row) * 16 + x * 8 + col;
+                        assert_eq!(compact.luma[row * 8 + col], actual.luma[index]);
+                        let a = i32::from(first.luma[index]);
+                        let b = i32::from(second.luma[index]);
+                        let expected = match weights {
+                            Some((w0, w1)) => ((a * w0 + b * w1 + 32) >> 6).clamp(0, 255) as u8,
+                            None => ((a + b + 1) >> 1) as u8,
+                        };
+                        assert_eq!(
+                            actual.luma[index], expected,
+                            "region={region} weights={weights:?} index={index}"
+                        );
+                    }
+                }
+                for row in 0..4 {
+                    for col in 0..4 {
+                        let index = (y * 4 + row) * 8 + x * 4 + col;
+                        assert_eq!(compact.cb[row * 4 + col], actual.cb[index]);
+                        assert_eq!(compact.cr[row * 4 + col], actual.cr[index]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3136,6 +4034,192 @@ mod tests {
     }
 
     #[test]
+    fn integer_motion_row_copy_matches_scalar_luma() {
+        let reference = Yuv420Picture {
+            width: 32,
+            height: 32,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: (0..1024).map(|i| (i * 37 % 251) as u8).collect(),
+            cb: vec![80; 256],
+            cr: vec![60; 256],
+            motion: vec![[MotionCell::default(); 4]; 4],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        let motion = [8, 4];
+        let block = predict_l0_16x16(&reference, 0, 0, motion, None, 0).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    block.luma[y * 16 + x],
+                    luma_quarter(
+                        &reference.luma,
+                        32,
+                        32,
+                        x as i32 * 4 + motion[0],
+                        y as i32 * 4 + motion[1],
+                    )
+                );
+            }
+        }
+        for region in 0..4 {
+            let region_block = predict_inter_8x8(&reference, 0, 0, motion, region).unwrap();
+            let x0 = region % 2 * 8;
+            let y0 = region / 2 * 8;
+            for y in y0..y0 + 8 {
+                for x in x0..x0 + 8 {
+                    assert_eq!(
+                        region_block.luma[y * 16 + x],
+                        luma_quarter(
+                            &reference.luma,
+                            32,
+                            32,
+                            x as i32 * 4 + motion[0],
+                            y as i32 * 4 + motion[1],
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_chroma_motion_row_copy_matches_interpolation() {
+        let reference = Yuv420Picture {
+            width: 48,
+            height: 48,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: vec![100; 48 * 48],
+            cb: (0..24 * 24).map(|i| (i * 37 % 251) as u8).collect(),
+            cr: (0..24 * 24).map(|i| (i * 19 % 253) as u8).collect(),
+            motion: vec![[MotionCell::default(); 4]; 9],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        for motion in [[8, 16], [-8, -8], [16, 0]] {
+            let block = predict_l0_16x16(&reference, 1, 1, motion, None, 0).unwrap();
+            for region in 0..4 {
+                let part = predict_inter_8x8(&reference, 1, 1, motion, region).unwrap();
+                for y in (region / 2) * 4..(region / 2) * 4 + 4 {
+                    for x in (region % 2) * 4..(region % 2) * 4 + 4 {
+                        let x8 = ((8 + x) as i32) * 8 + motion[0];
+                        let y8 = ((8 + y) as i32) * 8 + motion[1];
+                        let cb = chroma_eighth(&reference.cb, 24, 24, x8, y8);
+                        let cr = chroma_eighth(&reference.cr, 24, 24, x8, y8);
+                        assert_eq!(block.cb[y * 8 + x], cb);
+                        assert_eq!(block.cr[y * 8 + x], cr);
+                        assert_eq!(part.cb[y * 8 + x], cb);
+                        assert_eq!(part.cr[y * 8 + x], cr);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_luma_rows_match_every_fractional_phase() {
+        let reference = Yuv420Picture {
+            width: 64,
+            height: 64,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: (0..64 * 64).map(|i| (i * 37 % 251) as u8).collect(),
+            cb: vec![0; 32 * 32],
+            cr: vec![0; 32 * 32],
+            motion: vec![[MotionCell::default(); 4]; 16],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        let half = HalfPelPlanes::new(&reference);
+        for dy in -7..=7 {
+            for dx in -7..=7 {
+                for (region_x, region_y, span) in [(0, 0, 16), (8, 0, 8), (0, 8, 8), (8, 8, 8)] {
+                    let mut output = [0; 256];
+                    assert!(predict_cached_luma_region(
+                        &reference,
+                        &half,
+                        1,
+                        1,
+                        region_x,
+                        region_y,
+                        span,
+                        [dx, dy],
+                        &mut output,
+                        16,
+                        region_x,
+                        region_y,
+                    ));
+                    for y in region_y..region_y + span {
+                        for x in region_x..region_x + span {
+                            let x4 = ((16 + x) as i32) * 4 + dx;
+                            let y4 = ((16 + y) as i32) * 4 + dy;
+                            assert_eq!(
+                                output[y * 16 + x],
+                                luma_quarter_cached(&reference, &half, x4, y4),
+                                "phase ({dx}, {dy}) at ({x}, {y})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_fractional_luma_rows() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let reference = Yuv420Picture {
+            width: 1280,
+            height: 720,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: (0..1280 * 720).map(|i| (i * 37 % 251) as u8).collect(),
+            cb: vec![0; 640 * 360],
+            cr: vec![0; 640 * 360],
+            motion: vec![[MotionCell::default(); 4]; 80 * 45],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        let half = HalfPelPlanes::new(&reference);
+        let run = |bulk: bool| {
+            let mut output = [0u8; 256];
+            let start = Instant::now();
+            for i in 0..15_000 {
+                let mb_x = black_box(1 + i % 78);
+                let mb_y = black_box(1 + i % 43);
+                let motion = black_box([1, 3]);
+                if bulk {
+                    assert!(predict_cached_luma_region(
+                        &reference, &half, mb_x, mb_y, 0, 0, 16, motion, &mut output, 16, 0, 0,
+                    ));
+                } else {
+                    for y in 0..16 {
+                        for x in 0..16 {
+                            let x4 = ((mb_x * 16 + x) as i32) * 4 + motion[0];
+                            let y4 = ((mb_y * 16 + y) as i32) * 4 + motion[1];
+                            output[y * 16 + x] = luma_quarter_cached(&reference, &half, x4, y4);
+                        }
+                    }
+                }
+                black_box(output[0]);
+            }
+            start.elapsed()
+        };
+        for _ in 0..3 {
+            eprintln!("luma pixel={:?}, row={:?}", run(false), run(true));
+        }
+    }
+
+    #[test]
     fn quarter_luma_uses_six_tap_and_rounds_quarters() {
         let plane: Vec<u8> = (0..16)
             .flat_map(|y| (0..16).map(move |x| (4 * x + 8 * y) as u8))
@@ -3166,6 +4250,179 @@ mod tests {
         assert_eq!(chroma_eighth(&plane, 2, 2, 4, 4), 112);
         assert_eq!(weighted_single(101, 3, -2, 1), 150);
         assert_eq!(weighted_single(255, 2, 0, 0), 255);
+    }
+
+    #[test]
+    fn chroma_fast_path_matches_clamped_sampling() {
+        let width = 11;
+        let height = 9;
+        let plane: Vec<u8> = (0..width * height)
+            .map(|index| (index * 37 % 256) as u8)
+            .collect();
+        for y8 in -16..(height as i32 * 8 + 16) {
+            for x8 in -16..(width as i32 * 8 + 16) {
+                let x = x8.div_euclid(8);
+                let y = y8.div_euclid(8);
+                let fx = x8.rem_euclid(8);
+                let fy = y8.rem_euclid(8);
+                let a = sample(&plane, width, height, x, y);
+                let b = sample(&plane, width, height, x + 1, y);
+                let c = sample(&plane, width, height, x, y + 1);
+                let d = sample(&plane, width, height, x + 1, y + 1);
+                let expected = (((8 - fx) * (8 - fy) * a
+                    + fx * (8 - fy) * b
+                    + (8 - fx) * fy * c
+                    + fx * fy * d
+                    + 32)
+                    >> 6) as u8;
+                assert_eq!(chroma_eighth(&plane, width, height, x8, y8), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_region_matches_pixel_interpolation() {
+        let reference = Yuv420Picture {
+            width: 64,
+            height: 64,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: vec![0; 64 * 64],
+            cb: (0..32 * 32).map(|i| (i * 37) as u8).collect(),
+            cr: (0..32 * 32).map(|i| (i * 91 + 13) as u8).collect(),
+            motion: vec![[MotionCell::default(); 4]; 16],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        for size in [4, 8] {
+            for y in [0, 4, 12, 24] {
+                for x in [0, 4, 12, 24] {
+                    for dy in -9..=9 {
+                        for dx in -9..=9 {
+                            let mut cb = vec![0; size * size];
+                            let mut cr = vec![0; size * size];
+                            if !predict_chroma_region(
+                                &reference,
+                                x,
+                                y,
+                                [dx, dy],
+                                size,
+                                &mut cb,
+                                &mut cr,
+                            ) {
+                                continue;
+                            }
+                            for row in 0..size {
+                                for col in 0..size {
+                                    let x8 = ((x + col) as i32) * 8 + dx;
+                                    let y8 = ((y + row) as i32) * 8 + dy;
+                                    assert_eq!(
+                                        cb[row * size + col],
+                                        chroma_eighth(&reference.cb, 32, 32, x8, y8)
+                                    );
+                                    assert_eq!(
+                                        cr[row * size + col],
+                                        chroma_eighth(&reference.cr, 32, 32, x8, y8)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run explicitly when measuring chroma block prediction"]
+    fn benchmark_chroma_region() {
+        let reference = Yuv420Picture {
+            width: 1280,
+            height: 720,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: vec![0; 1280 * 720],
+            cb: (0..640 * 360).map(|i| (i * 37) as u8).collect(),
+            cr: (0..640 * 360).map(|i| (i * 91 + 13) as u8).collect(),
+            motion: vec![[MotionCell::default(); 4]; 80 * 45],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        for bulk in [false, true] {
+            let start = std::time::Instant::now();
+            let mut cb = [0u8; 64];
+            let mut cr = [0u8; 64];
+            for i in 0..10_000 {
+                let x = 16 + i % 600;
+                let y = 16 + i % 320;
+                let motion = [3, 5];
+                if bulk {
+                    assert!(predict_chroma_region(
+                        &reference, x, y, motion, 8, &mut cb, &mut cr,
+                    ));
+                } else {
+                    for row in 0..8 {
+                        for col in 0..8 {
+                            let x8 = ((x + col) as i32) * 8 + motion[0];
+                            let y8 = ((y + row) as i32) * 8 + motion[1];
+                            cb[row * 8 + col] = chroma_eighth(&reference.cb, 640, 360, x8, y8);
+                            cr[row * 8 + col] = chroma_eighth(&reference.cr, 640, 360, x8, y8);
+                        }
+                    }
+                }
+                std::hint::black_box((&cb[..], &cr[..]));
+            }
+            eprintln!("chroma 10k blocks bulk={bulk}: {:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_chroma_interior_path() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let width = 640;
+        let height = 360;
+        let plane: Vec<u8> = (0..width * height)
+            .map(|index| (index * 37 % 256) as u8)
+            .collect();
+        let old = |x8: i32, y8: i32| {
+            let x = x8.div_euclid(8);
+            let y = y8.div_euclid(8);
+            let fx = x8.rem_euclid(8);
+            let fy = y8.rem_euclid(8);
+            let a = sample(&plane, width, height, x, y);
+            let b = sample(&plane, width, height, x + 1, y);
+            let c = sample(&plane, width, height, x, y + 1);
+            let d = sample(&plane, width, height, x + 1, y + 1);
+            (((8 - fx) * (8 - fy) * a
+                + fx * (8 - fy) * b
+                + (8 - fx) * fy * c
+                + fx * fy * d
+                + 32)
+                >> 6) as u8
+        };
+        let run = |fast: bool| {
+            let start = Instant::now();
+            let mut checksum = 0u64;
+            for index in 0..2_000_000 {
+                let x8 = black_box((index % 638) as i32 * 8 + 3);
+                let y8 = black_box((index % 358) as i32 * 8 + 5);
+                checksum += u64::from(if fast {
+                    chroma_eighth(&plane, width, height, x8, y8)
+                } else {
+                    old(x8, y8)
+                });
+            }
+            black_box(checksum);
+            start.elapsed()
+        };
+        for _ in 0..3 {
+            eprintln!("chroma original={:?}, fast={:?}", run(false), run(true));
+        }
     }
 
     #[test]

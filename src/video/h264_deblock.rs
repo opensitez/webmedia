@@ -102,24 +102,28 @@ fn filter_edge(
     let origin = y * stride + x;
     for line in 0..length {
         let q = origin + line * along;
+        let p0 = plane[q - across] as i32;
+        let p1 = plane[q - 2 * across] as i32;
+        let q0 = plane[q] as i32;
+        let q1 = plane[q + across] as i32;
+        if (p0 - q0).abs() >= alpha
+            || (p1 - p0).abs() >= beta
+            || (q1 - q0).abs() >= beta
+        {
+            continue;
+        }
         let p = [
-            plane[q - across] as i32,
-            plane[q - 2 * across] as i32,
+            p0,
+            p1,
             plane[q - 3 * across] as i32,
             plane[q - 4 * across] as i32,
         ];
         let r = [
-            plane[q] as i32,
-            plane[q + across] as i32,
+            q0,
+            q1,
             plane[q + 2 * across] as i32,
             plane[q + 3 * across] as i32,
         ];
-        if (p[0] - r[0]).abs() >= alpha
-            || (p[1] - p[0]).abs() >= beta
-            || (r[1] - r[0]).abs() >= beta
-        {
-            continue;
-        }
         let (mut p0, mut p1, mut p2) = (p[0], p[1], p[2]);
         let (mut q0, mut q1, mut q2) = (r[0], r[1], r[2]);
         if strength == 4 {

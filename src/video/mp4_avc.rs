@@ -38,6 +38,9 @@ impl Mp4AvcStream {
     }
 
     fn avc_error(error: AvcError) -> MediaDecodeError {
+        if std::env::var_os("WEBMEDIA_TRACE_RECOVERY").is_some() {
+            eprintln!("AVC decode error: {error:?}");
+        }
         match error {
             AvcError::Unsupported(_) | AvcError::UnsupportedProfile(_) => {
                 MediaDecodeError::Unsupported
@@ -630,6 +633,8 @@ mod tests {
         let mut frames = 0usize;
         let mut last_timestamp = None;
         let mut reported = 0usize;
+        let mut last_dropped_nonreference = 0usize;
+        let mut last_dropped_until_idr = 0usize;
         for chunk in bytes.chunks(16 * 1024) {
             let decoded = decoder.push(chunk).unwrap_or_else(|error| {
                 panic!("failed at sample {}: {error:?}", decoder.next_sample)
@@ -642,10 +647,17 @@ mod tests {
             if decoder.next_sample / 200 > reported {
                 reported = decoder.next_sample / 200;
                 eprintln!(
-                    "decoded {} / {} samples",
+                    "decoded {} / {} samples, frames={}, dropped B={} (+{}), until IDR={} (+{})",
                     decoder.next_sample,
-                    index.samples.len()
+                    index.samples.len(),
+                    frames,
+                    decoder.dropped_nonreference_samples,
+                    decoder.dropped_nonreference_samples - last_dropped_nonreference,
+                    decoder.dropped_until_idr_samples,
+                    decoder.dropped_until_idr_samples - last_dropped_until_idr,
                 );
+                last_dropped_nonreference = decoder.dropped_nonreference_samples;
+                last_dropped_until_idr = decoder.dropped_until_idr_samples;
             }
         }
         decoder.finish().unwrap();
@@ -672,7 +684,7 @@ mod tests {
         let end_sample = &index.samples[target];
         if std::env::var_os("WEBMEDIA_TRACE_RECOVERY").is_some() {
             eprintln!(
-                "target sample {target} pts={:.3} offset={} size={}",
+                "target sample {target} from IDR {start} pts={:.3} offset={} size={}",
                 end_sample.presentation_time as f64 / index.timescale as f64,
                 end_sample.offset,
                 end_sample.size
