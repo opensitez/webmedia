@@ -1620,6 +1620,7 @@ mod tests {
         assert_eq!(config.nal_length_size, 4);
         assert_eq!(config.sequence_parameters[0].profile_idc, 100);
         assert_eq!(config.sequence_parameters[0].level_idc, 32);
+        assert!(config.sequence_parameters[0].direct_8x8_inference);
         assert_eq!(
             (
                 config.sequence_parameters[0].width,

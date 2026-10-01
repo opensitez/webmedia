@@ -1443,6 +1443,42 @@ mod tests {
         let expected = std::fs::read(raw).unwrap();
         let frame_bytes = picture.width * picture.height * 3 / 2;
         assert_eq!(expected.len(), frame_bytes);
+        if std::env::var_os("WEBMEDIA_TRACE_ERROR_MAP").is_some() {
+            let mut edge_error = 0u64;
+            let mut edge_count = 0u64;
+            let mut interior_error = 0u64;
+            let mut interior_count = 0u64;
+            let mut macroblocks = Vec::new();
+            for my in 0..picture.height / 16 {
+                for mx in 0..picture.width / 16 {
+                    let mut error = 0u64;
+                    for row in 0..16 {
+                        for col in 0..16 {
+                            let x = mx * 16 + col;
+                            let y = my * 16 + row;
+                            let at = y * picture.width + x;
+                            let difference = u64::from(picture.luma[at].abs_diff(expected[at]));
+                            error += difference;
+                            if x % 4 == 0 || x % 4 == 3 || y % 4 == 0 || y % 4 == 3 {
+                                edge_error += difference;
+                                edge_count += 1;
+                            } else {
+                                interior_error += difference;
+                                interior_count += 1;
+                            }
+                        }
+                    }
+                    macroblocks.push((error, mx, my));
+                }
+            }
+            macroblocks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            eprintln!(
+                "luma edge MAE={:.3}, interior MAE={:.3}, worst macroblocks={:?}",
+                edge_error as f64 / edge_count as f64,
+                interior_error as f64 / interior_count as f64,
+                &macroblocks[..10]
+            );
+        }
         for (name, actual, reference) in [
             (
                 "Y",
@@ -1467,7 +1503,8 @@ mod tests {
                 .sum();
             let mae = error as f64 / actual.len() as f64;
             eprintln!("sample 100 {name} MAE: {mae:.3}");
-            assert!(mae < 25.0, "sample 100 {name} MAE: {mae}");
+            let limit = if name == "Y" { 3.2 } else { 1.0 };
+            assert!(mae < limit, "sample 100 {name} MAE: {mae}");
         }
     }
 
