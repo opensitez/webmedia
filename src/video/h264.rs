@@ -100,6 +100,9 @@ pub struct CabacIdrISlice {
     pub frame_num: u32,
     pub pic_order_cnt_lsb: u32,
     pub slice_qp: i32,
+    pub deblocking_disabled: bool,
+    pub alpha_offset: i32,
+    pub beta_offset: i32,
     pub rbsp: Vec<u8>,
     pub data_byte_offset: usize,
     pub marking: Vec<MemoryManagement>,
@@ -119,6 +122,9 @@ pub struct CabacInterSlice {
     pub direct_spatial_mv_pred: bool,
     pub cabac_init_idc: u32,
     pub slice_qp: i32,
+    pub deblocking_disabled: bool,
+    pub alpha_offset: i32,
+    pub beta_offset: i32,
     pub weights: Option<PredictionWeightTable>,
     pub rbsp: Vec<u8>,
     pub data_byte_offset: usize,
@@ -596,15 +602,19 @@ pub fn parse_cabac_i_slice(
     if !(0..=51).contains(&slice_qp) {
         return Err(AvcError::InvalidData("slice QP out of range"));
     }
+    let mut deblocking_disabled = false;
+    let mut alpha_offset = 0;
+    let mut beta_offset = 0;
     if pps.deblocking_filter_control_present {
         let disable_idc = bits.ue()?;
         if disable_idc > 2 {
             return Err(AvcError::InvalidData("invalid deblocking mode"));
         }
         if disable_idc != 1 {
-            bits.se()?;
-            bits.se()?;
+            alpha_offset = bits.se()? * 2;
+            beta_offset = bits.se()? * 2;
         }
+        deblocking_disabled = disable_idc == 1;
     }
     while bits.bit % 8 != 0 {
         if bits.read(1)? != 1 {
@@ -620,6 +630,9 @@ pub fn parse_cabac_i_slice(
         frame_num,
         pic_order_cnt_lsb,
         slice_qp,
+        deblocking_disabled,
+        alpha_offset,
+        beta_offset,
         rbsp,
         data_byte_offset,
         marking,
@@ -787,15 +800,19 @@ pub fn parse_cabac_inter_slice(
     if !(0..=51).contains(&slice_qp) {
         return Err(AvcError::InvalidData("slice QP out of range"));
     }
+    let mut deblocking_disabled = false;
+    let mut alpha_offset = 0;
+    let mut beta_offset = 0;
     if pps.deblocking_filter_control_present {
         let disable_idc = bits.ue()?;
         if disable_idc > 2 {
             return Err(AvcError::InvalidData("invalid deblocking mode"));
         }
         if disable_idc != 1 {
-            bits.se()?;
-            bits.se()?;
+            alpha_offset = bits.se()? * 2;
+            beta_offset = bits.se()? * 2;
         }
+        deblocking_disabled = disable_idc == 1;
     }
     while bits.bit % 8 != 0 {
         if bits.read(1)? != 1 {
@@ -819,6 +836,9 @@ pub fn parse_cabac_inter_slice(
         direct_spatial_mv_pred,
         cabac_init_idc,
         slice_qp,
+        deblocking_disabled,
+        alpha_offset,
+        beta_offset,
         weights,
         rbsp,
         data_byte_offset,

@@ -719,6 +719,51 @@ mod tests {
     }
 
     #[test]
+    fn site_first_ten_frame_pixel_error_profile() {
+        let (Ok(fixture), Ok(raw)) = (
+            std::env::var("WEBCORE_MP4_FIXTURE"),
+            std::env::var("WEBCORE_H264_FIRST_TEN_REFERENCE_YUV"),
+        ) else {
+            return;
+        };
+        let bytes = std::fs::read(fixture).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let sps = &index.config.sequence_parameters[0];
+        let mut decoder = Mp4AvcStream::new();
+        let frames = decoder.push(&bytes).unwrap();
+        let raw = std::fs::read(raw).unwrap();
+        let frame_bytes = sps.width as usize * sps.height as usize * 3 / 2;
+        assert_eq!(raw.len(), 10 * frame_bytes);
+        assert!(frames.len() >= 10);
+        for (number, actual) in frames.iter().take(10).enumerate() {
+            let expected = &raw[number * frame_bytes..(number + 1) * frame_bytes];
+            let y_end = sps.width as usize * sps.height as usize;
+            let chroma_end = y_end + y_end / 4;
+            let expected = frame_from_yuv420(
+                sps,
+                &expected[..y_end],
+                &expected[y_end..chroma_end],
+                &expected[chroma_end..],
+            );
+            let error: u64 = actual
+                .rgba
+                .chunks_exact(4)
+                .zip(expected.rgba.chunks_exact(4))
+                .map(|(a, b)| {
+                    u64::from(a[0].abs_diff(b[0]))
+                        + u64::from(a[1].abs_diff(b[1]))
+                        + u64::from(a[2].abs_diff(b[2]))
+                })
+                .sum();
+            eprintln!(
+                "presentation frame {number}: t={:.3} RGB MAE={:.3}",
+                actual.timestamp,
+                error as f64 / (y_end * 3) as f64
+            );
+        }
+    }
+
+    #[test]
     fn site_idr_slice_reaches_original_cabac_engine() {
         let Ok(path) = std::env::var("WEBCORE_MP4_FIXTURE") else {
             return;

@@ -4,6 +4,7 @@ pub mod av1;
 pub mod backend;
 pub mod h264;
 pub mod h264_cabac;
+mod h264_deblock;
 mod h264_high;
 mod h264_inter;
 pub mod h264_intra;

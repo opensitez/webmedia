@@ -13,6 +13,7 @@ use super::h264_cabac::{
     IntraMbTypeContexts, IntraPredContexts, Luma4x4Contexts, Luma8x8Contexts, Luma16x16AcContexts,
     Luma16x16DcContexts, MbQpContexts, Transform8x8Contexts, intra4x4_modes, intra8x8_modes,
 };
+use super::h264_deblock::filter_intra_picture;
 use super::h264_intra::{
     reconstruct_chroma, reconstruct_intra4x4_luma, reconstruct_intra8x8_luma,
     reconstruct_intra16x16_luma,
@@ -171,6 +172,8 @@ pub fn decode_cabac_i_yuv_2005(
     let mut cr = vec![0; width * height / 4];
     let mut states: Vec<IntraMb> =
         Vec::with_capacity((sps.width_mbs * sps.frame_height_mbs) as usize);
+    let mut macroblock_qps = Vec::with_capacity(states.capacity());
+    let mut macroblock_transform8x8 = Vec::with_capacity(states.capacity());
     let mut decoder = CabacDecoder::new(&slice.rbsp[slice.data_byte_offset..])?;
     let mut type_contexts = IntraMbTypeContexts::new(slice.slice_qp)?;
     let mut transform_contexts = Transform8x8Contexts::new(slice.slice_qp)?;
@@ -422,10 +425,28 @@ pub fn decode_cabac_i_yuv_2005(
             }),
             luma_dc_coded,
         });
+        macroblock_qps.push(qp);
+        macroblock_transform8x8.push(transform_8x8);
         let end = decoder.terminate()?;
         if end != (mb + 1 == mb_count) {
             return Err(AvcError::Unsupported("incomplete single-slice I picture"));
         }
+    }
+    if !slice.deblocking_disabled {
+        filter_intra_picture(
+            &mut luma,
+            &mut cb,
+            &mut cr,
+            width,
+            &macroblock_qps,
+            &macroblock_transform8x8,
+            [
+                pps.core.chroma_qp_index_offset,
+                pps.second_chroma_qp_index_offset,
+            ],
+            slice.alpha_offset,
+            slice.beta_offset,
+        )?;
     }
     let previous_poc = if nal[0] & 0x1f == 5 {
         None
