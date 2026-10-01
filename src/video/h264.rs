@@ -102,6 +102,7 @@ pub struct CabacIdrISlice {
     pub slice_qp: i32,
     pub rbsp: Vec<u8>,
     pub data_byte_offset: usize,
+    pub marking: Vec<MemoryManagement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -510,16 +511,42 @@ pub fn parse_cabac_idr_i_slice(
     sps: &SequenceParameters,
     pps: &PictureParameters2003,
 ) -> Result<CabacIdrISlice, AvcError> {
+    if nal.first().is_none_or(|header| header & 0x1f != 5) {
+        return Err(AvcError::InvalidData("expected IDR I slice"));
+    }
+    parse_cabac_i_slice(nal, sps, pps)
+}
+
+pub fn parse_slice_type(nal: &[u8]) -> Result<u32, AvcError> {
+    let nal_type = nal.first().ok_or(AvcError::Incomplete)? & 0x1f;
+    let rbsp = rbsp_from_nal(nal, nal_type)?;
+    let mut bits = Bits {
+        bytes: &rbsp,
+        bit: 0,
+    };
+    bits.ue()?;
+    bits.ue()
+}
+
+pub fn parse_cabac_i_slice(
+    nal: &[u8],
+    sps: &SequenceParameters,
+    pps: &PictureParameters2003,
+) -> Result<CabacIdrISlice, AvcError> {
+    let nal_type = nal.first().ok_or(AvcError::Incomplete)? & 0x1f;
+    if !matches!(nal_type, 1 | 5) {
+        return Err(AvcError::InvalidData("expected I slice"));
+    }
     if !sps.frame_mbs_only || sps.pic_order_cnt_type != 0 || pps.slice_groups != 1 || !pps.cabac {
         return Err(AvcError::Unsupported("CABAC IDR header shape"));
     }
     if pps.sequence_id != sps.id {
         return Err(AvcError::InvalidData("PPS refers to another SPS"));
     }
-    if nal.first().is_none_or(|header| header & 0x60 == 0) {
+    if nal_type == 5 && nal[0] & 0x60 == 0 {
         return Err(AvcError::InvalidData("IDR is not a reference picture"));
     }
-    let rbsp = rbsp_from_nal(nal, 5)?;
+    let rbsp = rbsp_from_nal(nal, nal_type)?;
     let mut bits = Bits {
         bytes: &rbsp,
         bit: 0,
@@ -529,10 +556,12 @@ pub fn parse_cabac_idr_i_slice(
         return Err(AvcError::InvalidData("first macroblock out of bounds"));
     }
     if !matches!(bits.ue()?, 2 | 7) || bits.ue()? != pps.id {
-        return Err(AvcError::Unsupported("expected IDR I slice for PPS"));
+        return Err(AvcError::Unsupported("expected I slice for PPS"));
     }
     let frame_num = bits.read(sps.frame_num_bits)?;
-    bits.ue()?; // idr_pic_id
+    if nal_type == 5 {
+        bits.ue()?; // idr_pic_id
+    }
     let pic_order_cnt_lsb = bits.read(
         sps.pic_order_cnt_lsb_bits
             .ok_or(AvcError::Unsupported("POC type"))?,
@@ -543,7 +572,26 @@ pub fn parse_cabac_idr_i_slice(
     if pps.redundant_pic_cnt_present {
         bits.ue()?;
     }
-    bits.read(2)?; // IDR reference picture marking flags
+    let mut marking = Vec::new();
+    if nal_type == 5 {
+        bits.read(2)?; // IDR reference picture marking flags
+    } else if nal[0] & 0x60 != 0 && bits.read(1)? != 0 {
+        for _ in 0..32 {
+            match bits.ue()? {
+                0 => break,
+                1 => marking.push(MemoryManagement::ForgetShortTerm(bits.ue()?)),
+                2..=6 => {
+                    return Err(AvcError::Unsupported(
+                        "adaptive reference marking operation",
+                    ));
+                }
+                _ => return Err(AvcError::InvalidData("invalid reference marking operation")),
+            }
+        }
+        if marking.len() == 32 {
+            return Err(AvcError::TooLarge);
+        }
+    }
     let slice_qp = pps.pic_init_qp + bits.se()?;
     if !(0..=51).contains(&slice_qp) {
         return Err(AvcError::InvalidData("slice QP out of range"));
@@ -574,6 +622,7 @@ pub fn parse_cabac_idr_i_slice(
         slice_qp,
         rbsp,
         data_byte_offset,
+        marking,
     })
 }
 
@@ -1102,6 +1151,20 @@ pub(super) fn frame_from_yuv420(
     cb: &[u8],
     cr: &[u8],
 ) -> super::VideoFrame {
+    #[cfg(target_arch = "aarch64")]
+    let rgba = unsafe { rgba_from_yuv420_neon(sps, luma, cb, cr) };
+    #[cfg(not(target_arch = "aarch64"))]
+    let rgba = rgba_from_yuv420_scalar(sps, luma, cb, cr);
+    super::VideoFrame {
+        width: sps.width,
+        height: sps.height,
+        rgba: std::sync::Arc::new(rgba),
+        timestamp: 0.0,
+    }
+}
+
+#[cfg(any(test, not(target_arch = "aarch64")))]
+fn rgba_from_yuv420_scalar(sps: &SequenceParameters, luma: &[u8], cb: &[u8], cr: &[u8]) -> Vec<u8> {
     let luma_stride = sps.width as usize;
     let chroma_stride = luma_stride / 2;
     let mut rgba = vec![0u8; luma.len() * 4];
@@ -1119,17 +1182,176 @@ pub(super) fn frame_from_yuv420(
             rgba[index + 3] = 255;
         }
     }
-    super::VideoFrame {
-        width: sps.width,
-        height: sps.height,
-        rgba: std::sync::Arc::new(rgba),
-        timestamp: 0.0,
+    rgba
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rgba_from_yuv420_neon(
+    sps: &SequenceParameters,
+    luma: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+) -> Vec<u8> {
+    use std::arch::aarch64::*;
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn convert_four(
+        y: int16x4_t,
+        u: int16x4_t,
+        v: int16x4_t,
+    ) -> (uint16x4_t, uint16x4_t, uint16x4_t) {
+        let y = vmovl_s16(y);
+        let u = vsubq_s32(vmovl_s16(u), vdupq_n_s32(128));
+        let v = vsubq_s32(vmovl_s16(v), vdupq_n_s32(128));
+        let c = vmulq_n_s32(
+            vmaxq_s32(vsubq_s32(y, vdupq_n_s32(16)), vdupq_n_s32(0)),
+            298,
+        );
+        let round = vdupq_n_s32(128);
+        let red = vshrq_n_s32::<8>(vaddq_s32(vmlaq_n_s32(c, v, 409), round));
+        let green = vshrq_n_s32::<8>(vaddq_s32(
+            vsubq_s32(vsubq_s32(c, vmulq_n_s32(u, 100)), vmulq_n_s32(v, 208)),
+            round,
+        ));
+        let blue = vshrq_n_s32::<8>(vaddq_s32(vmlaq_n_s32(c, u, 516), round));
+        (vqmovun_s32(red), vqmovun_s32(green), vqmovun_s32(blue))
+    }
+
+    unsafe {
+        let width = sps.width as usize;
+        let height = sps.height as usize;
+        let chroma_width = width / 2;
+        let mut rgba = vec![0u8; width * height * 4];
+        for y in 0..height {
+            let uv_row = y / 2 * chroma_width;
+            let mut x = 0;
+            while x + 8 <= width {
+                let mut u8 = [0u8; 8];
+                let mut v8 = [0u8; 8];
+                for pair in 0..4 {
+                    u8[pair * 2..pair * 2 + 2].fill(cb[uv_row + x / 2 + pair]);
+                    v8[pair * 2..pair * 2 + 2].fill(cr[uv_row + x / 2 + pair]);
+                }
+                let y8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(luma.as_ptr().add(y * width + x))));
+                let u8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(u8.as_ptr())));
+                let v8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(v8.as_ptr())));
+                let (r0, g0, b0) =
+                    convert_four(vget_low_s16(y8), vget_low_s16(u8), vget_low_s16(v8));
+                let (r1, g1, b1) =
+                    convert_four(vget_high_s16(y8), vget_high_s16(u8), vget_high_s16(v8));
+                let red = vqmovn_u16(vcombine_u16(r0, r1));
+                let green = vqmovn_u16(vcombine_u16(g0, g1));
+                let blue = vqmovn_u16(vcombine_u16(b0, b1));
+                let channels = uint8x8x4_t(red, green, blue, vdup_n_u8(255));
+                vst4_u8(rgba.as_mut_ptr().add((y * width + x) * 4), channels);
+                x += 8;
+            }
+            while x < width {
+                let value = i32::from(luma[y * width + x]) - 16;
+                let uv = uv_row + x / 2;
+                let u = i32::from(cb[uv]) - 128;
+                let v = i32::from(cr[uv]) - 128;
+                let c = value.max(0) * 298;
+                let offset = (y * width + x) * 4;
+                rgba[offset] = ((c + 409 * v + 128) >> 8).clamp(0, 255) as u8;
+                rgba[offset + 1] = ((c - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
+                rgba[offset + 2] = ((c + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+                rgba[offset + 3] = 255;
+                x += 1;
+            }
+        }
+        rgba
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_yuv_conversion_matches_scalar_for_full_and_tail_blocks() {
+        for width in [8, 16, 18, 24] {
+            let height = 6;
+            let sps = SequenceParameters {
+                id: 0,
+                profile_idc: 100,
+                level_idc: 31,
+                width,
+                height,
+                chroma_format_idc: 1,
+                bit_depth_luma: 8,
+                bit_depth_chroma: 8,
+                scaling_matrices_present: false,
+                width_mbs: width / 16,
+                frame_height_mbs: 1,
+                frame_mbs_only: true,
+                direct_8x8_inference: true,
+                frame_num_bits: 4,
+                max_num_ref_frames: 1,
+                pic_order_cnt_type: 0,
+                pic_order_cnt_lsb_bits: Some(4),
+            };
+            let pixels = width as usize * height as usize;
+            let luma: Vec<_> = (0..pixels).map(|i| ((i * 53 + 7) & 255) as u8).collect();
+            let cb: Vec<_> = (0..pixels / 4)
+                .map(|i| ((i * 37 + 3) & 255) as u8)
+                .collect();
+            let cr: Vec<_> = (0..pixels / 4)
+                .map(|i| ((i * 71 + 29) & 255) as u8)
+                .collect();
+            let expected = rgba_from_yuv420_scalar(&sps, &luma, &cb, &cr);
+            let actual = unsafe { rgba_from_yuv420_neon(&sps, &luma, &cb, &cr) };
+            assert_eq!(actual, expected, "width {width}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "run explicitly when measuring the native 1280x720 conversion path"]
+    fn benchmark_neon_yuv_conversion() {
+        let sps = SequenceParameters {
+            id: 0,
+            profile_idc: 100,
+            level_idc: 31,
+            width: 1280,
+            height: 720,
+            chroma_format_idc: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            scaling_matrices_present: false,
+            width_mbs: 80,
+            frame_height_mbs: 45,
+            frame_mbs_only: true,
+            direct_8x8_inference: true,
+            frame_num_bits: 4,
+            max_num_ref_frames: 1,
+            pic_order_cnt_type: 0,
+            pic_order_cnt_lsb_bits: Some(4),
+        };
+        let pixels = sps.width as usize * sps.height as usize;
+        let luma: Vec<_> = (0..pixels).map(|i| ((i * 53 + 7) & 255) as u8).collect();
+        let cb: Vec<_> = (0..pixels / 4)
+            .map(|i| ((i * 37 + 3) & 255) as u8)
+            .collect();
+        let cr: Vec<_> = (0..pixels / 4)
+            .map(|i| ((i * 71 + 29) & 255) as u8)
+            .collect();
+        let runs = 40;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(rgba_from_yuv420_scalar(&sps, &luma, &cb, &cr));
+        }
+        let scalar = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(unsafe { rgba_from_yuv420_neon(&sps, &luma, &cb, &cr) });
+        }
+        let neon = start.elapsed();
+        eprintln!("1280x720 x{runs}: scalar {scalar:?}, NEON {neon:?}");
+    }
 
     #[test]
     fn type_zero_picture_order_count_wraps_in_both_directions() {

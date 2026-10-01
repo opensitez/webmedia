@@ -1,8 +1,12 @@
 //! Progressive 8-bit, 4:2:0 CABAC IDR picture reconstruction (2005 profile).
 
+#[cfg(test)]
 use super::VideoFrame;
+#[cfg(test)]
+use super::h264::frame_from_yuv420;
 use super::h264::{
-    AvcError, PictureParameters2005, SequenceParameters, frame_from_yuv420, parse_cabac_idr_i_slice,
+    AvcError, MemoryManagement, PictureParameters2005, SequenceParameters, parse_cabac_i_slice,
+    type0_pic_order_count,
 };
 use super::h264_cabac::{
     CabacDecoder, ChromaAcContexts, ChromaDcContexts, CodedBlockContexts, CodedBlockPattern,
@@ -26,6 +30,7 @@ pub struct Yuv420Picture {
     pub cb: Vec<u8>,
     pub cr: Vec<u8>,
     pub motion: Vec<[MotionCell; 4]>,
+    pub(super) luma_half: std::sync::OnceLock<super::h264_inter::HalfPelPlanes>,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -107,6 +112,7 @@ fn write_block(plane: &mut [u8], stride: usize, x: usize, y: usize, block: &[u8]
     }
 }
 
+#[cfg(test)]
 pub fn decode_cabac_idr_2005(
     nal: &[u8],
     sps: &SequenceParameters,
@@ -126,6 +132,18 @@ pub fn decode_cabac_idr_yuv_2005(
     sps: &SequenceParameters,
     pps: &PictureParameters2005,
 ) -> Result<Yuv420Picture, AvcError> {
+    if nal.first().is_none_or(|header| header & 0x1f != 5) {
+        return Err(AvcError::InvalidData("expected IDR I slice"));
+    }
+    decode_cabac_i_yuv_2005(nal, sps, pps, None).map(|(picture, _)| picture)
+}
+
+pub fn decode_cabac_i_yuv_2005(
+    nal: &[u8],
+    sps: &SequenceParameters,
+    pps: &PictureParameters2005,
+    previous_reference: Option<&Yuv420Picture>,
+) -> Result<(Yuv420Picture, Vec<MemoryManagement>), AvcError> {
     if sps.profile_idc != 100
         || sps.chroma_format_idc != 1
         || sps.bit_depth_luma != 8
@@ -136,11 +154,11 @@ pub fn decode_cabac_idr_yuv_2005(
         || sps.width != sps.width_mbs * 16
         || sps.height != sps.frame_height_mbs * 16
     {
-        return Err(AvcError::Unsupported("High-profile IDR picture format"));
+        return Err(AvcError::Unsupported("High-profile I picture format"));
     }
-    let slice = parse_cabac_idr_i_slice(nal, sps, &pps.core)?;
+    let slice = parse_cabac_i_slice(nal, sps, &pps.core)?;
     if slice.first_mb != 0 {
-        return Err(AvcError::Unsupported("IDR picture starts in a later slice"));
+        return Err(AvcError::Unsupported("I picture starts in a later slice"));
     }
     let pixels = u64::from(sps.width) * u64::from(sps.height);
     if pixels > 8 * 1024 * 1024 {
@@ -406,19 +424,34 @@ pub fn decode_cabac_idr_yuv_2005(
         });
         let end = decoder.terminate()?;
         if end != (mb + 1 == mb_count) {
-            return Err(AvcError::Unsupported("incomplete single-slice IDR picture"));
+            return Err(AvcError::Unsupported("incomplete single-slice I picture"));
         }
     }
-    Ok(Yuv420Picture {
-        width,
-        height,
-        frame_num: slice.frame_num,
-        pic_order_cnt_lsb: slice.pic_order_cnt_lsb,
-        pic_order_cnt_msb: 0,
-        pic_order_cnt: slice.pic_order_cnt_lsb as i32,
-        luma,
-        cb,
-        cr,
-        motion: vec![[MotionCell::default(); 4]; mb_count],
-    })
+    let previous_poc = if nal[0] & 0x1f == 5 {
+        None
+    } else {
+        previous_reference.map(|picture| (picture.pic_order_cnt_msb, picture.pic_order_cnt_lsb))
+    };
+    let (pic_order_cnt_msb, pic_order_cnt) = type0_pic_order_count(
+        slice.pic_order_cnt_lsb,
+        sps.pic_order_cnt_lsb_bits
+            .ok_or(AvcError::Unsupported("POC type"))?,
+        previous_poc,
+    )?;
+    Ok((
+        Yuv420Picture {
+            width,
+            height,
+            frame_num: slice.frame_num,
+            pic_order_cnt_lsb: slice.pic_order_cnt_lsb,
+            pic_order_cnt_msb,
+            pic_order_cnt,
+            luma,
+            cb,
+            cr,
+            motion: vec![[MotionCell::default(); 4]; mb_count],
+            luma_half: std::sync::OnceLock::new(),
+        },
+        slice.marking,
+    ))
 }
