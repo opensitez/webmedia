@@ -541,13 +541,13 @@ pub fn decode_cabac_p_2005(
     for y in 0..height_mbs {
         for x in 0..width_mbs {
             let index = y * width_mbs + x;
-            let left = (x > 0).then(|| states[index - 1]).flatten();
-            let above = (y > 0).then(|| states[index - width_mbs]).flatten();
+            let left = (x > 0).then(|| states[index - 1].as_ref()).flatten();
+            let above = (y > 0).then(|| states[index - width_mbs].as_ref()).flatten();
             let upper_right = (y > 0 && x + 1 < width_mbs)
-                .then(|| states[index - width_mbs + 1])
+                .then(|| states[index - width_mbs + 1].as_ref())
                 .flatten();
             let upper_left = (y > 0 && x > 0)
-                .then(|| states[index - width_mbs - 1])
+                .then(|| states[index - width_mbs - 1].as_ref())
                 .flatten();
             let skipped = decoder.inter_mb_skip_flag(
                 &mut inter,
@@ -1419,7 +1419,7 @@ pub fn decode_cabac_p_2005(
                     [2, 3].map(|part| ac_levels[channel][part].iter().any(|&level| level != 0))
                 }),
             });
-            let state = states[index].expect("decoded P macroblock");
+            let state = states[index].as_ref().expect("decoded P macroblock");
             picture.motion[index] = [0, 3, 12, 15].map(|cell| MotionCell {
                 l0: Some((state.refs4[cell], state.motion4[cell])),
                 l1: None,
@@ -1440,7 +1440,7 @@ pub fn decode_cabac_p_2005(
             .iter()
             .enumerate()
             .map(|(index, state)| {
-                let state = state.expect("decoded P macroblock");
+                let state = state.as_ref().expect("decoded P macroblock");
                 DeblockMb {
                     qp: state.qp,
                     intra: state.intra16 || state.intra_nxn,
@@ -1631,8 +1631,8 @@ pub fn decode_cabac_b_2005(
         for x in 0..width_mbs {
             let index = y * width_mbs + x;
             let mb_start_bits = if trace_b { decoder.consumed_bits() } else { 0 };
-            let left = (x > 0).then(|| states[index - 1]).flatten();
-            let above = (y > 0).then(|| states[index - width_mbs]).flatten();
+            let left = (x > 0).then(|| states[index - 1].as_ref()).flatten();
+            let above = (y > 0).then(|| states[index - width_mbs].as_ref()).flatten();
             let skipped = decoder.inter_mb_skip_flag(
                 &mut inter,
                 left.map(|state| state.skipped),
@@ -2431,7 +2431,7 @@ pub fn decode_cabac_b_2005(
             .iter()
             .enumerate()
             .map(|(index, state)| {
-                let state = state.expect("decoded B macroblock");
+                let state = state.as_ref().expect("decoded B macroblock");
                 DeblockMb {
                     qp: state.qp,
                     intra: state.intra16 || state.intra_nxn,
@@ -3288,8 +3288,7 @@ fn predict_inter_16x16(
     });
     let integer_x = (mb_x * 16) as i64 + i64::from(motion[0] >> 2);
     let integer_y = (mb_y * 16) as i64 + i64::from(motion[1] >> 2);
-    if weight.is_none()
-        && motion[0] & 3 == 0
+    let luma_bulk = if motion[0] & 3 == 0
         && motion[1] & 3 == 0
         && integer_x >= 0
         && integer_y >= 0
@@ -3303,11 +3302,26 @@ fn predict_inter_16x16(
             block.luma[row * 16..row * 16 + 16]
                 .copy_from_slice(&reference.luma[source..source + 16]);
         }
-    } else if weight.is_some()
-        || !half.is_some_and(|half| {
-            predict_cached_luma_region(reference, half, mb_x, mb_y, 0, 0, 16, motion, &mut block.luma, 16, 0, 0)
-        })
-    {
+        true
+    } else if let Some(half) = half {
+        predict_cached_luma_region(
+            reference, half, mb_x, mb_y, 0, 0, 16, motion, &mut block.luma, 16, 0, 0,
+        )
+    } else {
+        false
+    };
+    if luma_bulk {
+        if let Some((table, weight)) = weight {
+            for value in &mut block.luma {
+                *value = weighted_single(
+                    *value,
+                    weight.luma_weight,
+                    weight.luma_offset,
+                    table.luma_denom,
+                );
+            }
+        }
+    } else {
         for y in 0..16 {
             for x in 0..16 {
                 let x4 = ((mb_x * 16 + x) as i32) * 4 + motion[0];
@@ -3335,8 +3349,7 @@ fn predict_inter_16x16(
     let chroma_height = reference.height / 2;
     let chroma_source_x = mb_x as i64 * 8 + i64::from(motion[0] >> 3);
     let chroma_source_y = mb_y as i64 * 8 + i64::from(motion[1] >> 3);
-    if weight.is_none()
-        && motion[0] & 7 == 0
+    let chroma_bulk = if motion[0] & 7 == 0
         && motion[1] & 7 == 0
         && chroma_source_x >= 0
         && chroma_source_y >= 0
@@ -3351,10 +3364,9 @@ fn predict_inter_16x16(
             block.cb[target.clone()].copy_from_slice(&reference.cb[source..source + 8]);
             block.cr[target].copy_from_slice(&reference.cr[source..source + 8]);
         }
-        return Ok(block);
-    }
-    if weight.is_none()
-        && predict_chroma_region(
+        true
+    } else {
+        predict_chroma_region(
             reference,
             mb_x * 8,
             mb_y * 8,
@@ -3363,7 +3375,20 @@ fn predict_inter_16x16(
             &mut block.cb,
             &mut block.cr,
         )
-    {
+    };
+    if chroma_bulk {
+        if let Some((table, weight)) = weight {
+            for (channel, target) in [&mut block.cb, &mut block.cr].into_iter().enumerate() {
+                for value in target {
+                    *value = weighted_single(
+                        *value,
+                        weight.chroma_weight[channel],
+                        weight.chroma_offset[channel],
+                        table.chroma_denom,
+                    );
+                }
+            }
+        }
         return Ok(block);
     }
     for y in 0..8 {
@@ -4031,6 +4056,75 @@ mod tests {
         assert_eq!(block.luma, [200; 256]);
         assert_eq!(block.cb, [160; 64]);
         assert_eq!(block.cr, [120; 64]);
+    }
+
+    #[test]
+    fn weighted_fractional_prediction_matches_scalar_samples() {
+        let width = 48;
+        let height = 48;
+        let reference = Yuv420Picture {
+            width,
+            height,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt: 0,
+            luma: (0..width * height).map(|i| (i * 37 % 251) as u8).collect(),
+            cb: (0..width * height / 4).map(|i| (i * 19 % 253) as u8).collect(),
+            cr: (0..width * height / 4).map(|i| (i * 29 % 247) as u8).collect(),
+            motion: vec![[MotionCell::default(); 4]; 9],
+            luma_half: std::sync::OnceLock::new(),
+        };
+        let weights = PredictionWeightTable {
+            luma_denom: 1,
+            chroma_denom: 1,
+            list0: vec![super::super::h264::PredictionWeight {
+                luma_weight: 3,
+                luma_offset: -2,
+                chroma_weight: [2, 3],
+                chroma_offset: [1, -3],
+            }],
+            list1: vec![],
+        };
+        let weight = &weights.list0[0];
+        for (mb_x, mb_y, motion) in [(1, 1, [1, 3]), (1, 1, [8, 0]), (0, 0, [-3, -5])] {
+            let block = predict_l0_16x16(&reference, mb_x, mb_y, motion, Some(&weights), 0)
+                .unwrap();
+            for y in 0..16 {
+                for x in 0..16 {
+                    let x4 = ((mb_x * 16 + x) as i32) * 4 + motion[0];
+                    let y4 = ((mb_y * 16 + y) as i32) * 4 + motion[1];
+                    let expected = weighted_single(
+                        luma_quarter(&reference.luma, width, height, x4, y4),
+                        weight.luma_weight,
+                        weight.luma_offset,
+                        weights.luma_denom,
+                    );
+                    assert_eq!(block.luma[y * 16 + x], expected, "luma ({mb_x},{mb_y}) ({x},{y})");
+                }
+            }
+            for y in 0..8 {
+                for x in 0..8 {
+                    let x8 = ((mb_x * 8 + x) as i32) * 8 + motion[0];
+                    let y8 = ((mb_y * 8 + y) as i32) * 8 + motion[1];
+                    for (channel, (source, actual)) in [
+                        (&reference.cb, &block.cb),
+                        (&reference.cr, &block.cr),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let expected = weighted_single(
+                            chroma_eighth(source, width / 2, height / 2, x8, y8),
+                            weight.chroma_weight[channel],
+                            weight.chroma_offset[channel],
+                            weights.chroma_denom,
+                        );
+                        assert_eq!(actual[y * 8 + x], expected, "chroma {channel} ({mb_x},{mb_y}) ({x},{y})");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

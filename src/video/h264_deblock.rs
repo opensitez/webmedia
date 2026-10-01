@@ -116,13 +116,11 @@ fn filter_edge(
             p0,
             p1,
             plane[q - 3 * across] as i32,
-            plane[q - 4 * across] as i32,
         ];
         let r = [
             q0,
             q1,
             plane[q + 2 * across] as i32,
-            plane[q + 3 * across] as i32,
         ];
         let (mut p0, mut p1, mut p2) = (p[0], p[1], p[2]);
         let (mut q0, mut q1, mut q2) = (r[0], r[1], r[2]);
@@ -131,14 +129,16 @@ fn filter_edge(
             if !chroma && strong && (p[2] - p[0]).abs() < beta {
                 p0 = (p[2] + 2 * p[1] + 2 * p[0] + 2 * r[0] + r[1] + 4) >> 3;
                 p1 = (p[2] + p[1] + p[0] + r[0] + 2) >> 2;
-                p2 = (2 * p[3] + 3 * p[2] + p[1] + p[0] + r[0] + 4) >> 3;
+                let p3 = plane[q - 4 * across] as i32;
+                p2 = (2 * p3 + 3 * p[2] + p[1] + p[0] + r[0] + 4) >> 3;
             } else {
                 p0 = (2 * p[1] + p[0] + r[1] + 2) >> 2;
             }
             if !chroma && strong && (r[2] - r[0]).abs() < beta {
                 q0 = (p[1] + 2 * p[0] + 2 * r[0] + 2 * r[1] + r[2] + 4) >> 3;
                 q1 = (p[0] + r[0] + r[1] + r[2] + 2) >> 2;
-                q2 = (2 * r[3] + 3 * r[2] + r[1] + r[0] + p[0] + 4) >> 3;
+                let q3 = plane[q + 3 * across] as i32;
+                q2 = (2 * q3 + 3 * r[2] + r[1] + r[0] + p[0] + 4) >> 3;
             } else {
                 q0 = (2 * r[1] + r[0] + p[1] + 2) >> 2;
             }
@@ -329,8 +329,8 @@ fn motion_differs(a: MotionCell, b: MotionCell) -> bool {
 }
 
 fn boundary_strength(
-    current: DeblockMb,
-    previous: DeblockMb,
+    current: &DeblockMb,
+    previous: &DeblockMb,
     current_region: usize,
     previous_region: usize,
     mb_edge: bool,
@@ -366,13 +366,14 @@ pub(super) fn filter_inter_picture(
     for mb in 0..macroblocks.len() {
         let x = mb % mb_width;
         let y = mb / mb_width;
-        let current = macroblocks[mb];
+        let current = &macroblocks[mb];
+        let mut vertical_chroma_strength = [[0u8; 2]; 2];
         for edge in 0..4 {
             if edge == 0 && x == 0 || edge % 2 != 0 && current.transform8x8 {
                 continue;
             }
             let previous = if edge == 0 {
-                macroblocks[mb - 1]
+                &macroblocks[mb - 1]
             } else {
                 current
             };
@@ -385,6 +386,9 @@ pub(super) fn filter_inter_picture(
                 let q_region = (segment / 2) * 2 + edge / 2;
                 let p_region = (segment / 2) * 2 + if edge == 0 { 1 } else { (edge - 1) / 2 };
                 let strength = boundary_strength(current, previous, q_region, p_region, edge == 0);
+                if edge == 0 || edge == 2 {
+                    vertical_chroma_strength[edge / 2][segment / 2] = strength;
+                }
                 filter_edge(
                     luma, width, x * 16 + edge * 4, y * 16 + segment * 4,
                     true, 4, strength, qp, alpha_offset, beta_offset, false,
@@ -399,14 +403,12 @@ pub(super) fn filter_inter_picture(
                 if edge == 0 && x == 0 {
                     continue;
                 }
-                let previous = if edge == 0 { macroblocks[mb - 1] } else { current };
+                let previous = if edge == 0 { &macroblocks[mb - 1] } else { current };
                 let qpc = chroma_qp(current.qp, offset)?;
                 let ppc = chroma_qp(previous.qp, offset)?;
                 let qp = (qpc + ppc + 1) >> 1;
                 for segment in 0..2 {
-                    let q_region = segment * 2 + edge;
-                    let p_region = segment * 2 + if edge == 0 { 1 } else { 0 };
-                    let strength = boundary_strength(current, previous, q_region, p_region, edge == 0);
+                    let strength = vertical_chroma_strength[edge][segment];
                     filter_edge(
                         plane, width / 2, x * 8 + edge * 4, y * 8 + segment * 4,
                         true, 4, strength, qp, alpha_offset, beta_offset, true,
@@ -414,12 +416,13 @@ pub(super) fn filter_inter_picture(
                 }
             }
         }
+        let mut horizontal_chroma_strength = [[0u8; 2]; 2];
         for edge in 0..4 {
             if edge == 0 && y == 0 || edge % 2 != 0 && current.transform8x8 {
                 continue;
             }
             let previous = if edge == 0 {
-                macroblocks[mb - mb_width]
+                &macroblocks[mb - mb_width]
             } else {
                 current
             };
@@ -432,6 +435,9 @@ pub(super) fn filter_inter_picture(
                 let q_region = (edge / 2) * 2 + segment / 2;
                 let p_region = (if edge == 0 { 1 } else { (edge - 1) / 2 }) * 2 + segment / 2;
                 let strength = boundary_strength(current, previous, q_region, p_region, edge == 0);
+                if edge == 0 || edge == 2 {
+                    horizontal_chroma_strength[edge / 2][segment / 2] = strength;
+                }
                 filter_edge(
                     luma, width, x * 16 + segment * 4, y * 16 + edge * 4,
                     false, 4, strength, qp, alpha_offset, beta_offset, false,
@@ -446,14 +452,12 @@ pub(super) fn filter_inter_picture(
                 if edge == 0 && y == 0 {
                     continue;
                 }
-                let previous = if edge == 0 { macroblocks[mb - mb_width] } else { current };
+                let previous = if edge == 0 { &macroblocks[mb - mb_width] } else { current };
                 let qpc = chroma_qp(current.qp, offset)?;
                 let ppc = chroma_qp(previous.qp, offset)?;
                 let qp = (qpc + ppc + 1) >> 1;
                 for segment in 0..2 {
-                    let q_region = edge * 2 + segment;
-                    let p_region = (if edge == 0 { 1 } else { 0 }) * 2 + segment;
-                    let strength = boundary_strength(current, previous, q_region, p_region, edge == 0);
+                    let strength = horizontal_chroma_strength[edge][segment];
                     filter_edge(
                         plane, width / 2, x * 8 + segment * 4, y * 8 + edge * 4,
                         false, 4, strength, qp, alpha_offset, beta_offset, true,
