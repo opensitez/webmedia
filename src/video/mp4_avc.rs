@@ -707,6 +707,110 @@ mod tests {
     }
 
     #[test]
+    fn site_target_reference_picture_error_profile() {
+        let (Ok(fixture), Ok(raw), Ok(target)) = (
+            std::env::var("WEBCORE_MP4_FULL_FIXTURE"),
+            std::env::var("WEBCORE_H264_TARGET_REFERENCE_YUV"),
+            std::env::var("WEBCORE_H264_TARGET_SAMPLE"),
+        ) else {
+            return;
+        };
+        let target: usize = target.parse().unwrap();
+        let bytes = std::fs::read(fixture).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let sample = &index.samples[target];
+        let start = (0..=target)
+            .rev()
+            .find(|&number| index.samples[number].keyframe)
+            .unwrap();
+        let presentation_index = index
+            .samples
+            .iter()
+            .filter(|other| other.presentation_time < sample.presentation_time)
+            .count();
+        eprintln!("sample {target} presentation index {presentation_index} from keyframe {start}");
+        let start_offset = index.samples[start].offset as usize;
+        let end_offset = sample.offset as usize + sample.size as usize;
+        let mut decoder = Mp4AvcStream::new();
+        decoder.index = Some(index.clone());
+        decoder.next_sample = start;
+        decoder.base_offset = start_offset as u64;
+        let preceding = if target == start {
+            start_offset
+        } else {
+            let previous = &index.samples[target - 1];
+            previous.offset as usize + previous.size as usize
+        };
+        decoder.push(&bytes[start_offset..preceding]).unwrap();
+        assert_eq!(decoder.next_sample, target);
+        let (actual, picture, _, _) = Mp4AvcStream::decode_sample(
+            &index,
+            &bytes[start_offset..end_offset],
+            start_offset as u64,
+            target,
+            &decoder.reference_pictures,
+        )
+        .unwrap();
+        let expected = std::fs::read(raw).unwrap();
+        let frame_bytes = actual.width as usize * actual.height as usize * 3 / 2;
+        assert_eq!(expected.len(), frame_bytes);
+        let y_end = actual.width as usize * actual.height as usize;
+        let cb_end = y_end + y_end / 4;
+        let reference = frame_from_yuv420(
+            &index.config.sequence_parameters[0],
+            &expected[..y_end],
+            &expected[y_end..cb_end],
+            &expected[cb_end..],
+        );
+        if let Ok(path) = std::env::var("WEBCORE_H264_TARGET_DUMP_RGBA") {
+            std::fs::write(path, &*actual.rgba).unwrap();
+        }
+        let error: u64 = actual
+            .rgba
+            .chunks_exact(4)
+            .zip(reference.rgba.chunks_exact(4))
+            .map(|(a, b)| {
+                (0..3)
+                    .map(|channel| u64::from(a[channel].abs_diff(b[channel])))
+                    .sum::<u64>()
+            })
+            .sum();
+        let mae = error as f64 / (y_end * 3) as f64;
+        eprintln!(
+            "sample {target} pts={:.3} RGB MAE={:.3}",
+            sample.presentation_time as f64 / index.timescale as f64,
+            mae
+        );
+        if let Ok(limit) = std::env::var("WEBCORE_H264_TARGET_MAX_RGB_MAE") {
+            let limit: f64 = limit.parse().unwrap();
+            assert!(mae < limit, "sample {target} RGB MAE {mae} exceeds {limit}");
+        }
+        let mut blocks = Vec::new();
+        for my in 0..actual.height as usize / 16 {
+            for mx in 0..actual.width as usize / 16 {
+                let mut error = 0u64;
+                for row in 0..16 {
+                    for col in 0..16 {
+                        let at = ((my * 16 + row) * actual.width as usize + mx * 16 + col) * 4;
+                        error += u64::from(actual.rgba[at].abs_diff(reference.rgba[at]));
+                    }
+                }
+                blocks.push((error, mx, my));
+            }
+        }
+        blocks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        eprintln!("worst luma macroblocks: {:?}", &blocks[..12]);
+        if std::env::var_os("WEBMEDIA_TRACE_ERROR_MAP").is_some() {
+            if let Some(picture) = picture.as_ref() {
+                for &(_, mx, my) in blocks.iter().take(5) {
+                    let index = my * (picture.width / 16) + mx;
+                    eprintln!("motion ({mx},{my}): {:?}", picture.motion[index]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn site_samples_770_and_771_have_distinct_picture_headers() {
         let Ok(path) = std::env::var("WEBCORE_MP4_FULL_FIXTURE") else {
             return;

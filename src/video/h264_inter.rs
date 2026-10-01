@@ -30,7 +30,6 @@ struct InterMbState {
     transform8x8: bool,
     modes4: [u8; 16],
     modes8: [u8; 4],
-    motion: [[i32; 2]; 4],
     motion4: [[i32; 2]; 16],
     mvd4: [[i32; 2]; 16],
     refs4: [u8; 16],
@@ -188,10 +187,6 @@ fn motion_predictor(
     if above.is_none() && upper_right.is_none() {
         return left.unwrap_or([0, 0]);
     }
-    let available = [left, above, upper_right];
-    if available.iter().filter(|mb| mb.is_some()).count() == 1 {
-        return available.into_iter().flatten().next().unwrap();
-    }
     let a = left.unwrap_or([0, 0]);
     let b = above.unwrap_or([0, 0]);
     let c = upper_right.unwrap_or([0, 0]);
@@ -225,6 +220,17 @@ fn motion_predictor_for_ref(
         right.map(|(_, vector)| vector),
         None,
     )
+}
+
+fn p_neighbor_motion(mb: Option<&InterMbState>, cell: usize) -> Option<(u8, [i32; 2])> {
+    mb.map(|mb| {
+        if mb.intra16 || mb.intra_nxn {
+            // Intra neighbors are available for prediction with refIdx = -1 and mv = 0.
+            (u8::MAX, [0, 0])
+        } else {
+            (mb.refs4[cell], mb.motion4[cell])
+        }
+    })
 }
 
 fn p_skip_motion(
@@ -561,24 +567,10 @@ pub fn decode_cabac_p_2005(
             {
                 eprintln!("P MB {index}: skipped={skipped} bits={}", decoder.consumed_bits());
             }
-            let above_bottom = above
-                .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                .map(|mb| mb.motion[2]);
-            let upper_right_bottom = upper_right
-                .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                .map(|mb| mb.motion[2]);
-            let left_reference = left
-                .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                .map(|mb| (mb.refs4[3], mb.motion4[3]));
-            let above_reference = above
-                .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                .map(|mb| (mb.refs4[12], mb.motion4[12]));
-            let upper_right_reference = upper_right
-                .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                .map(|mb| (mb.refs4[12], mb.motion4[12]));
-            let upper_left_reference = upper_left
-                .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                .map(|mb| (mb.refs4[15], mb.motion4[15]));
+            let left_reference = p_neighbor_motion(left, 3);
+            let above_reference = p_neighbor_motion(above, 12);
+            let upper_right_reference = p_neighbor_motion(upper_right, 12);
+            let upper_left_reference = p_neighbor_motion(upper_left, 15);
             let upper_candidate = if y > 0 && x + 1 < width_mbs {
                 upper_right_reference
             } else {
@@ -783,7 +775,6 @@ pub fn decode_cabac_p_2005(
                             transform8x8,
                             modes4,
                             modes8,
-                            motion: [[0; 2]; 4],
                             motion4: [[0; 2]; 16],
                             mvd4: [[0; 2]; 16],
                             refs4: [0; 16],
@@ -909,7 +900,6 @@ pub fn decode_cabac_p_2005(
                         transform8x8: false,
                         modes4: [2; 16],
                         modes8: [2; 4],
-                        motion: [[0; 2]; 4],
                         motion4: [[0; 2]; 16],
                         mvd4: [[0; 2]; 16],
                         refs4: [0; 16],
@@ -1055,23 +1045,13 @@ pub fn decode_cabac_p_2005(
                                     let cell = cy as usize * 4 + cx as usize;
                                     cell_motion[cell].map(|vector| (cell_refs[cell], vector))
                                 } else if cx < 0 && (0..4).contains(&cy) {
-                                    left.filter(|mb| !mb.intra16 && !mb.intra_nxn).map(|mb| {
-                                        let cell = cy as usize * 4 + 3;
-                                        (mb.refs4[cell], mb.motion4[cell])
-                                    })
+                                    p_neighbor_motion(left, cy as usize * 4 + 3)
                                 } else if cy < 0 && (0..4).contains(&cx) {
-                                    above.filter(|mb| !mb.intra16 && !mb.intra_nxn).map(|mb| {
-                                        let cell = 12 + cx as usize;
-                                        (mb.refs4[cell], mb.motion4[cell])
-                                    })
+                                    p_neighbor_motion(above, 12 + cx as usize)
                                 } else if cx >= 4 && cy < 0 {
-                                    upper_right
-                                        .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                                        .map(|mb| (mb.refs4[12], mb.motion4[12]))
+                                    p_neighbor_motion(upper_right, 12)
                                 } else if cx < 0 && cy < 0 {
-                                    upper_left
-                                        .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                                        .map(|mb| (mb.refs4[15], mb.motion4[15]))
+                                    p_neighbor_motion(upper_left, 15)
                                 } else {
                                     None
                                 }
@@ -1206,20 +1186,37 @@ pub fn decode_cabac_p_2005(
                                 second_above_mvd_y,
                             )?,
                         ];
-                        let bottom_predictor = if kind == 1 {
-                            left.map_or(top, |mb| mb.motion[3])
-                        } else {
-                            upper_right_bottom.unwrap_or_else(|| {
-                                motion_predictor(
-                                    Some(top),
-                                    above
-                                        .filter(|mb| !mb.intra16 && !mb.intra_nxn)
-                                        .map(|mb| mb.motion[3]),
-                                    upper_right_bottom,
-                                    above_bottom,
+                        let (left_motion, above_motion, right_motion, upper_left_motion, reference) =
+                            if kind == 1 {
+                                (
+                                    p_neighbor_motion(left, 11),
+                                    Some((refs[0], top)),
+                                    None,
+                                    p_neighbor_motion(left, 7),
+                                    refs[2],
                                 )
-                            })
-                        };
+                            } else {
+                                (
+                                    Some((refs[0], top)),
+                                    p_neighbor_motion(above, 14),
+                                    p_neighbor_motion(upper_right, 12),
+                                    p_neighbor_motion(above, 15),
+                                    refs[1],
+                                )
+                            };
+                        let directional = if kind == 1 { left_motion } else { right_motion };
+                        let bottom_predictor = directional
+                            .filter(|(index, _)| *index == reference)
+                            .map(|(_, vector)| vector)
+                            .unwrap_or_else(|| {
+                                motion_predictor_for_ref(
+                                    left_motion,
+                                    above_motion,
+                                    right_motion,
+                                    upper_left_motion,
+                                    reference,
+                                )
+                            });
                         let bottom = [
                             bottom_predictor[0].saturating_add(bottom_mvd[0]),
                             bottom_predictor[1].saturating_add(bottom_mvd[1]),
@@ -1393,7 +1390,6 @@ pub fn decode_cabac_p_2005(
                 transform8x8,
                 modes4: [2; 16],
                 modes8: [2; 4],
-                motion,
                 motion4: sub_partitions.map_or_else(
                     || std::array::from_fn(|cell| motion[(cell / 8) * 2 + (cell % 4) / 2]),
                     |parts| parts.vectors,
@@ -2098,15 +2094,24 @@ pub fn decode_cabac_b_2005(
                         };
                         let from = |cell: MotionCell| if list == 0 { cell.l0 } else { cell.l1 };
                         let ref_index = selected_refs[list][partitions[part][0]];
-                        let vector_for_ref = |cell: MotionCell| {
-                            from(cell)
+                        let left_motion = left_cell.and_then(from);
+                        let above_motion = above_cell.and_then(from);
+                        let right_motion = right_cell.and_then(from);
+                        let upper_left_motion = upper_left_cell.and_then(from);
+                        let directional = |candidate: Option<(u8, [i32; 2])>| {
+                            candidate
                                 .filter(|(index, _)| *index == ref_index)
                                 .map(|(_, vector)| vector)
                         };
-                        let left_motion = left_cell.and_then(vector_for_ref);
-                        let above_motion = above_cell.and_then(vector_for_ref);
-                        let right_motion = right_cell.and_then(vector_for_ref);
-                        let upper_left_motion = upper_left_cell.and_then(vector_for_ref);
+                        let median_prediction = || {
+                            motion_predictor_for_ref(
+                                left_motion,
+                                above_motion,
+                                right_motion,
+                                upper_left_motion,
+                                ref_index,
+                            )
+                        };
                         let left_mvd = if part == 1 && vertical {
                             Some(mvd[list][0])
                         } else {
@@ -2132,48 +2137,15 @@ pub fn decode_cabac_b_2005(
                             )?,
                         ];
                         let predicted = if partition_count == 2 && !vertical && part == 0 {
-                            above_motion.unwrap_or_else(|| {
-                                motion_predictor(
-                                    left_motion,
-                                    above_motion,
-                                    right_motion,
-                                    upper_left_motion,
-                                )
-                            })
+                            directional(above_motion).unwrap_or_else(median_prediction)
                         } else if partition_count == 2 && !vertical && part == 1 {
-                            left_motion.unwrap_or_else(|| {
-                                motion_predictor(
-                                    left_motion,
-                                    above_motion,
-                                    right_motion,
-                                    upper_left_motion,
-                                )
-                            })
+                            directional(left_motion).unwrap_or_else(median_prediction)
                         } else if partition_count == 2 && vertical && part == 0 {
-                            left_motion.unwrap_or_else(|| {
-                                motion_predictor(
-                                    left_motion,
-                                    above_motion,
-                                    right_motion,
-                                    upper_left_motion,
-                                )
-                            })
+                            directional(left_motion).unwrap_or_else(median_prediction)
                         } else if partition_count == 2 && vertical && part == 1 {
-                            right_motion.unwrap_or_else(|| {
-                                motion_predictor(
-                                    left_motion,
-                                    above_motion,
-                                    right_motion,
-                                    upper_left_motion,
-                                )
-                            })
+                            directional(right_motion).unwrap_or_else(median_prediction)
                         } else {
-                            motion_predictor(
-                                left_motion,
-                                above_motion,
-                                right_motion,
-                                upper_left_motion,
-                            )
+                            median_prediction()
                         };
                         let vector = [
                             predicted[0].saturating_add(difference[0]),
@@ -2739,7 +2711,7 @@ unsafe fn halfpel_rows_neon(
     plane: &[u8],
     width: usize,
     index: usize,
-    raw: &mut [i32],
+    raw: &mut [i16],
     horizontal_half: &mut [u8],
     vertical_half: &mut [u8],
 ) {
@@ -2762,14 +2734,7 @@ unsafe fn halfpel_rows_neon(
             vld1_u8(source.add(2 * width)),
             vld1_u8(source.add(3 * width)),
         ]);
-        vst1q_s32(
-            raw.as_mut_ptr().add(index),
-            vmovl_s16(vget_low_s16(horizontal)),
-        );
-        vst1q_s32(
-            raw.as_mut_ptr().add(index + 4),
-            vmovl_s16(vget_high_s16(horizontal)),
-        );
+        vst1q_s16(raw.as_mut_ptr().add(index), horizontal);
         let rounded_horizontal = vshrq_n_s16::<5>(vaddq_s16(horizontal, vdupq_n_s16(16)));
         let rounded_vertical = vshrq_n_s16::<5>(vaddq_s16(vertical, vdupq_n_s16(16)));
         vst1_u8(
@@ -2785,11 +2750,12 @@ unsafe fn halfpel_rows_neon(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn diagonal_row_neon(raw: &[i32], width: usize, index: usize, output: &mut [u8]) {
+unsafe fn diagonal_row_neon(raw: &[i16], width: usize, index: usize, output: &mut [u8]) {
     use std::arch::aarch64::*;
     #[inline]
     #[target_feature(enable = "neon")]
-    unsafe fn filter(taps: [int32x4_t; 6]) -> uint16x4_t {
+    unsafe fn filter(taps: [int16x4_t; 6]) -> uint16x4_t {
+        let taps = taps.map(|value| vmovl_s16(value));
         let value = vaddq_s32(
             vsubq_s32(
                 vaddq_s32(taps[0], taps[5]),
@@ -2801,23 +2767,16 @@ unsafe fn diagonal_row_neon(raw: &[i32], width: usize, index: usize, output: &mu
     }
     unsafe {
         let source = raw.as_ptr().add(index);
-        let low = filter([
-            vld1q_s32(source.sub(2 * width)),
-            vld1q_s32(source.sub(width)),
-            vld1q_s32(source),
-            vld1q_s32(source.add(width)),
-            vld1q_s32(source.add(2 * width)),
-            vld1q_s32(source.add(3 * width)),
-        ]);
-        let source = source.add(4);
-        let high = filter([
-            vld1q_s32(source.sub(2 * width)),
-            vld1q_s32(source.sub(width)),
-            vld1q_s32(source),
-            vld1q_s32(source.add(width)),
-            vld1q_s32(source.add(2 * width)),
-            vld1q_s32(source.add(3 * width)),
-        ]);
+        let taps = [
+            vld1q_s16(source.sub(2 * width)),
+            vld1q_s16(source.sub(width)),
+            vld1q_s16(source),
+            vld1q_s16(source.add(width)),
+            vld1q_s16(source.add(2 * width)),
+            vld1q_s16(source.add(3 * width)),
+        ];
+        let low = filter(taps.map(|value| vget_low_s16(value)));
+        let high = filter(taps.map(|value| vget_high_s16(value)));
         vst1_u8(
             output.as_mut_ptr().add(index),
             vqmovn_u16(vcombine_u16(low, high)),
@@ -2830,7 +2789,7 @@ impl HalfPelPlanes {
         let width = reference.width;
         let height = reference.height;
         let plane = &reference.luma;
-        let mut horizontal_raw = vec![0i32; width * height];
+        let mut horizontal_raw = vec![0i16; width * height];
         let mut horizontal_half = vec![0u8; width * height];
         let mut vertical_half = vec![0u8; width * height];
         let mut diagonal_half = vec![0u8; width * height];
@@ -2867,7 +2826,8 @@ impl HalfPelPlanes {
                 } else {
                     horizontal(plane, width, height, x as i32, y as i32)
                 };
-                horizontal_raw[index] = value;
+                // Six-tap output from u8 samples lies in [-2550, 10200].
+                horizontal_raw[index] = value as i16;
                 horizontal_half[index] = clip((value + 16) >> 5);
                 let vertical_value = if interior {
                     six_tap([
@@ -2898,19 +2858,21 @@ impl HalfPelPlanes {
                 }
                 let taps = if y >= 2 && y + 3 < height {
                     six_tap([
-                        horizontal_raw[index - 2 * width],
-                        horizontal_raw[index - width],
-                        horizontal_raw[index],
-                        horizontal_raw[index + width],
-                        horizontal_raw[index + 2 * width],
-                        horizontal_raw[index + 3 * width],
+                        i32::from(horizontal_raw[index - 2 * width]),
+                        i32::from(horizontal_raw[index - width]),
+                        i32::from(horizontal_raw[index]),
+                        i32::from(horizontal_raw[index + width]),
+                        i32::from(horizontal_raw[index + 2 * width]),
+                        i32::from(horizontal_raw[index + 3 * width]),
                     ])
                 } else {
                     six_tap(std::array::from_fn(|i| {
-                        horizontal_raw[(y as i32 + i as i32 - 2).clamp(0, height as i32 - 1)
-                            as usize
-                            * width
-                            + x]
+                        i32::from(
+                            horizontal_raw[(y as i32 + i as i32 - 2)
+                                .clamp(0, height as i32 - 1) as usize
+                                * width
+                                + x],
+                        )
                     }))
                 };
                 diagonal_half[y * width + x] = clip((taps + 512) >> 10);
@@ -3041,7 +3003,13 @@ fn predict_cached_luma_region(
             let second = &second[source + offset..source + offset + span];
             #[cfg(target_arch = "aarch64")]
             unsafe {
-                average_luma_row_neon(first, second, destination);
+                if span >= 8 {
+                    average_luma_row_neon(first, second, destination);
+                } else {
+                    for (out, (&a, &b)) in destination.iter_mut().zip(first.iter().zip(second)) {
+                        *out = (u16::from(a) + u16::from(b) + 1 >> 1) as u8;
+                    }
+                }
             }
             #[cfg(not(target_arch = "aarch64"))]
             for (out, (&a, &b)) in destination.iter_mut().zip(first.iter().zip(second)) {
@@ -3452,21 +3420,45 @@ fn predict_p_subpartitions(
                         .ok_or(AvcError::InvalidData("missing prediction weight"))
                 })
                 .transpose()?;
-            for row in cy * 4..cy * 4 + 4 {
-                for col in cx * 4..cx * 4 + 4 {
-                    let x4 = ((mb_x * 16 + col) as i32) * 4 + motion[0];
-                    let y4 = ((mb_y * 16 + row) as i32) * 4 + motion[1];
-                    let value = match half {
-                        Some(half) => luma_quarter_cached(source, half, x4, y4),
-                        None => luma_quarter(&source.luma, source.width, source.height, x4, y4),
+            let region_x = cx * 4;
+            let region_y = cy * 4;
+            let integer_x = (mb_x * 16 + region_x) as i64 + i64::from(motion[0] >> 2);
+            let integer_y = (mb_y * 16 + region_y) as i64 + i64::from(motion[1] >> 2);
+            let luma_bulk = if motion[0] & 3 == 0
+                && motion[1] & 3 == 0
+                && integer_x >= 0
+                && integer_y >= 0
+                && integer_x + 4 <= source.width as i64
+                && integer_y + 4 <= source.height as i64
+            {
+                for row in 0..4 {
+                    let from = (integer_y as usize + row) * source.width + integer_x as usize;
+                    let to = (region_y + row) * 16 + region_x;
+                    block.luma[to..to + 4].copy_from_slice(&source.luma[from..from + 4]);
+                }
+                true
+            } else if let Some(half) = half {
+                predict_cached_luma_region(
+                    source, half, mb_x, mb_y, region_x, region_y, 4, motion,
+                    &mut block.luma, 16, region_x, region_y,
+                )
+            } else {
+                false
+            };
+            for row in region_y..region_y + 4 {
+                for col in region_x..region_x + 4 {
+                    let value = if luma_bulk {
+                        block.luma[row * 16 + col]
+                    } else {
+                        let x4 = ((mb_x * 16 + col) as i32) * 4 + motion[0];
+                        let y4 = ((mb_y * 16 + row) as i32) * 4 + motion[1];
+                        match half {
+                            Some(half) => luma_quarter_cached(source, half, x4, y4),
+                            None => luma_quarter(&source.luma, source.width, source.height, x4, y4),
+                        }
                     };
                     block.luma[row * 16 + col] = if let Some((table, weight)) = weight {
-                        weighted_single(
-                            value,
-                            weight.luma_weight,
-                            weight.luma_offset,
-                            table.luma_denom,
-                        )
+                        weighted_single(value, weight.luma_weight, weight.luma_offset, table.luma_denom)
                     } else {
                         value
                     };
@@ -4389,7 +4381,7 @@ mod tests {
             motion: vec![[MotionCell::default(); 4]; 16],
             luma_half: std::sync::OnceLock::new(),
         };
-        for size in [4, 8] {
+        for size in [2, 4, 8] {
             for y in [0, 4, 12, 24] {
                 for x in [0, 4, 12, 24] {
                     for dy in -9..=9 {
@@ -4444,31 +4436,42 @@ mod tests {
             motion: vec![[MotionCell::default(); 4]; 80 * 45],
             luma_half: std::sync::OnceLock::new(),
         };
-        for bulk in [false, true] {
-            let start = std::time::Instant::now();
-            let mut cb = [0u8; 64];
-            let mut cr = [0u8; 64];
-            for i in 0..10_000 {
-                let x = 16 + i % 600;
-                let y = 16 + i % 320;
-                let motion = [3, 5];
-                if bulk {
-                    assert!(predict_chroma_region(
-                        &reference, x, y, motion, 8, &mut cb, &mut cr,
-                    ));
-                } else {
-                    for row in 0..8 {
-                        for col in 0..8 {
-                            let x8 = ((x + col) as i32) * 8 + motion[0];
-                            let y8 = ((y + row) as i32) * 8 + motion[1];
-                            cb[row * 8 + col] = chroma_eighth(&reference.cb, 640, 360, x8, y8);
-                            cr[row * 8 + col] = chroma_eighth(&reference.cr, 640, 360, x8, y8);
+        for size in [2, 8] {
+            let count = if size == 2 { 100_000 } else { 10_000 };
+            for bulk in [false, true] {
+                let start = std::time::Instant::now();
+                let mut cb = [0u8; 64];
+                let mut cr = [0u8; 64];
+                for i in 0..count {
+                    let x = 16 + i % 600;
+                    let y = 16 + i % 320;
+                    let motion = [3, 5];
+                    if bulk {
+                        assert!(predict_chroma_region(
+                            &reference,
+                            x,
+                            y,
+                            motion,
+                            size,
+                            &mut cb[..size * size],
+                            &mut cr[..size * size],
+                        ));
+                    } else {
+                        for row in 0..size {
+                            for col in 0..size {
+                                let x8 = ((x + col) as i32) * 8 + motion[0];
+                                let y8 = ((y + row) as i32) * 8 + motion[1];
+                                cb[row * size + col] =
+                                    chroma_eighth(&reference.cb, 640, 360, x8, y8);
+                                cr[row * size + col] =
+                                    chroma_eighth(&reference.cr, 640, 360, x8, y8);
+                            }
                         }
                     }
+                    std::hint::black_box((&cb[..size * size], &cr[..size * size]));
                 }
-                std::hint::black_box((&cb[..], &cr[..]));
+                eprintln!("chroma {count} {size}x{size} blocks bulk={bulk}: {:?}", start.elapsed());
             }
-            eprintln!("chroma 10k blocks bulk={bulk}: {:?}", start.elapsed());
         }
     }
 
@@ -4520,40 +4523,10 @@ mod tests {
     }
 
     #[test]
-    fn median_prediction_uses_the_only_available_reference() {
-        let mb = InterMbState {
-            qp: 26,
-            skipped: false,
-            intra16: false,
-            intra_nxn: false,
-            transform8x8: false,
-            modes4: [2; 16],
-            modes8: [2; 4],
-            motion: [[9, -3]; 4],
-            motion4: [[9, -3]; 16],
-            mvd4: [[0, 0]; 16],
-            refs4: [0; 16],
-            coded: CodedBlockPattern {
-                luma: 0,
-                chroma: 0,
-                pcm: false,
-            },
-            chroma_mode: 0,
-            luma_dc_coded: false,
-            luma_ac_right: [false; 4],
-            luma_ac_bottom: [false; 4],
-            chroma_dc_coded: [false; 2],
-            chroma_ac_right: [[false; 2]; 2],
-            chroma_ac_bottom: [[false; 2]; 2],
-        };
-        assert_eq!(
-            motion_predictor(None, Some(mb.motion[2]), None, None),
-            [9, -3]
-        );
-        assert_eq!(
-            motion_predictor(Some(mb.motion[1]), None, None, None),
-            [9, -3]
-        );
+    fn median_prediction_uses_left_only_exception_and_zero_for_missing_neighbors() {
+        assert_eq!(motion_predictor(None, Some([9, -3]), None, None), [0, 0]);
+        assert_eq!(motion_predictor(None, None, Some([9, -3]), None), [0, 0]);
+        assert_eq!(motion_predictor(Some([9, -3]), None, None, None), [9, -3]);
         assert_eq!(
             motion_predictor_for_ref(
                 Some((1, [17, 0])),
@@ -4563,6 +4536,37 @@ mod tests {
                 0,
             ),
             [2, -5]
+        );
+        let left = Some((0, [0, 0]));
+        let above = Some((1, [10, 10]));
+        let upper_left = Some((0, [200, 200]));
+        assert_eq!(
+            motion_predictor_for_ref(
+                left,
+                above,
+                Some((u8::MAX, [0, 0])),
+                upper_left,
+                0,
+            ),
+            [0, 0]
+        );
+        assert_eq!(
+            motion_predictor_for_ref(left, above, None, upper_left, 0),
+            [10, 10]
+        );
+        assert_eq!(
+            motion_predictor_for_ref(
+                Some((1, [9, 0])),
+                Some((u8::MAX, [0, 0])),
+                None,
+                None,
+                0,
+            ),
+            [0, 0]
+        );
+        assert_eq!(
+            motion_predictor_for_ref(Some((1, [9, 0])), None, None, None, 0),
+            [9, 0]
         );
     }
 

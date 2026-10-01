@@ -370,11 +370,14 @@ fn rbsp_from_nal(nal: &[u8], expected_type: u8) -> Result<Vec<u8>, AvcError> {
         return Err(AvcError::InvalidData("invalid parameter-set NAL"));
     }
     let mut rbsp = Vec::with_capacity(nal.len().saturating_sub(1));
+    let mut zero_count = 0;
     for &byte in &nal[1..] {
-        if rbsp.len() >= 2 && rbsp[rbsp.len() - 2..] == [0, 0] && byte == 3 {
+        if zero_count == 2 && byte == 3 {
+            zero_count = 0;
             continue;
         }
         rbsp.push(byte);
+        zero_count = if byte == 0 { (zero_count + 1).min(2) } else { 0 };
     }
     Ok(rbsp)
 }
@@ -1172,7 +1175,7 @@ pub(super) fn frame_from_yuv420(
     cr: &[u8],
 ) -> super::VideoFrame {
     #[cfg(target_arch = "aarch64")]
-    let rgba = unsafe { rgba_from_yuv420_neon(sps, luma, cb, cr) };
+    let rgba = unsafe { rgba_from_yuv420_neon::<true>(sps, luma, cb, cr) };
     #[cfg(not(target_arch = "aarch64"))]
     let rgba = rgba_from_yuv420_scalar(sps, luma, cb, cr);
     super::VideoFrame {
@@ -1207,7 +1210,7 @@ fn rgba_from_yuv420_scalar(sps: &SequenceParameters, luma: &[u8], cb: &[u8], cr:
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn rgba_from_yuv420_neon(
+unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool>(
     sps: &SequenceParameters,
     luma: &[u8],
     cb: &[u8],
@@ -1248,15 +1251,23 @@ unsafe fn rgba_from_yuv420_neon(
             let uv_row = y / 2 * chroma_width;
             let mut x = 0;
             while x + 8 <= width {
-                let mut u8 = [0u8; 8];
-                let mut v8 = [0u8; 8];
-                for pair in 0..4 {
-                    u8[pair * 2..pair * 2 + 2].fill(cb[uv_row + x / 2 + pair]);
-                    v8[pair * 2..pair * 2 + 2].fill(cr[uv_row + x / 2 + pair]);
-                }
+                let chroma = uv_row + x / 2;
+                let (u8, v8) = if VECTOR_CHROMA_LOAD && x / 2 + 8 <= chroma_width {
+                    let u = vld1_u8(cb.as_ptr().add(chroma));
+                    let v = vld1_u8(cr.as_ptr().add(chroma));
+                    (vzip1_u8(u, u), vzip1_u8(v, v))
+                } else {
+                    let mut u = [0u8; 8];
+                    let mut v = [0u8; 8];
+                    for pair in 0..4 {
+                        u[pair * 2..pair * 2 + 2].fill(cb[chroma + pair]);
+                        v[pair * 2..pair * 2 + 2].fill(cr[chroma + pair]);
+                    }
+                    (vld1_u8(u.as_ptr()), vld1_u8(v.as_ptr()))
+                };
                 let y8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(luma.as_ptr().add(y * width + x))));
-                let u8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(u8.as_ptr())));
-                let v8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(v8.as_ptr())));
+                let u8 = vreinterpretq_s16_u16(vmovl_u8(u8));
+                let v8 = vreinterpretq_s16_u16(vmovl_u8(v8));
                 let (r0, g0, b0) =
                     convert_four(vget_low_s16(y8), vget_low_s16(u8), vget_low_s16(v8));
                 let (r1, g1, b1) =
@@ -1289,6 +1300,14 @@ unsafe fn rgba_from_yuv420_neon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rbsp_removes_only_emulation_prevention_bytes() {
+        assert_eq!(
+            rbsp_from_nal(&[0x41, 0, 0, 3, 0, 0, 3, 3, 0, 0, 3, 1], 1).unwrap(),
+            [0, 0, 0, 0, 3, 0, 0, 1]
+        );
+    }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
@@ -1323,7 +1342,7 @@ mod tests {
                 .map(|i| ((i * 71 + 29) & 255) as u8)
                 .collect();
             let expected = rgba_from_yuv420_scalar(&sps, &luma, &cb, &cr);
-            let actual = unsafe { rgba_from_yuv420_neon(&sps, &luma, &cb, &cr) };
+            let actual = unsafe { rgba_from_yuv420_neon::<true>(&sps, &luma, &cb, &cr) };
             assert_eq!(actual, expected, "width {width}");
         }
     }
@@ -1360,17 +1379,21 @@ mod tests {
             .map(|i| ((i * 71 + 29) & 255) as u8)
             .collect();
         let runs = 40;
-        let start = std::time::Instant::now();
-        for _ in 0..runs {
-            std::hint::black_box(rgba_from_yuv420_scalar(&sps, &luma, &cb, &cr));
+        for vector_chroma_load in [false, true, true, false] {
+            let start = std::time::Instant::now();
+            for _ in 0..runs {
+                let rgba = if vector_chroma_load {
+                    unsafe { rgba_from_yuv420_neon::<true>(&sps, &luma, &cb, &cr) }
+                } else {
+                    unsafe { rgba_from_yuv420_neon::<false>(&sps, &luma, &cb, &cr) }
+                };
+                std::hint::black_box(rgba);
+            }
+            eprintln!(
+                "1280x720 x{runs}: vector chroma load={vector_chroma_load}: {:?}",
+                start.elapsed()
+            );
         }
-        let scalar = start.elapsed();
-        let start = std::time::Instant::now();
-        for _ in 0..runs {
-            std::hint::black_box(unsafe { rgba_from_yuv420_neon(&sps, &luma, &cb, &cr) });
-        }
-        let neon = start.elapsed();
-        eprintln!("1280x720 x{runs}: scalar {scalar:?}, NEON {neon:?}");
     }
 
     #[test]
