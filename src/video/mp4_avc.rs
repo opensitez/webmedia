@@ -329,7 +329,10 @@ impl StreamingVideoDecoder for Mp4AvcStream {
                     .is_some_and(|header| header & 0x1f == 1 && header & 0x60 == 0) =>
                 {
                     if std::env::var_os("WEBMEDIA_TRACE_RECOVERY").is_some() {
-                        eprintln!("dropping non-reference sample {}: {error:?}", self.next_sample);
+                        eprintln!(
+                            "dropping non-reference sample {}: {error:?}",
+                            self.next_sample
+                        );
                     }
                     self.dropped_nonreference_samples += 1;
                     self.next_sample += 1;
@@ -338,7 +341,10 @@ impl StreamingVideoDecoder for Mp4AvcStream {
                 }
                 Err(error) if self.next_sample + 1 < self.index.as_ref().unwrap().samples.len() => {
                     if std::env::var_os("WEBMEDIA_TRACE_RECOVERY").is_some() {
-                        eprintln!("resync after reference sample {}: {error:?}", self.next_sample);
+                        eprintln!(
+                            "resync after reference sample {}: {error:?}",
+                            self.next_sample
+                        );
                     }
                     self.waiting_for_idr = true;
                     self.dropped_until_idr_samples += 1;
@@ -664,6 +670,14 @@ mod tests {
             .unwrap();
         let start_offset = index.samples[start].offset as usize;
         let end_sample = &index.samples[target];
+        if std::env::var_os("WEBMEDIA_TRACE_RECOVERY").is_some() {
+            eprintln!(
+                "target sample {target} pts={:.3} offset={} size={}",
+                end_sample.presentation_time as f64 / index.timescale as f64,
+                end_sample.offset,
+                end_sample.size
+            );
+        }
         let end_offset = end_sample.offset as usize + end_sample.size as usize;
         let mut decoder = Mp4AvcStream::new();
         decoder.index = Some(index);
