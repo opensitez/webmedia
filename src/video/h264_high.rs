@@ -20,9 +20,18 @@ pub struct Yuv420Picture {
     pub height: usize,
     pub frame_num: u32,
     pub pic_order_cnt_lsb: u32,
+    pub pic_order_cnt_msb: i32,
+    pub pic_order_cnt: i32,
     pub luma: Vec<u8>,
     pub cb: Vec<u8>,
     pub cr: Vec<u8>,
+    pub motion: Vec<[MotionCell; 4]>,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct MotionCell {
+    pub l0: Option<(u8, [i32; 2])>,
+    pub l1: Option<(u8, [i32; 2])>,
 }
 
 #[derive(Clone, Copy)]
@@ -73,11 +82,21 @@ fn luma8_edges(mb: &IntraMb, side: bool) -> [u8; 2] {
     }
 }
 
-fn upper_edge<const N: usize>(plane: &[u8], stride: usize, x: usize, y: usize) -> Option<[u8; N]> {
+pub(super) fn upper_edge<const N: usize>(
+    plane: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+) -> Option<[u8; N]> {
     (y > 0).then(|| std::array::from_fn(|i| plane[(y - 1) * stride + (x + i).min(stride - 1)]))
 }
 
-fn left_edge<const N: usize>(plane: &[u8], stride: usize, x: usize, y: usize) -> Option<[u8; N]> {
+pub(super) fn left_edge<const N: usize>(
+    plane: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+) -> Option<[u8; N]> {
     (x > 0).then(|| std::array::from_fn(|i| plane[(y + i) * stride + x - 1]))
 }
 
@@ -395,8 +414,11 @@ pub fn decode_cabac_idr_yuv_2005(
         height,
         frame_num: slice.frame_num,
         pic_order_cnt_lsb: slice.pic_order_cnt_lsb,
+        pic_order_cnt_msb: 0,
+        pic_order_cnt: slice.pic_order_cnt_lsb as i32,
         luma,
         cb,
         cr,
+        motion: vec![[MotionCell::default(); 4]; mb_count],
     })
 }

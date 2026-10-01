@@ -102,6 +102,7 @@ impl MtxStreamDecoder {
 
     /// `offset` is the absolute byte position in the EOT resource. Skipping or
     /// replaying bytes is an error; a fetcher should send each new range once.
+    #[inline]
     pub fn push(&mut self, offset: usize, mut bytes: &[u8]) -> Result<(), &'static str> {
         if offset != self.cursor {
             return Err("non-contiguous MTX stream input");

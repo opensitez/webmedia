@@ -10,6 +10,7 @@ pub struct RasterImage {
 
 /// Decode a complete raster image. Animated formats yield their first frame.
 /// SVG is a document format and is not decoded here.
+#[inline]
 pub fn decode_raster(bytes: &[u8]) -> Result<RasterImage, image::ImageError> {
     let image = image::load_from_memory(bytes)?;
     let has_alpha = image.color().has_alpha();

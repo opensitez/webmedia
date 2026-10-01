@@ -85,6 +85,23 @@ const TRANS_MPS: [u8; 64] = [
     51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
 
+const INTRA_MB_TYPE_CODES: [&str; 26] = [
+    "0", "100000", "100001", "100010", "100011", "1001000", "1001001", "1001010", "1001011",
+    "1001100", "1001101", "1001110", "1001111", "101000", "101001", "101010", "101011", "1011000",
+    "1011001", "1011010", "1011011", "1011100", "1011101", "1011110", "1011111", "11",
+];
+
+const B_MB_TYPE_CODES: [&str; 24] = [
+    "0", "100", "101", "110000", "110001", "110010", "110011", "110100", "110101", "110110",
+    "110111", "111110", "1110000", "1110001", "1110010", "1110011", "1110100", "1110101",
+    "1110110", "1110111", "1111000", "1111001", "111111", "111101",
+];
+
+const B_SUB_MB_TYPE_CODES: [&str; 13] = [
+    "0", "100", "101", "11000", "11001", "11010", "11011", "111000", "111001", "111010", "111011",
+    "11110", "11111",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Context {
     pub state: u8,
@@ -122,14 +139,39 @@ pub struct CabacDecoder<'a> {
 /// CABAC contexts 3..10 for I-slice `mb_type` (2003 Tables 9-12 and 9-29).
 pub struct IntraMbTypeContexts([Context; 8]);
 
-/// Inter-slice CABAC contexts 11..13 (P skip), 24..26 (B skip), and 14..17 (P type).
+/// Inter-slice CABAC contexts for skip, P macroblock type, and P sub-macroblock type.
 pub struct InterMbContexts {
     skip: [Context; 3],
     p_type: [Context; 4],
+    p_intra_type: [Context; 3],
+    p_sub_type: [Context; 3],
+    b_type: [Context; 9],
+    b_sub_type: [Context; 4],
 }
 
 /// CABAC contexts 40..53 for horizontal and vertical motion differences.
 pub struct MotionVectorContexts([Context; 14]);
+
+/// CABAC contexts 54..59 for reference indices in either prediction list.
+pub struct ReferenceIndexContexts([Context; 6]);
+
+impl ReferenceIndexContexts {
+    pub fn new(slice_qp: i32, cabac_init_idc: u32) -> Result<Self, AvcError> {
+        const VALUES: [[(i32, i32); 6]; 3] = [
+            [(-7, 67), (-5, 74), (-4, 74), (-5, 80), (-7, 72), (1, 58)],
+            [(-1, 66), (-1, 77), (1, 70), (-2, 86), (-5, 72), (0, 61)],
+            [(3, 55), (-4, 79), (-2, 75), (-12, 97), (-7, 50), (1, 60)],
+        ];
+        let values = VALUES
+            .get(cabac_init_idc as usize)
+            .ok_or(AvcError::InvalidData("CABAC initialization out of range"))?;
+        let mut contexts = [Context { state: 0, mps: 0 }; 6];
+        for (context, &(m, n)) in contexts.iter_mut().zip(values) {
+            *context = Context::init(m, n, slice_qp)?;
+        }
+        Ok(Self(contexts))
+    }
+}
 
 impl MotionVectorContexts {
     pub fn new(slice_qp: i32, cabac_init_idc: u32) -> Result<Self, AvcError> {
@@ -211,6 +253,68 @@ impl InterMbContexts {
             2 => [(-10, 51), (-3, 62), (-27, 99), (26, 16)],
             _ => unreachable!(),
         };
+        let p_intra_type = match cabac_init_idc {
+            0 => [(5, 57), (-13, 78), (-11, 65), (1, 62)],
+            1 => [(2, 65), (-6, 71), (-13, 79), (5, 52)],
+            2 => [(26, 16), (-4, 85), (-24, 102), (5, 57)],
+            _ => unreachable!(),
+        };
+        let p_sub_type = match cabac_init_idc {
+            0 => [(12, 49), (-4, 73), (17, 50)],
+            1 => [(9, 50), (-3, 70), (10, 54)],
+            2 => [(6, 57), (-17, 73), (14, 57)],
+            _ => unreachable!(),
+        };
+        let b_type = match cabac_init_idc {
+            0 => [
+                (26, 67),
+                (16, 90),
+                (9, 104),
+                (-46, 127),
+                (-20, 104),
+                (1, 67),
+                (-13, 78),
+                (-11, 65),
+                (1, 62),
+            ],
+            1 => [
+                (57, 2),
+                (41, 36),
+                (26, 69),
+                (-45, 127),
+                (-15, 101),
+                (-4, 76),
+                (-6, 71),
+                (-13, 79),
+                (5, 52),
+            ],
+            2 => [
+                (54, 0),
+                (37, 42),
+                (12, 97),
+                (-32, 127),
+                (-22, 117),
+                (-2, 74),
+                (-4, 85),
+                (-24, 102),
+                (5, 57),
+            ],
+            _ => unreachable!(),
+        };
+        let mut b_contexts = [Context { state: 0, mps: 0 }; 9];
+        for (context, (m, n)) in b_contexts.iter_mut().zip(b_type) {
+            *context = Context::init(m, n, slice_qp)?;
+        }
+        let b_sub_type = match cabac_init_idc {
+            0 => [(-6, 86), (-17, 95), (-6, 61), (9, 45)],
+            1 => [(6, 69), (-13, 90), (0, 52), (8, 43)],
+            2 => [(-6, 93), (-14, 88), (-6, 44), (4, 55)],
+            _ => unreachable!(),
+        };
+        let mut b_sub_contexts = [Context { state: 0, mps: 0 }; 4];
+        for (context, (m, n)) in b_sub_contexts.iter_mut().zip(b_sub_type) {
+            *context = Context::init(m, n, slice_qp)?;
+        }
         Ok(Self {
             skip: [
                 Context::init(init[0].0, init[0].1, slice_qp)?,
@@ -223,6 +327,18 @@ impl InterMbContexts {
                 Context::init(p_type[2].0, p_type[2].1, slice_qp)?,
                 Context::init(p_type[3].0, p_type[3].1, slice_qp)?,
             ],
+            p_intra_type: [
+                Context::init(p_intra_type[1].0, p_intra_type[1].1, slice_qp)?,
+                Context::init(p_intra_type[2].0, p_intra_type[2].1, slice_qp)?,
+                Context::init(p_intra_type[3].0, p_intra_type[3].1, slice_qp)?,
+            ],
+            p_sub_type: [
+                Context::init(p_sub_type[0].0, p_sub_type[0].1, slice_qp)?,
+                Context::init(p_sub_type[1].0, p_sub_type[1].1, slice_qp)?,
+                Context::init(p_sub_type[2].0, p_sub_type[2].1, slice_qp)?,
+            ],
+            b_type: b_contexts,
+            b_sub_type: b_sub_contexts,
         })
     }
 }
@@ -379,7 +495,7 @@ pub struct Luma16x16DcContexts {
     magnitude: [Context; 10],
 }
 
-/// I-slice Intra16x16 luma AC contexts (block category 1, Tables 9-18..9-21).
+/// Intra16x16 luma AC contexts (block category 1, Tables 9-18..9-21).
 pub struct Luma16x16AcContexts {
     coded: [Context; 4],
     significant: [Context; 14],
@@ -456,6 +572,172 @@ impl Luma16x16AcContexts {
             )?,
         })
     }
+
+    pub fn new_inter(slice_qp: i32, cabac_init_idc: u32) -> Result<Self, AvcError> {
+        const CODED: [[(i32, i32); 4]; 3] = [
+            [(-3, 46), (-1, 65), (-1, 57), (-9, 93)],
+            [(0, 39), (0, 65), (-15, 84), (-35, 127)],
+            [(-6, 55), (4, 61), (-14, 83), (-37, 127)],
+        ];
+        const SIGNIFICANT: [[(i32, i32); 14]; 3] = [
+            [
+                (11, 35),
+                (4, 64),
+                (1, 61),
+                (11, 35),
+                (18, 25),
+                (12, 24),
+                (13, 29),
+                (13, 36),
+                (-10, 93),
+                (-7, 73),
+                (-2, 73),
+                (13, 46),
+                (9, 49),
+                (-7, 100),
+            ],
+            [
+                (-4, 66),
+                (-5, 78),
+                (-4, 71),
+                (-8, 72),
+                (2, 59),
+                (-1, 55),
+                (-7, 70),
+                (-6, 75),
+                (-8, 89),
+                (-34, 119),
+                (-3, 75),
+                (32, 20),
+                (30, 22),
+                (-44, 127),
+            ],
+            [
+                (-4, 44),
+                (-1, 69),
+                (0, 62),
+                (-7, 51),
+                (-4, 47),
+                (-6, 42),
+                (-3, 41),
+                (-6, 53),
+                (8, 76),
+                (-9, 78),
+                (-11, 83),
+                (9, 52),
+                (0, 67),
+                (-5, 90),
+            ],
+        ];
+        const LAST: [[(i32, i32); 14]; 3] = [
+            [
+                (6, 51),
+                (6, 57),
+                (7, 53),
+                (6, 52),
+                (6, 55),
+                (11, 45),
+                (14, 36),
+                (8, 53),
+                (-1, 82),
+                (7, 55),
+                (-3, 78),
+                (15, 46),
+                (22, 31),
+                (-1, 84),
+            ],
+            [
+                (33, -4),
+                (29, 10),
+                (37, -5),
+                (51, -29),
+                (39, -9),
+                (52, -34),
+                (69, -58),
+                (67, -63),
+                (44, -5),
+                (32, 7),
+                (55, -29),
+                (32, 1),
+                (0, 0),
+                (27, 36),
+            ],
+            [
+                (8, 44),
+                (11, 44),
+                (14, 42),
+                (7, 48),
+                (4, 56),
+                (4, 52),
+                (13, 37),
+                (9, 49),
+                (19, 58),
+                (10, 48),
+                (12, 45),
+                (0, 69),
+                (20, 33),
+                (8, 63),
+            ],
+        ];
+        const MAGNITUDE: [[(i32, i32); 10]; 3] = [
+            [
+                (-9, 77),
+                (3, 24),
+                (0, 42),
+                (0, 48),
+                (0, 55),
+                (-6, 59),
+                (-7, 71),
+                (-12, 83),
+                (-11, 87),
+                (-30, 119),
+            ],
+            [
+                (-21, 101),
+                (-3, 39),
+                (-5, 53),
+                (-7, 61),
+                (-11, 75),
+                (-15, 77),
+                (-17, 91),
+                (-25, 107),
+                (-25, 111),
+                (-28, 122),
+            ],
+            [
+                (-21, 100),
+                (-14, 57),
+                (-12, 67),
+                (-11, 71),
+                (-10, 77),
+                (-21, 85),
+                (-16, 88),
+                (-23, 104),
+                (-15, 98),
+                (-37, 127),
+            ],
+        ];
+        let idc = cabac_init_idc as usize;
+        if idc > 2 {
+            return Err(AvcError::InvalidData("CABAC initialization out of range"));
+        }
+        fn init<const N: usize>(
+            values: [(i32, i32); N],
+            qp: i32,
+        ) -> Result<[Context; N], AvcError> {
+            let mut contexts = [Context { state: 0, mps: 0 }; N];
+            for (context, (m, n)) in contexts.iter_mut().zip(values) {
+                *context = Context::init(m, n, qp)?;
+            }
+            Ok(contexts)
+        }
+        Ok(Self {
+            coded: init(CODED[idc], slice_qp)?,
+            significant: init(SIGNIFICANT[idc], slice_qp)?,
+            last: init(LAST[idc], slice_qp)?,
+            magnitude: init(MAGNITUDE[idc], slice_qp)?,
+        })
+    }
 }
 
 impl Luma16x16DcContexts {
@@ -526,6 +808,190 @@ impl Luma16x16DcContexts {
                     (-9, 91),
                 ],
                 slice_qp,
+            )?,
+        })
+    }
+    /// P/B-slice residual contexts from 2005 Tables 9-18 through 9-21.
+    pub fn new_inter(slice_qp: i32, cabac_init_idc: u32) -> Result<Self, AvcError> {
+        fn init<const N: usize>(
+            values: [[(i32, i32); N]; 3],
+            qp: i32,
+            idc: u32,
+        ) -> Result<[Context; N], AvcError> {
+            let selected = values
+                .get(idc as usize)
+                .ok_or(AvcError::InvalidData("CABAC initialization out of range"))?;
+            let mut contexts = [Context { state: 0, mps: 0 }; N];
+            for (context, &(m, n)) in contexts.iter_mut().zip(selected) {
+                *context = Context::init(m, n, qp)?;
+            }
+            Ok(contexts)
+        }
+        Ok(Self {
+            coded: init(
+                [
+                    [(-7, 92), (-5, 89), (-7, 96), (-13, 108)],
+                    [(0, 80), (-5, 89), (-7, 94), (-4, 92)],
+                    [(11, 80), (5, 76), (2, 84), (5, 78)],
+                ],
+                slice_qp,
+                cabac_init_idc,
+            )?,
+            significant: init(
+                [
+                    [
+                        (-2, 85),
+                        (-6, 78),
+                        (-1, 75),
+                        (-7, 77),
+                        (2, 54),
+                        (5, 50),
+                        (-3, 68),
+                        (1, 50),
+                        (6, 42),
+                        (-4, 81),
+                        (1, 63),
+                        (-4, 70),
+                        (0, 67),
+                        (2, 57),
+                        (-2, 76),
+                    ],
+                    [
+                        (-13, 103),
+                        (-13, 91),
+                        (-9, 89),
+                        (-14, 92),
+                        (-8, 76),
+                        (-12, 87),
+                        (-23, 110),
+                        (-24, 105),
+                        (-10, 78),
+                        (-20, 112),
+                        (-17, 99),
+                        (-78, 127),
+                        (-70, 127),
+                        (-50, 127),
+                        (-46, 127),
+                    ],
+                    [
+                        (-4, 86),
+                        (-12, 88),
+                        (-5, 82),
+                        (-3, 72),
+                        (-4, 67),
+                        (-8, 72),
+                        (-16, 89),
+                        (-9, 69),
+                        (-1, 59),
+                        (5, 66),
+                        (4, 57),
+                        (-4, 71),
+                        (-2, 71),
+                        (2, 58),
+                        (-1, 74),
+                    ],
+                ],
+                slice_qp,
+                cabac_init_idc,
+            )?,
+            last: init(
+                [
+                    [
+                        (11, 28),
+                        (2, 40),
+                        (3, 44),
+                        (0, 49),
+                        (0, 46),
+                        (2, 44),
+                        (2, 51),
+                        (0, 47),
+                        (4, 39),
+                        (2, 62),
+                        (6, 46),
+                        (0, 54),
+                        (3, 54),
+                        (2, 58),
+                        (4, 63),
+                    ],
+                    [
+                        (4, 45),
+                        (10, 28),
+                        (10, 31),
+                        (33, -11),
+                        (52, -43),
+                        (18, 15),
+                        (28, 0),
+                        (35, -22),
+                        (38, -25),
+                        (34, 0),
+                        (39, -18),
+                        (32, -12),
+                        (102, -94),
+                        (0, 0),
+                        (56, -15),
+                    ],
+                    [
+                        (4, 39),
+                        (0, 42),
+                        (7, 34),
+                        (11, 29),
+                        (8, 31),
+                        (6, 37),
+                        (7, 42),
+                        (3, 40),
+                        (8, 33),
+                        (13, 43),
+                        (13, 36),
+                        (4, 47),
+                        (3, 55),
+                        (2, 58),
+                        (6, 60),
+                    ],
+                ],
+                slice_qp,
+                cabac_init_idc,
+            )?,
+            magnitude: init(
+                [
+                    [
+                        (-6, 76),
+                        (-2, 44),
+                        (0, 45),
+                        (0, 52),
+                        (-3, 64),
+                        (-2, 59),
+                        (-4, 70),
+                        (-4, 75),
+                        (-8, 82),
+                        (-17, 102),
+                    ],
+                    [
+                        (-23, 112),
+                        (-15, 71),
+                        (-7, 61),
+                        (0, 53),
+                        (-5, 66),
+                        (-11, 77),
+                        (-9, 80),
+                        (-9, 84),
+                        (-10, 87),
+                        (-34, 127),
+                    ],
+                    [
+                        (-24, 115),
+                        (-22, 82),
+                        (-9, 62),
+                        (0, 53),
+                        (0, 59),
+                        (-14, 85),
+                        (-13, 89),
+                        (-13, 94),
+                        (-11, 92),
+                        (-29, 127),
+                    ],
+                ],
+                slice_qp,
+                cabac_init_idc,
             )?,
         })
     }
@@ -605,6 +1071,154 @@ impl Luma8x8Contexts {
             significant: init(SIGNIFICANT, slice_qp)?,
             last: init(LAST, slice_qp)?,
             magnitude: init(MAGNITUDE, slice_qp)?,
+        })
+    }
+
+    pub fn new_inter(slice_qp: i32, cabac_init_idc: u32) -> Result<Self, AvcError> {
+        const SIGNIFICANT: [[(i32, i32); 15]; 3] = [
+            [
+                (-4, 79),
+                (-7, 71),
+                (-5, 69),
+                (-9, 70),
+                (-8, 66),
+                (-10, 68),
+                (-19, 73),
+                (-12, 69),
+                (-16, 70),
+                (-15, 67),
+                (-20, 62),
+                (-19, 70),
+                (-16, 66),
+                (-22, 65),
+                (-20, 63),
+            ],
+            [
+                (-5, 85),
+                (-6, 81),
+                (-10, 77),
+                (-7, 81),
+                (-17, 80),
+                (-18, 73),
+                (-4, 74),
+                (-10, 83),
+                (-9, 71),
+                (-9, 67),
+                (-1, 61),
+                (-8, 66),
+                (-14, 66),
+                (0, 59),
+                (2, 59),
+            ],
+            [
+                (-3, 78),
+                (-8, 74),
+                (-9, 72),
+                (-10, 72),
+                (-18, 75),
+                (-12, 71),
+                (-11, 63),
+                (-5, 70),
+                (-17, 75),
+                (-14, 72),
+                (-16, 67),
+                (-8, 53),
+                (-14, 59),
+                (-9, 52),
+                (-11, 68),
+            ],
+        ];
+        const LAST: [[(i32, i32); 9]; 3] = [
+            [
+                (9, -2),
+                (26, -9),
+                (33, -9),
+                (39, -7),
+                (41, -2),
+                (45, 3),
+                (49, 9),
+                (45, 27),
+                (36, 59),
+            ],
+            [
+                (17, -10),
+                (32, -13),
+                (42, -9),
+                (49, -5),
+                (53, 0),
+                (64, 3),
+                (68, 10),
+                (66, 27),
+                (47, 57),
+            ],
+            [
+                (9, -2),
+                (30, -10),
+                (31, -4),
+                (33, -1),
+                (33, 7),
+                (31, 12),
+                (37, 23),
+                (31, 38),
+                (20, 64),
+            ],
+        ];
+        const MAGNITUDE: [[(i32, i32); 10]; 3] = [
+            [
+                (-6, 66),
+                (-7, 35),
+                (-7, 42),
+                (-8, 45),
+                (-5, 48),
+                (-12, 56),
+                (-6, 60),
+                (-5, 62),
+                (-8, 66),
+                (-8, 76),
+            ],
+            [
+                (-5, 71),
+                (0, 24),
+                (-1, 36),
+                (-2, 42),
+                (-2, 52),
+                (-9, 57),
+                (-6, 63),
+                (-4, 65),
+                (-4, 67),
+                (-7, 82),
+            ],
+            [
+                (-9, 71),
+                (-7, 37),
+                (-8, 44),
+                (-11, 49),
+                (-10, 56),
+                (-12, 59),
+                (-8, 63),
+                (-9, 67),
+                (-6, 68),
+                (-10, 79),
+            ],
+        ];
+        let idc = cabac_init_idc as usize;
+        if idc > 2 {
+            return Err(AvcError::InvalidData("CABAC initialization out of range"));
+        }
+        fn init<const N: usize>(
+            values: [(i32, i32); N],
+            qp: i32,
+        ) -> Result<[Context; N], AvcError> {
+            let mut contexts = [Context { state: 0, mps: 0 }; N];
+            for (context, (m, n)) in contexts.iter_mut().zip(values) {
+                *context = Context::init(m, n, qp)?;
+            }
+            Ok(contexts)
+        }
+        Ok(Self {
+            significant: init(SIGNIFICANT[idc], slice_qp)?,
+            last: init(LAST[idc], slice_qp)?,
+            magnitude: init(MAGNITUDE[idc], slice_qp)?,
         })
     }
 }
@@ -692,6 +1306,173 @@ impl ChromaAcContexts {
                 ],
                 slice_qp,
             )?,
+        })
+    }
+
+    /// P/B-slice chroma AC contexts from 2005 Tables 9-18 through 9-21.
+    pub fn new_inter(slice_qp: i32, cabac_init_idc: u32) -> Result<Self, AvcError> {
+        const CODED: [[(i32, i32); 4]; 3] = [
+            [(-1, 48), (0, 68), (-4, 69), (-8, 88)],
+            [(-3, 53), (0, 68), (-7, 74), (-9, 88)],
+            [(-6, 56), (3, 68), (-8, 71), (-13, 98)],
+        ];
+        const SIGNIFICANT: [[(i32, i32); 14]; 3] = [
+            [
+                (7, 50),
+                (16, 39),
+                (5, 44),
+                (4, 52),
+                (11, 48),
+                (-5, 60),
+                (-1, 59),
+                (0, 59),
+                (22, 33),
+                (5, 44),
+                (14, 43),
+                (-1, 78),
+                (0, 60),
+                (9, 69),
+            ],
+            [
+                (9, 41),
+                (18, 25),
+                (9, 32),
+                (5, 43),
+                (9, 47),
+                (0, 44),
+                (0, 51),
+                (2, 46),
+                (19, 38),
+                (-4, 66),
+                (15, 38),
+                (12, 42),
+                (9, 34),
+                (0, 89),
+            ],
+            [
+                (-10, 66),
+                (3, 62),
+                (-3, 68),
+                (-20, 81),
+                (0, 30),
+                (1, 7),
+                (-3, 23),
+                (-21, 74),
+                (16, 66),
+                (-23, 124),
+                (17, 37),
+                (44, -18),
+                (50, -34),
+                (-22, 127),
+            ],
+        ];
+        const LAST: [[(i32, i32); 14]; 3] = [
+            [
+                (16, 30),
+                (18, 32),
+                (18, 35),
+                (22, 29),
+                (24, 31),
+                (23, 38),
+                (18, 43),
+                (20, 41),
+                (11, 63),
+                (9, 59),
+                (9, 64),
+                (-1, 94),
+                (-2, 89),
+                (-9, 108),
+            ],
+            [
+                (14, 35),
+                (18, 31),
+                (17, 35),
+                (21, 30),
+                (17, 45),
+                (20, 42),
+                (18, 45),
+                (27, 26),
+                (16, 54),
+                (7, 66),
+                (16, 56),
+                (11, 73),
+                (10, 67),
+                (-10, 116),
+            ],
+            [
+                (19, 16),
+                (15, 36),
+                (15, 36),
+                (21, 28),
+                (25, 21),
+                (30, 20),
+                (31, 12),
+                (27, 16),
+                (24, 42),
+                (0, 93),
+                (14, 56),
+                (15, 57),
+                (26, 38),
+                (-24, 127),
+            ],
+        ];
+        const MAGNITUDE: [[(i32, i32); 10]; 3] = [
+            [
+                (0, 58),
+                (8, 5),
+                (10, 14),
+                (14, 18),
+                (13, 27),
+                (2, 40),
+                (0, 58),
+                (-3, 70),
+                (-6, 79),
+                (-8, 85),
+            ],
+            [
+                (3, 52),
+                (7, 4),
+                (10, 8),
+                (17, 8),
+                (16, 19),
+                (3, 37),
+                (-1, 61),
+                (-5, 73),
+                (-1, 70),
+                (-4, 78),
+            ],
+            [
+                (-13, 81),
+                (-6, 38),
+                (-13, 62),
+                (-6, 58),
+                (-2, 59),
+                (-16, 73),
+                (-10, 76),
+                (-13, 86),
+                (-9, 83),
+                (-10, 87),
+            ],
+        ];
+        let idc = cabac_init_idc as usize;
+        if idc > 2 {
+            return Err(AvcError::InvalidData("CABAC initialization out of range"));
+        }
+        fn init<const N: usize>(
+            values: [(i32, i32); N],
+            qp: i32,
+        ) -> Result<[Context; N], AvcError> {
+            let mut contexts = [Context { state: 0, mps: 0 }; N];
+            for (context, (m, n)) in contexts.iter_mut().zip(values) {
+                *context = Context::init(m, n, qp)?;
+            }
+            Ok(contexts)
+        }
+        Ok(Self {
+            coded: init(CODED[idc], slice_qp)?,
+            significant: init(SIGNIFICANT[idc], slice_qp)?,
+            last: init(LAST[idc], slice_qp)?,
+            magnitude: init(MAGNITUDE[idc], slice_qp)?,
         })
     }
 }
@@ -873,6 +1654,178 @@ impl Luma4x4Contexts {
             magnitude: init(MAGNITUDE, slice_qp)?,
         })
     }
+
+    pub fn new_inter(slice_qp: i32, cabac_init_idc: u32) -> Result<Self, AvcError> {
+        const CODED: [[(i32, i32); 4]; 3] = [
+            [(-3, 74), (-9, 92), (-8, 87), (-23, 126)],
+            [(-2, 73), (-12, 104), (-9, 91), (-31, 127)],
+            [(-5, 79), (-11, 104), (-11, 91), (-30, 127)],
+        ];
+        const SIGNIFICANT: [[(i32, i32); 15]; 3] = [
+            [
+                (9, 53),
+                (2, 53),
+                (5, 53),
+                (-2, 61),
+                (0, 56),
+                (0, 56),
+                (-13, 63),
+                (-5, 60),
+                (-1, 62),
+                (4, 57),
+                (-6, 69),
+                (4, 57),
+                (14, 39),
+                (4, 51),
+                (13, 68),
+            ],
+            [
+                (0, 54),
+                (-5, 61),
+                (0, 58),
+                (-1, 60),
+                (-3, 61),
+                (-8, 67),
+                (-25, 84),
+                (-14, 74),
+                (-5, 65),
+                (5, 52),
+                (2, 57),
+                (0, 61),
+                (-9, 69),
+                (-11, 70),
+                (18, 55),
+            ],
+            [
+                (1, 67),
+                (-15, 72),
+                (-5, 75),
+                (-8, 80),
+                (-21, 83),
+                (-21, 64),
+                (-13, 31),
+                (-25, 64),
+                (-29, 94),
+                (9, 75),
+                (17, 63),
+                (-8, 74),
+                (-5, 35),
+                (-2, 27),
+                (13, 91),
+            ],
+        ];
+        const LAST: [[(i32, i32); 15]; 3] = [
+            [
+                (25, 7),
+                (30, -7),
+                (28, 3),
+                (28, 4),
+                (32, 0),
+                (34, -1),
+                (30, 6),
+                (30, 6),
+                (32, 9),
+                (31, 19),
+                (26, 27),
+                (26, 30),
+                (37, 20),
+                (28, 34),
+                (17, 70),
+            ],
+            [
+                (33, -25),
+                (34, -30),
+                (36, -28),
+                (38, -28),
+                (38, -27),
+                (34, -18),
+                (35, -16),
+                (34, -14),
+                (32, -8),
+                (37, -6),
+                (35, 0),
+                (30, 10),
+                (28, 18),
+                (26, 25),
+                (29, 41),
+            ],
+            [
+                (35, -18),
+                (33, -25),
+                (28, -3),
+                (24, 10),
+                (27, 0),
+                (34, -14),
+                (52, -44),
+                (39, -24),
+                (19, 17),
+                (31, 25),
+                (36, 29),
+                (24, 33),
+                (34, 15),
+                (30, 20),
+                (22, 73),
+            ],
+        ];
+        const MAGNITUDE: [[(i32, i32); 10]; 3] = [
+            [
+                (1, 58),
+                (-3, 29),
+                (-1, 36),
+                (1, 38),
+                (2, 43),
+                (-6, 55),
+                (0, 58),
+                (0, 64),
+                (-3, 74),
+                (-10, 90),
+            ],
+            [
+                (-11, 76),
+                (-10, 44),
+                (-10, 52),
+                (-10, 57),
+                (-9, 58),
+                (-16, 72),
+                (-7, 69),
+                (-4, 69),
+                (-5, 74),
+                (-9, 86),
+            ],
+            [
+                (-10, 82),
+                (-8, 48),
+                (-8, 61),
+                (-8, 66),
+                (-7, 70),
+                (-14, 75),
+                (-10, 79),
+                (-9, 83),
+                (-12, 92),
+                (-18, 108),
+            ],
+        ];
+        let idc = cabac_init_idc as usize;
+        if idc > 2 {
+            return Err(AvcError::InvalidData("CABAC initialization out of range"));
+        }
+        fn init<const N: usize>(
+            values: [(i32, i32); N],
+            qp: i32,
+        ) -> Result<[Context; N], AvcError> {
+            let mut contexts = [Context { state: 0, mps: 0 }; N];
+            for (context, (m, n)) in contexts.iter_mut().zip(values) {
+                *context = Context::init(m, n, qp)?;
+            }
+            Ok(contexts)
+        }
+        Ok(Self {
+            coded: init(CODED[idc], slice_qp)?,
+            significant: init(SIGNIFICANT[idc], slice_qp)?,
+            last: init(LAST[idc], slice_qp)?,
+            magnitude: init(MAGNITUDE[idc], slice_qp)?,
+        })
+    }
 }
 
 impl MbQpContexts {
@@ -959,6 +1912,20 @@ impl Transform8x8Contexts {
             Context::init(31, 21, slice_qp)?,
             Context::init(31, 31, slice_qp)?,
             Context::init(25, 50, slice_qp)?,
+        ]))
+    }
+
+    pub fn new_inter(slice_qp: i32, cabac_init_idc: u32) -> Result<Self, AvcError> {
+        let values = match cabac_init_idc {
+            0 => [(12, 40), (11, 51), (14, 59)],
+            1 => [(25, 32), (21, 49), (21, 54)],
+            2 => [(21, 33), (19, 50), (17, 61)],
+            _ => return Err(AvcError::InvalidData("CABAC initialization out of range")),
+        };
+        Ok(Self([
+            Context::init(values[0].0, values[0].1, slice_qp)?,
+            Context::init(values[1].0, values[1].1, slice_qp)?,
+            Context::init(values[2].0, values[2].1, slice_qp)?,
         ]))
     }
 }
@@ -1202,7 +2169,7 @@ impl CabacDecoder<'_> {
             } else {
                 (1 + count_eq1).min(4)
             };
-            let later_context = 5 + count_gt1.min(4);
+            let later_context = 5 + count_gt1.min(if N == 4 { 3 } else { 4 });
             let mut magnitude_minus1 = 0u32;
             loop {
                 let context = if magnitude_minus1 == 0 {
@@ -1391,12 +2358,6 @@ impl CabacDecoder<'_> {
         left: Option<u8>,
         above: Option<u8>,
     ) -> Result<u8, AvcError> {
-        const CODES: [&str; 26] = [
-            "0", "100000", "100001", "100010", "100011", "1001000", "1001001", "1001010",
-            "1001011", "1001100", "1001101", "1001110", "1001111", "101000", "101001", "101010",
-            "101011", "1011000", "1011001", "1011010", "1011011", "1011100", "1011101", "1011110",
-            "1011111", "11",
-        ];
         let first_context = usize::from(left.is_some_and(|kind| kind != 0))
             + usize::from(above.is_some_and(|kind| kind != 0));
         let first = self.decision(&mut contexts.0[first_context])?;
@@ -1430,10 +2391,16 @@ impl CabacDecoder<'_> {
             };
             let bit = self.decision(&mut contexts.0[ctx_idx - 3])?;
             code.push(char::from(b'0' + bit));
-            if let Some(kind) = CODES.iter().position(|candidate| *candidate == code) {
+            if let Some(kind) = INTRA_MB_TYPE_CODES
+                .iter()
+                .position(|candidate| *candidate == code)
+            {
                 return Ok(kind as u8);
             }
-            if !CODES.iter().any(|candidate| candidate.starts_with(&code)) {
+            if !INTRA_MB_TYPE_CODES
+                .iter()
+                .any(|candidate| candidate.starts_with(&code))
+            {
                 return Err(AvcError::InvalidData("invalid CABAC I macroblock type"));
             }
         }
@@ -1507,10 +2474,64 @@ impl<'a> CabacDecoder<'a> {
         Ok(self.decision(&mut contexts.skip[index])? != 0)
     }
 
-    /// The inter-only prefix of Table 9-28; intra types use a separate suffix.
+    pub fn reference_index(
+        &mut self,
+        contexts: &mut ReferenceIndexContexts,
+        left: Option<u8>,
+        above: Option<u8>,
+        active_count: u32,
+    ) -> Result<u8, AvcError> {
+        if active_count == 0 || active_count > 32 {
+            return Err(AvcError::InvalidData("reference index count out of range"));
+        }
+        let first = usize::from(left.is_some_and(|index| index > 0))
+            + 2 * usize::from(above.is_some_and(|index| index > 0));
+        if self.decision(&mut contexts.0[first])? == 0 {
+            return Ok(0);
+        }
+        for index in 1..active_count {
+            let context = if index == 1 { 4 } else { 5 };
+            if self.decision(&mut contexts.0[context])? == 0 {
+                return Ok(index as u8);
+            }
+        }
+        Err(AvcError::InvalidData("reference index exceeds active list"))
+    }
+
+    /// Table 9-28's P prefix, followed by the Table 9-27 intra suffix.
     pub fn p_inter_mb_type(&mut self, contexts: &mut InterMbContexts) -> Result<u8, AvcError> {
         if self.decision(&mut contexts.p_type[0])? != 0 {
-            return Err(AvcError::Unsupported("intra macroblock in P slice"));
+            if self.decision(&mut contexts.p_type[3])? == 0 {
+                return Ok(5);
+            }
+            if self.terminate()? {
+                return Ok(30);
+            }
+            let mut code = String::from("10");
+            while code.len() < 7 {
+                let bin_idx = code.len();
+                let context = match bin_idx {
+                    2 => 1,
+                    3 => 2,
+                    4 if code.as_bytes()[3] == b'1' => 2,
+                    _ => 3,
+                };
+                let bit = self.decision(&mut contexts.p_intra_type[context - 1])?;
+                code.push(char::from(b'0' + bit));
+                if let Some(kind) = INTRA_MB_TYPE_CODES
+                    .iter()
+                    .position(|candidate| *candidate == code)
+                {
+                    return Ok(kind as u8 + 5);
+                }
+                if !INTRA_MB_TYPE_CODES
+                    .iter()
+                    .any(|candidate| candidate.starts_with(&code))
+                {
+                    return Err(AvcError::InvalidData("invalid CABAC P intra type"));
+                }
+            }
+            return Err(AvcError::InvalidData("CABAC P intra type too long"));
         }
         let second = self.decision(&mut contexts.p_type[1])?;
         let third = self.decision(&mut contexts.p_type[2 + second as usize])?;
@@ -1520,6 +2541,135 @@ impl<'a> CabacDecoder<'a> {
             (1, 0) => 2,
             (1, 1) => 1,
             _ => unreachable!(),
+        })
+    }
+
+    /// Table 9-28 B prefix and Table 9-27 intra suffix, using contexts 27..35.
+    pub fn b_inter_mb_type(
+        &mut self,
+        contexts: &mut InterMbContexts,
+        left_direct: Option<bool>,
+        above_direct: Option<bool>,
+    ) -> Result<u8, AvcError> {
+        let first_context =
+            usize::from(left_direct == Some(false)) + usize::from(above_direct == Some(false));
+        if self.decision(&mut contexts.b_type[first_context])? == 0 {
+            return Ok(0);
+        }
+        let mut code = [0u8; 7];
+        code[0] = b'1';
+        let mut code_len = 1;
+        while code_len < code.len() {
+            let bin_idx = code_len;
+            let context = match bin_idx {
+                1 => 3,
+                2 if code[1] != b'0' => 4,
+                _ => 5,
+            };
+            let bit = self.decision(&mut contexts.b_type[context])?;
+            code[code_len] = b'0' + bit;
+            code_len += 1;
+            let prefix = &code[..code_len];
+            if let Some(kind) = B_MB_TYPE_CODES
+                .iter()
+                .position(|candidate| candidate.as_bytes() == prefix)
+            {
+                if kind != 23 {
+                    return Ok(kind as u8);
+                }
+                if self.decision(&mut contexts.b_type[5])? == 0 {
+                    return Ok(23);
+                }
+                if self.terminate()? {
+                    return Ok(48);
+                }
+                let mut suffix = [0u8; 7];
+                suffix[..2].copy_from_slice(b"10");
+                let mut suffix_len = 2;
+                while suffix_len < suffix.len() {
+                    let suffix_bin = suffix_len;
+                    let suffix_context = match suffix_bin {
+                        2 => 6,
+                        3 => 7,
+                        4 if suffix[3] != b'0' => 7,
+                        _ => 8,
+                    };
+                    let value = self.decision(&mut contexts.b_type[suffix_context])?;
+                    suffix[suffix_len] = b'0' + value;
+                    suffix_len += 1;
+                    let suffix_prefix = &suffix[..suffix_len];
+                    if let Some(intra_kind) = INTRA_MB_TYPE_CODES
+                        .iter()
+                        .position(|candidate| candidate.as_bytes() == suffix_prefix)
+                    {
+                        return Ok(23 + intra_kind as u8);
+                    }
+                    if !INTRA_MB_TYPE_CODES
+                        .iter()
+                        .any(|candidate| candidate.as_bytes().starts_with(suffix_prefix))
+                    {
+                        return Err(AvcError::InvalidData("invalid CABAC B intra type"));
+                    }
+                }
+                return Err(AvcError::InvalidData("CABAC B intra type too long"));
+            }
+            if !B_MB_TYPE_CODES
+                .iter()
+                .any(|candidate| candidate.as_bytes().starts_with(prefix))
+            {
+                return Err(AvcError::InvalidData("invalid CABAC B macroblock type"));
+            }
+        }
+        Err(AvcError::InvalidData("CABAC B macroblock type too long"))
+    }
+
+    /// Table 9-29 B sub-partition types with context offset 36.
+    pub fn b_sub_mb_type(&mut self, contexts: &mut InterMbContexts) -> Result<u8, AvcError> {
+        if self.decision(&mut contexts.b_sub_type[0])? == 0 {
+            return Ok(0);
+        }
+        let mut code = [0u8; 6];
+        code[0] = b'1';
+        let mut code_len = 1;
+        while code_len < code.len() {
+            let context = match code_len {
+                1 => 1,
+                2 if code[1] != b'0' => 2,
+                _ => 3,
+            };
+            code[code_len] = b'0' + self.decision(&mut contexts.b_sub_type[context])?;
+            code_len += 1;
+            let prefix = &code[..code_len];
+            if let Some(kind) = B_SUB_MB_TYPE_CODES
+                .iter()
+                .position(|candidate| candidate.as_bytes() == prefix)
+            {
+                return Ok(kind as u8);
+            }
+            if !B_SUB_MB_TYPE_CODES
+                .iter()
+                .any(|candidate| candidate.as_bytes().starts_with(prefix))
+            {
+                return Err(AvcError::InvalidData("invalid CABAC B sub-macroblock type"));
+            }
+        }
+        Err(AvcError::InvalidData(
+            "CABAC B sub-macroblock type too long",
+        ))
+    }
+
+    /// Table 9-29's P sub-macroblock binarization: 8x8, 8x4, 4x8, 4x4.
+    pub fn p_sub_mb_type(&mut self, contexts: &mut InterMbContexts) -> Result<u8, AvcError> {
+        if self.decision(&mut contexts.p_sub_type[0])? != 0 {
+            return Ok(0);
+        }
+        if self.decision(&mut contexts.p_sub_type[1])? == 0 {
+            return Ok(1);
+        }
+        Ok(if self.decision(&mut contexts.p_sub_type[2])? != 0 {
+            2
+        } else {
+            3
         })
     }
 
@@ -1603,6 +2753,87 @@ impl<'a> CabacDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inter_luma16_ac_contexts_follow_2005_initialization_tables() {
+        for (idc, first, last) in [
+            (
+                0,
+                [(-3, 46), (11, 35), (6, 51), (-9, 77)],
+                [(-9, 93), (-7, 100), (-1, 84), (-30, 119)],
+            ),
+            (
+                1,
+                [(0, 39), (-4, 66), (33, -4), (-21, 101)],
+                [(-35, 127), (-44, 127), (27, 36), (-28, 122)],
+            ),
+            (
+                2,
+                [(-6, 55), (-4, 44), (8, 44), (-21, 100)],
+                [(-37, 127), (-5, 90), (8, 63), (-37, 127)],
+            ),
+        ] {
+            let contexts = Luma16x16AcContexts::new_inter(26, idc).unwrap();
+            for (actual, (m, n)) in [
+                contexts.coded[0],
+                contexts.significant[0],
+                contexts.last[0],
+                contexts.magnitude[0],
+            ]
+            .into_iter()
+            .zip(first)
+            {
+                assert_eq!(actual, Context::init(m, n, 26).unwrap());
+            }
+            for (actual, (m, n)) in [
+                contexts.coded[3],
+                contexts.significant[13],
+                contexts.last[13],
+                contexts.magnitude[9],
+            ]
+            .into_iter()
+            .zip(last)
+            {
+                assert_eq!(actual, Context::init(m, n, 26).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn inter_chroma_ac_contexts_follow_2005_initialization_tables() {
+        for (idc, coded, significant, last, magnitude) in [
+            (0, (-1, 48), (7, 50), (16, 30), (0, 58)),
+            (1, (-3, 53), (9, 41), (14, 35), (3, 52)),
+            (2, (-6, 56), (-10, 66), (19, 16), (-13, 81)),
+        ] {
+            let contexts = ChromaAcContexts::new_inter(26, idc).unwrap();
+            assert_eq!(
+                contexts.coded[0],
+                Context::init(coded.0, coded.1, 26).unwrap()
+            );
+            assert_eq!(
+                contexts.significant[0],
+                Context::init(significant.0, significant.1, 26).unwrap()
+            );
+            assert_eq!(contexts.last[0], Context::init(last.0, last.1, 26).unwrap());
+            assert_eq!(
+                contexts.magnitude[0],
+                Context::init(magnitude.0, magnitude.1, 26).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn p_sub_macroblock_codes_follow_table_9_29() {
+        for (first, second, third, expected) in
+            [(1, 0, 0, 0), (0, 0, 0, 1), (0, 1, 1, 2), (0, 1, 0, 3)]
+        {
+            let mut contexts = InterMbContexts::new(26, 0, false).unwrap();
+            contexts.p_sub_type = [first, second, third].map(|mps| Context { state: 63, mps });
+            let mut decoder = CabacDecoder::new(&[0; 8]).unwrap();
+            assert_eq!(decoder.p_sub_mb_type(&mut contexts).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn intra4x4_modes_use_dc_for_missing_neighbours() {

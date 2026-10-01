@@ -2,12 +2,13 @@
 
 use super::backend::{MediaDecodeError, MediaMetadata, StreamingVideoDecoder, VideoFrame};
 use super::h264::{
-    AvcError, NalStream, decode_intra_2003, frame_from_yuv420, parse_pps_2003, parse_pps_2005,
+    AvcError, MemoryManagement, NalStream, decode_intra_2003, frame_from_yuv420,
+    parse_cabac_inter_slice, parse_pps_2003, parse_pps_2005,
 };
 #[cfg(test)]
 use super::h264_high::decode_cabac_idr_2005;
 use super::h264_high::{Yuv420Picture, decode_cabac_idr_yuv_2005};
-use super::h264_inter::decode_cabac_p_2005;
+use super::h264_inter::{decode_cabac_b_2005, decode_cabac_p_2005};
 use super::mp4::{Mp4Error, Mp4Index};
 
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
@@ -15,11 +16,13 @@ const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Default)]
 pub struct Mp4AvcStream {
     bytes: Vec<u8>,
+    base_offset: u64,
     index: Option<Mp4Index>,
     next_sample: usize,
     pending_pictures: Vec<(i64, VideoFrame)>,
     reference_pictures: Vec<Yuv420Picture>,
     future_min_pts: Vec<i64>,
+    decode_error: Option<MediaDecodeError>,
 }
 
 impl Mp4AvcStream {
@@ -61,11 +64,26 @@ impl Mp4AvcStream {
     fn decode_sample(
         index: &Mp4Index,
         bytes: &[u8],
+        base_offset: u64,
         sample_number: usize,
         references: &[Yuv420Picture],
-    ) -> Result<(VideoFrame, Option<Yuv420Picture>, bool), MediaDecodeError> {
+    ) -> Result<
+        (
+            VideoFrame,
+            Option<Yuv420Picture>,
+            bool,
+            Vec<MemoryManagement>,
+        ),
+        MediaDecodeError,
+    > {
         let sample = &index.samples[sample_number];
-        let start = usize::try_from(sample.offset).map_err(Self::invalid)?;
+        let start = usize::try_from(
+            sample
+                .offset
+                .checked_sub(base_offset)
+                .ok_or_else(|| Self::invalid("sample precedes buffered window"))?,
+        )
+        .map_err(Self::invalid)?;
         let end = start
             .checked_add(sample.size as usize)
             .ok_or(MediaDecodeError::Unsupported)?;
@@ -78,7 +96,11 @@ impl Mp4AvcStream {
         let mut picture = None;
         let mut reference = None;
         let mut is_idr = false;
+        let mut marking = Vec::new();
         for nal in nals {
+            if std::env::var_os("WEBMEDIA_TRACE_SAMPLE").is_some() {
+                eprintln!("sample {sample_number}: NAL type {}", nal[0] & 0x1f);
+            }
             match nal[0] & 0x1f {
                 5 => {
                     if picture.is_some() {
@@ -112,7 +134,7 @@ impl Mp4AvcStream {
                     });
                 }
                 1 => {
-                    if picture.is_some() || nal[0] & 0x60 == 0 {
+                    if picture.is_some() {
                         return Err(MediaDecodeError::Unsupported);
                     }
                     let sps = index
@@ -126,11 +148,40 @@ impl Mp4AvcStream {
                         .first()
                         .ok_or(MediaDecodeError::Unsupported)?;
                     let pps = parse_pps_2005(pps).map_err(Self::avc_error)?;
-                    let previous = references.last().ok_or(MediaDecodeError::Unsupported)?;
-                    let yuv =
-                        decode_cabac_p_2005(&nal, sps, &pps, previous).map_err(Self::avc_error)?;
+                    let parsed = parse_cabac_inter_slice(&nal, sps, &pps.core);
+                    if std::env::var_os("WEBMEDIA_TRACE_SAMPLE").is_some() {
+                        if let Err(error) = &parsed {
+                            eprintln!("sample {sample_number} slice header error: {error:?}");
+                        }
+                    }
+                    let parsed = parsed.map_err(Self::avc_error)?;
+                    marking = parsed.marking;
+                    let slice_type = parsed.slice_type;
+                    let yuv = match slice_type % 5 {
+                        0 => {
+                            let decoded = decode_cabac_p_2005(&nal, sps, &pps, references);
+                            if std::env::var_os("WEBMEDIA_TRACE_P").is_some() {
+                                if let Err(error) = &decoded {
+                                    eprintln!("P sample {sample_number} decode error: {error:?}");
+                                }
+                            }
+                            decoded.map_err(Self::avc_error)?
+                        }
+                        1 => {
+                            let decoded = decode_cabac_b_2005(&nal, sps, &pps, references);
+                            if std::env::var_os("WEBMEDIA_TRACE_B").is_some() {
+                                if let Err(error) = &decoded {
+                                    eprintln!("B sample {sample_number} decode error: {error:?}");
+                                }
+                            }
+                            decoded.map_err(Self::avc_error)?
+                        }
+                        _ => return Err(MediaDecodeError::Unsupported),
+                    };
                     picture = Some(frame_from_yuv420(sps, &yuv.luma, &yuv.cb, &yuv.cr));
-                    reference = Some(yuv);
+                    if nal[0] & 0x60 != 0 {
+                        reference = Some(yuv);
+                    }
                 }
                 2..=4 => return Err(MediaDecodeError::Unsupported),
                 _ => {}
@@ -141,12 +192,29 @@ impl Mp4AvcStream {
             return Err(MediaDecodeError::Unsupported);
         }
         picture.timestamp = sample.presentation_time as f32 / index.timescale as f32;
-        Ok((picture, reference, is_idr))
+        Ok((picture, reference, is_idr, marking))
+    }
+
+    fn discard_consumed_prefix(&mut self) {
+        let keep_from = self
+            .index
+            .as_ref()
+            .and_then(|index| index.samples.get(self.next_sample))
+            .map(|sample| sample.offset)
+            .unwrap_or(self.base_offset + self.bytes.len() as u64);
+        let drop_count = keep_from
+            .saturating_sub(self.base_offset)
+            .min(self.bytes.len() as u64) as usize;
+        self.bytes.drain(..drop_count);
+        self.base_offset += drop_count as u64;
     }
 }
 
 impl StreamingVideoDecoder for Mp4AvcStream {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<VideoFrame>, MediaDecodeError> {
+        if let Some(error) = &self.decode_error {
+            return Err(error.clone());
+        }
         if bytes.len() > MAX_BUFFER_BYTES.saturating_sub(self.bytes.len()) {
             return Err(MediaDecodeError::Unsupported);
         }
@@ -172,17 +240,21 @@ impl StreamingVideoDecoder for Mp4AvcStream {
                 .offset
                 .checked_add(u64::from(sample.size))
                 .ok_or(MediaDecodeError::Unsupported)?;
-            if end > self.bytes.len() as u64 {
+            if end > self.base_offset + self.bytes.len() as u64 {
                 break;
             }
-            let (frame, reference, is_idr) = match Self::decode_sample(
+            let (frame, reference, is_idr, marking) = match Self::decode_sample(
                 self.index.as_ref().unwrap(),
                 &self.bytes,
+                self.base_offset,
                 self.next_sample,
                 &self.reference_pictures,
             ) {
                 Ok(frame) => frame,
-                Err(_) if !frames.is_empty() => break,
+                Err(error) if !frames.is_empty() => {
+                    self.decode_error = Some(error);
+                    break;
+                }
                 Err(error) => return Err(error),
             };
             let presentation_time = sample.presentation_time;
@@ -191,6 +263,25 @@ impl StreamingVideoDecoder for Mp4AvcStream {
                 self.reference_pictures.clear();
             }
             if let Some(reference) = reference {
+                let max_frame_num = 1u32
+                    << self.index.as_ref().unwrap().config.sequence_parameters[0].frame_num_bits;
+                for operation in marking {
+                    match operation {
+                        MemoryManagement::ForgetShortTerm(distance) => {
+                            let target = reference
+                                .frame_num
+                                .wrapping_add(max_frame_num)
+                                .wrapping_sub(distance.wrapping_add(1) % max_frame_num)
+                                % max_frame_num;
+                            let position = self
+                                .reference_pictures
+                                .iter()
+                                .position(|picture| picture.frame_num == target)
+                                .ok_or_else(|| Self::invalid("missing short-term reference"))?;
+                            self.reference_pictures.remove(position);
+                        }
+                    }
+                }
                 let max_references = self.index.as_ref().unwrap().config.sequence_parameters[0]
                     .max_num_ref_frames as usize;
                 if max_references > 0 {
@@ -202,6 +293,7 @@ impl StreamingVideoDecoder for Mp4AvcStream {
             }
             self.queue_picture(presentation_time, frame);
             self.drain_presentable(&mut frames);
+            self.discard_consumed_prefix();
         }
         Ok(frames)
     }
@@ -237,13 +329,16 @@ mod tests {
     use super::*;
     use crate::video::h264::{
         AvcConfig, parse_cabac_idr_i_slice, parse_cabac_inter_slice, parse_pps_2005, parse_sps,
+        type0_pic_order_count,
     };
     use crate::video::h264_cabac::{
         CabacDecoder, ChromaDcContexts, CodedBlockContexts, InterMbContexts, IntraMbTypeContexts,
         IntraPredContexts, Luma4x4Contexts, Luma8x8Contexts, MbQpContexts, MotionVectorContexts,
         Transform8x8Contexts, intra4x4_modes, intra8x8_modes,
     };
-    use crate::video::h264_inter::predict_l0_16x16;
+    use crate::video::h264_inter::{
+        b_reference_lists, predict_l0_16x16, predict_l1_16x16, spatial_direct_motion,
+    };
     use crate::video::h264_intra::{
         reconstruct_chroma_dc_only, reconstruct_intra4x4_luma, reconstruct_intra8x8_luma,
     };
@@ -322,16 +417,67 @@ mod tests {
     }
 
     #[test]
-    fn indexes_site_stream_before_rejecting_unsupported_picture() {
+    fn failed_later_sample_is_not_redecoded_for_each_network_chunk() {
+        let sps = parse_sps(&[0x67, 0x42, 0x00, 0x0a, 0xf4, 0xf2]).unwrap();
+        let pps = vec![0x68, 0xce, 0x3c, 0x80];
+        let mut nal = vec![0x65, 0xb8, 0x40, 0xa0, 0xd0];
+        nal.extend([235; 256]);
+        nal.extend([128; 128]);
+        nal.push(0x80);
+        let mut bytes = (nal.len() as u32).to_be_bytes().to_vec();
+        bytes.extend(nal);
+        let first_size = bytes.len() as u32;
+        bytes.extend([0, 0, 0, 1, 0xff]);
+        let index = Mp4Index {
+            timescale: 1000,
+            duration_ticks: 2000,
+            config: AvcConfig {
+                nal_length_size: 4,
+                sequence_parameters: vec![sps],
+                picture_parameter_sets: vec![pps],
+            },
+            samples: vec![
+                Sample {
+                    offset: 0,
+                    size: first_size,
+                    decode_time: 0,
+                    presentation_time: 0,
+                    keyframe: true,
+                },
+                Sample {
+                    offset: u64::from(first_size),
+                    size: 5,
+                    decode_time: 1000,
+                    presentation_time: 1000,
+                    keyframe: false,
+                },
+            ],
+        };
+        let mut decoder = Mp4AvcStream::new();
+        decoder.index = Some(index);
+        assert_eq!(decoder.push(&bytes).unwrap().len(), 1);
+        let failed_at = decoder.next_sample;
+        let buffered = decoder.bytes.len();
+        let error = decoder.decode_error.clone().unwrap();
+        assert_eq!(decoder.push(&[0; 16]).unwrap_err(), error);
+        assert_eq!(decoder.next_sample, failed_at);
+        assert_eq!(decoder.bytes.len(), buffered);
+    }
+
+    #[test]
+    fn decodes_site_prefix_in_presentation_order() {
         let Ok(path) = std::env::var("WEBCORE_MP4_FIXTURE") else {
             return;
         };
         let bytes = std::fs::read(path).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let last = &index.samples[289];
+        let prefix_end = last.offset as usize + last.size as usize;
         let mut decoder = Mp4AvcStream::new();
         assert!(decoder.metadata().is_none());
         let mut rejection = None;
         let mut delivered = Vec::new();
-        for chunk in bytes.chunks(16 * 1024) {
+        for chunk in bytes[..prefix_end].chunks(16 * 1024) {
             match decoder.push(chunk) {
                 Ok(frames) => delivered.extend(frames),
                 Err(error) => {
@@ -343,10 +489,25 @@ mod tests {
         let metadata = decoder.metadata().unwrap();
         assert_eq!((metadata.width, metadata.height), (Some(1280), Some(720)));
         assert!(metadata.duration.unwrap() > 80.0);
-        assert_eq!(delivered.len(), 1);
+        assert!(delivered.len() >= 5, "delivered {} frames", delivered.len());
         assert_eq!((delivered[0].width, delivered[0].height), (1280, 720));
         assert_eq!(delivered[0].timestamp, 0.0);
-        assert_eq!(decoder.reference_pictures.len(), 1);
+        assert!(
+            delivered
+                .windows(2)
+                .all(|pair| pair[0].timestamp <= pair[1].timestamp)
+        );
+        if let Some((_, pending)) = decoder.pending_pictures.first() {
+            assert!(pending.timestamp >= delivered.last().unwrap().timestamp);
+        }
+        assert!(
+            decoder.next_sample >= 290,
+            "decoded {} samples; rejection: {rejection:?}",
+            decoder.next_sample
+        );
+        assert!(decoder.base_offset > 0);
+        assert!(decoder.bytes.len() < 256 * 1024);
+        assert!(decoder.reference_pictures.len() >= 2);
         assert_eq!(
             (
                 decoder.reference_pictures[0].width,
@@ -354,7 +515,60 @@ mod tests {
             ),
             (1280, 720)
         );
-        assert_eq!(rejection, Some(MediaDecodeError::Unsupported));
+        assert!(rejection.is_none(), "prefix rejection: {rejection:?}");
+    }
+
+    #[test]
+    fn decodes_entire_site_video_in_presentation_order() {
+        let Ok(path) = std::env::var("WEBCORE_MP4_FULL_FIXTURE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let mut decoder = Mp4AvcStream::new();
+        let mut frames = 0usize;
+        let mut last_timestamp = None;
+        let mut reported = 0usize;
+        for chunk in bytes.chunks(16 * 1024) {
+            let decoded = decoder.push(chunk).unwrap_or_else(|error| {
+                panic!("failed at sample {}: {error:?}", decoder.next_sample)
+            });
+            for frame in decoded {
+                assert!(last_timestamp.is_none_or(|last| frame.timestamp >= last));
+                last_timestamp = Some(frame.timestamp);
+                frames += 1;
+            }
+            if decoder.next_sample / 200 > reported {
+                reported = decoder.next_sample / 200;
+                eprintln!("decoded {} / {} samples", decoder.next_sample, index.samples.len());
+            }
+        }
+        decoder.finish().unwrap();
+        assert_eq!(decoder.next_sample, index.samples.len());
+        assert_eq!(frames, index.samples.len());
+    }
+
+    #[test]
+    fn decodes_site_gop_around_sample_722() {
+        let Ok(path) = std::env::var("WEBCORE_MP4_FULL_FIXTURE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let target = 722;
+        let start = (0..=target)
+            .rev()
+            .find(|&sample| index.samples[sample].keyframe)
+            .unwrap();
+        let start_offset = index.samples[start].offset as usize;
+        let end_sample = &index.samples[target];
+        let end_offset = end_sample.offset as usize + end_sample.size as usize;
+        let mut decoder = Mp4AvcStream::new();
+        decoder.index = Some(index);
+        decoder.next_sample = start;
+        decoder.base_offset = start_offset as u64;
+        decoder.push(&bytes[start_offset..end_offset]).unwrap();
+        assert_eq!(decoder.next_sample, target + 1);
     }
 
     #[test]
@@ -723,6 +937,304 @@ mod tests {
     }
 
     #[test]
+    fn site_first_b_header_and_skip_flag() {
+        let Ok(path) = std::env::var("WEBCORE_MP4_FIXTURE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let pps = parse_pps_2005(&index.config.picture_parameter_sets[0]).unwrap();
+        let sample = &index.samples[2];
+        assert!(index.config.sequence_parameters[0].direct_8x8_inference);
+        assert!(!pps.core.pic_order_present);
+        assert_eq!(sample.presentation_time, 5400);
+        assert_eq!(index.timescale, 90000);
+        let start = sample.offset as usize;
+        let mut stream = NalStream::new(index.config.nal_length_size).unwrap();
+        let nals = stream
+            .push(&bytes[start..start + sample.size as usize])
+            .unwrap();
+        stream.finish().unwrap();
+        let nal = nals.iter().find(|nal| nal[0] & 0x1f == 1).unwrap();
+        let slice =
+            parse_cabac_inter_slice(nal, &index.config.sequence_parameters[0], &pps.core).unwrap();
+        assert_eq!(slice.slice_type % 5, 1);
+        assert_eq!(slice.first_mb, 0);
+        let mut decoder = CabacDecoder::new(&slice.rbsp[slice.data_byte_offset..]).unwrap();
+        let mut contexts =
+            InterMbContexts::new(slice.slice_qp, slice.cabac_init_idc, true).unwrap();
+        let skipped = decoder
+            .inter_mb_skip_flag(&mut contexts, None, None)
+            .unwrap();
+        assert_eq!(nal[0] >> 5, 2);
+        assert_eq!((slice.ref_idx_l0, slice.ref_idx_l1), (1, 1));
+        assert!(slice.direct_spatial_mv_pred);
+        assert_eq!(slice.slice_qp, 28);
+        assert!(!skipped);
+        let kind = decoder.b_inter_mb_type(&mut contexts, None, None).unwrap();
+        assert_eq!(kind, 2);
+        let mut motion = MotionVectorContexts::new(slice.slice_qp, slice.cabac_init_idc).unwrap();
+        let dx = decoder
+            .motion_vector_difference(&mut motion, 0, None, None)
+            .unwrap();
+        let dy = decoder
+            .motion_vector_difference(&mut motion, 1, None, None)
+            .unwrap();
+        let mut coded =
+            CodedBlockContexts::new_inter(slice.slice_qp, slice.cabac_init_idc).unwrap();
+        let pattern = decoder.coded_block_pattern(&mut coded, None, None).unwrap();
+        assert_eq!((dx, dy), (-3, 0));
+        assert_eq!((pattern.luma, pattern.chroma), (0, 0));
+        assert!(!decoder.terminate().unwrap());
+        let next_skipped = decoder
+            .inter_mb_skip_flag(&mut contexts, Some(false), None)
+            .unwrap();
+        assert!(next_skipped);
+        if let Ok(path) = std::env::var("WEBCORE_H264_B_REFERENCE_YUV") {
+            let (_, Some(idr), _, _) =
+                Mp4AvcStream::decode_sample(&index, &bytes, 0, 0, &[]).unwrap()
+            else {
+                panic!("IDR sample did not yield a reference picture");
+            };
+            let (_, Some(future), _, _) =
+                Mp4AvcStream::decode_sample(&index, &bytes, 0, 1, std::slice::from_ref(&idr))
+                    .unwrap()
+            else {
+                panic!("P sample did not yield a reference picture");
+            };
+            assert_eq!(future.pic_order_cnt, 8);
+            assert_eq!(
+                type0_pic_order_count(
+                    slice.pic_order_cnt_lsb,
+                    index.config.sequence_parameters[0]
+                        .pic_order_cnt_lsb_bits
+                        .unwrap(),
+                    Some((future.pic_order_cnt_msb, future.pic_order_cnt_lsb)),
+                )
+                .unwrap()
+                .1,
+                4
+            );
+            let references = [idr, future];
+            let (list0, list1) = b_reference_lists(&references, 4);
+            assert_eq!(
+                (list0.as_slice(), list1.as_slice()),
+                ([0, 1].as_slice(), [1, 0].as_slice())
+            );
+            let future = &references[list1[0]];
+            let block =
+                predict_l1_16x16(future, 0, 0, [dx, dy], slice.weights.as_ref(), 0).unwrap();
+            let expected = std::fs::read(path).unwrap();
+            let frame_bytes = future.width * future.height * 3 / 2;
+            assert_eq!(expected.len(), 5 * frame_bytes);
+            let presentation_index = index
+                .samples
+                .iter()
+                .take(5)
+                .filter(|other| other.presentation_time < sample.presentation_time)
+                .count();
+            assert_eq!(presentation_index, 2);
+            let frame =
+                &expected[presentation_index * frame_bytes..(presentation_index + 1) * frame_bytes];
+            let mut luma_error = 0u32;
+            for row in 0..16 {
+                for col in 0..16 {
+                    luma_error += u32::from(
+                        block.luma[row * 16 + col].abs_diff(frame[row * future.width + col]),
+                    );
+                }
+            }
+            assert!(luma_error < 1024, "first B luma block error: {luma_error}");
+            let direct = spatial_direct_motion(
+                Some(crate::video::h264_high::MotionCell {
+                    l0: None,
+                    l1: Some((0, [dx, dy])),
+                }),
+                None,
+                None,
+                None,
+                future.motion[1][0],
+                true,
+            );
+            assert_eq!(direct.l0, None);
+            let (ref_index, vector) = direct.l1.unwrap();
+            let skipped_block = predict_l1_16x16(
+                future,
+                1,
+                0,
+                vector,
+                slice.weights.as_ref(),
+                ref_index as usize,
+            )
+            .unwrap();
+            let mut skipped_error = 0u32;
+            for row in 0..16 {
+                for col in 0..16 {
+                    skipped_error += u32::from(
+                        skipped_block.luma[row * 16 + col]
+                            .abs_diff(frame[row * future.width + 16 + col]),
+                    );
+                }
+            }
+            assert!(
+                skipped_error < 1024,
+                "second B luma block error: {skipped_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn site_first_b_picture_matches_reference_pixels() {
+        let (Ok(fixture), Ok(raw)) = (
+            std::env::var("WEBCORE_MP4_FIXTURE"),
+            std::env::var("WEBCORE_H264_B_REFERENCE_YUV"),
+        ) else {
+            return;
+        };
+        let bytes = std::fs::read(fixture).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let (_, Some(idr), _, _) = Mp4AvcStream::decode_sample(&index, &bytes, 0, 0, &[]).unwrap()
+        else {
+            panic!("IDR sample did not yield a reference picture");
+        };
+        let (_, Some(p), _, _) =
+            Mp4AvcStream::decode_sample(&index, &bytes, 0, 1, std::slice::from_ref(&idr)).unwrap()
+        else {
+            panic!("P sample did not yield a reference picture");
+        };
+        let sample = &index.samples[2];
+        let start = sample.offset as usize;
+        let mut stream = NalStream::new(index.config.nal_length_size).unwrap();
+        let units = stream
+            .push(&bytes[start..start + sample.size as usize])
+            .unwrap();
+        stream.finish().unwrap();
+        let nal = units.iter().find(|nal| nal[0] & 0x1f == 1).unwrap();
+        let pps = parse_pps_2005(&index.config.picture_parameter_sets[0]).unwrap();
+        let picture =
+            decode_cabac_b_2005(nal, &index.config.sequence_parameters[0], &pps, &[idr, p])
+                .unwrap();
+        let expected = std::fs::read(raw).unwrap();
+        let frame_bytes = picture.width * picture.height * 3 / 2;
+        assert_eq!(expected.len(), 5 * frame_bytes);
+        let presentation_index = index
+            .samples
+            .iter()
+            .take(5)
+            .filter(|other| other.presentation_time < sample.presentation_time)
+            .count();
+        let expected =
+            &expected[presentation_index * frame_bytes..(presentation_index + 1) * frame_bytes];
+        let actual = [&picture.luma[..], &picture.cb[..], &picture.cr[..]].concat();
+        let error: u64 = actual
+            .iter()
+            .zip(expected)
+            .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+            .sum();
+        let mean_error = error as f64 / frame_bytes as f64;
+        assert!(mean_error < 5.0, "first B mean YUV error: {mean_error}");
+    }
+
+    #[test]
+    fn site_multi_reference_p_picture_matches_reference_pixels() {
+        let (Ok(fixture), Ok(raw)) = (
+            std::env::var("WEBCORE_MP4_FIXTURE"),
+            std::env::var("WEBCORE_H264_P2_REFERENCE_YUV"),
+        ) else {
+            return;
+        };
+        let bytes = std::fs::read(fixture).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let sample = &index.samples[5];
+        let end = sample.offset as usize + sample.size as usize;
+        let mut decoder = Mp4AvcStream::new();
+        decoder.index = Some(index.clone());
+        decoder.push(&bytes[..end]).unwrap();
+        assert_eq!(decoder.next_sample, 6);
+        let picture = decoder.reference_pictures.last().unwrap();
+        let frame_bytes = picture.width * picture.height * 3 / 2;
+        let presentation_index = index
+            .samples
+            .iter()
+            .filter(|other| other.presentation_time < sample.presentation_time)
+            .count();
+        let raw = std::fs::read(raw).unwrap();
+        let expected = &raw[presentation_index * frame_bytes..][..frame_bytes];
+        let absolute_error: u64 = picture
+            .luma
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| u64::from(actual.abs_diff(*expected)))
+            .sum();
+        let mae = absolute_error as f64 / picture.luma.len() as f64;
+        assert!(mae < 5.0, "multi-reference P luma MAE: {mae}");
+    }
+
+    #[test]
+    fn site_b_intra_picture_matches_reference_pixels() {
+        let (Ok(fixture), Ok(raw)) = (
+            std::env::var("WEBCORE_MP4_FIXTURE"),
+            std::env::var("WEBCORE_H264_B2_REFERENCE_YUV"),
+        ) else {
+            return;
+        };
+        let bytes = std::fs::read(fixture).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let sample = &index.samples[6];
+        let end = sample.offset as usize + sample.size as usize;
+        let mut decoder = Mp4AvcStream::new();
+        decoder.index = Some(index.clone());
+        decoder.push(&bytes[..end]).unwrap();
+        assert_eq!(decoder.next_sample, 7);
+        let picture = decoder.reference_pictures.last().unwrap();
+        let frame_bytes = picture.width * picture.height * 3 / 2;
+        let presentation_index = index
+            .samples
+            .iter()
+            .filter(|other| other.presentation_time < sample.presentation_time)
+            .count();
+        let raw = std::fs::read(raw).unwrap();
+        let expected = &raw[presentation_index * frame_bytes..][..frame_bytes];
+        let absolute_error: u64 = picture
+            .luma
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| u64::from(actual.abs_diff(*expected)))
+            .sum();
+        let mae = absolute_error as f64 / picture.luma.len() as f64;
+        assert!(mae < 5.0, "B intra luma MAE: {mae}");
+    }
+
+    #[test]
+    fn site_b_sample_slice_layout() {
+        let Ok(fixture) = std::env::var("WEBCORE_MP4_FIXTURE") else {
+            return;
+        };
+        let bytes = std::fs::read(fixture).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let pps = parse_pps_2005(&index.config.picture_parameter_sets[0]).unwrap();
+        for sample_number in 2..5 {
+            let sample = &index.samples[sample_number];
+            let mut stream = NalStream::new(index.config.nal_length_size).unwrap();
+            let start = sample.offset as usize;
+            let units = stream
+                .push(&bytes[start..start + sample.size as usize])
+                .unwrap();
+            stream.finish().unwrap();
+            let slices: Vec<_> = units
+                .iter()
+                .filter(|nal| nal[0] & 0x1f == 1)
+                .map(|nal| {
+                    parse_cabac_inter_slice(nal, &index.config.sequence_parameters[0], &pps.core)
+                        .unwrap()
+                        .first_mb
+                })
+                .collect();
+            assert_eq!(slices, [0], "sample {sample_number} slice layout changed");
+        }
+    }
+
+    #[test]
     fn site_first_p_macroblock_reaches_cabac_inter_syntax() {
         let Ok(path) = std::env::var("WEBCORE_MP4_FIXTURE") else {
             return;
@@ -741,6 +1253,7 @@ mod tests {
         let slice =
             parse_cabac_inter_slice(nal, &index.config.sequence_parameters[0], &pps.core).unwrap();
         assert_eq!(slice.slice_type % 5, 0);
+        assert_eq!(slice.slice_qp, 23);
         assert!(slice.weights.is_some());
         let mut decoder = CabacDecoder::new(&slice.rbsp[slice.data_byte_offset..]).unwrap();
         let mut contexts =
@@ -807,6 +1320,54 @@ mod tests {
                 }
                 assert!(error < 128, "first P chroma block error: {error}");
             }
+        }
+    }
+
+    #[test]
+    fn site_first_p_picture_reconstructs_full_frame() {
+        let Ok(path) = std::env::var("WEBCORE_MP4_FIXTURE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let pps = parse_pps_2005(&index.config.picture_parameter_sets[0]).unwrap();
+        let first = &index.samples[0];
+        let mut nals = NalStream::new(index.config.nal_length_size).unwrap();
+        let units = nals
+            .push(&bytes[first.offset as usize..first.offset as usize + first.size as usize])
+            .unwrap();
+        nals.finish().unwrap();
+        let idr = units.iter().find(|nal| nal[0] & 0x1f == 5).unwrap();
+        let reference =
+            decode_cabac_idr_yuv_2005(idr, &index.config.sequence_parameters[0], &pps).unwrap();
+        let second = &index.samples[1];
+        let mut nals = NalStream::new(index.config.nal_length_size).unwrap();
+        let units = nals
+            .push(&bytes[second.offset as usize..second.offset as usize + second.size as usize])
+            .unwrap();
+        nals.finish().unwrap();
+        let nal = units.iter().find(|nal| nal[0] & 0x1f == 1).unwrap();
+        let frame = decode_cabac_p_2005(
+            nal,
+            &index.config.sequence_parameters[0],
+            &pps,
+            std::slice::from_ref(&reference),
+        )
+        .unwrap();
+        assert_eq!((frame.width, frame.height), (1280, 720));
+        assert_eq!(frame.motion[0][0].l0, Some((0, [6, 1])));
+        assert_eq!(frame.motion.len(), (1280 / 16) * (720 / 16));
+        if let Ok(path) = std::env::var("WEBCORE_H264_P_REFERENCE_YUV") {
+            let expected = std::fs::read(path).unwrap();
+            let actual = [&frame.luma[..], &frame.cb[..], &frame.cr[..]].concat();
+            assert_eq!(actual.len(), expected.len());
+            let error: u64 = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                .sum();
+            let mean_error = error as f64 / actual.len() as f64;
+            assert!(mean_error < 5.0, "first P mean YUV error: {mean_error}");
         }
     }
 }

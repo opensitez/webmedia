@@ -30,10 +30,40 @@ pub struct SequenceParameters {
     pub width_mbs: u32,
     pub frame_height_mbs: u32,
     pub frame_mbs_only: bool,
+    pub direct_8x8_inference: bool,
     pub frame_num_bits: usize,
     pub max_num_ref_frames: u32,
     pub pic_order_cnt_type: u32,
     pub pic_order_cnt_lsb_bits: Option<usize>,
+}
+
+/// H.264 8.2.1.1, equation 8-3 for progressive picture order count type 0.
+pub(super) fn type0_pic_order_count(
+    lsb: u32,
+    lsb_bits: usize,
+    previous_reference: Option<(i32, u32)>,
+) -> Result<(i32, i32), AvcError> {
+    if !(4..=16).contains(&lsb_bits) {
+        return Err(AvcError::InvalidData("invalid POC LSB width"));
+    }
+    let maximum = 1u32 << lsb_bits;
+    if lsb >= maximum {
+        return Err(AvcError::InvalidData("POC LSB out of range"));
+    }
+    let (previous_msb, previous_lsb) = previous_reference.unwrap_or((0, 0));
+    if previous_lsb >= maximum {
+        return Err(AvcError::InvalidData("previous POC LSB out of range"));
+    }
+    let msb = if lsb < previous_lsb && previous_lsb - lsb >= maximum / 2 {
+        previous_msb.checked_add(maximum as i32)
+    } else if lsb > previous_lsb && lsb - previous_lsb > maximum / 2 {
+        previous_msb.checked_sub(maximum as i32)
+    } else {
+        Some(previous_msb)
+    }
+    .ok_or(AvcError::TooLarge)?;
+    let full = msb.checked_add(lsb as i32).ok_or(AvcError::TooLarge)?;
+    Ok((msb, full))
 }
 
 /// Fields from the original 2003 picture parameter set (7.3.2.2).
@@ -84,6 +114,7 @@ pub struct CabacInterSlice {
     pub ref_idx_l1: u32,
     pub reorder_l0: Vec<RefPicReorder>,
     pub reorder_l1: Vec<RefPicReorder>,
+    pub marking: Vec<MemoryManagement>,
     pub direct_spatial_mv_pred: bool,
     pub cabac_init_idc: u32,
     pub slice_qp: i32,
@@ -97,6 +128,11 @@ pub enum RefPicReorder {
     Subtract(u32),
     Add(u32),
     LongTerm(u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryManagement {
+    ForgetShortTerm(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -676,8 +712,23 @@ pub fn parse_cabac_inter_slice(
     } else {
         None
     };
+    let mut marking = Vec::new();
     if nal[0] & 0x60 != 0 && bits.read(1)? != 0 {
-        return Err(AvcError::Unsupported("adaptive reference picture marking"));
+        for _ in 0..32 {
+            match bits.ue()? {
+                0 => break,
+                1 => marking.push(MemoryManagement::ForgetShortTerm(bits.ue()?)),
+                2..=6 => {
+                    return Err(AvcError::Unsupported(
+                        "adaptive reference marking operation",
+                    ));
+                }
+                _ => return Err(AvcError::InvalidData("invalid reference marking operation")),
+            }
+        }
+        if marking.len() == 32 {
+            return Err(AvcError::TooLarge);
+        }
     }
     let cabac_init_idc = bits.ue()?;
     if cabac_init_idc > 2 {
@@ -715,6 +766,7 @@ pub fn parse_cabac_inter_slice(
         ref_idx_l1,
         reorder_l0,
         reorder_l1,
+        marking,
         direct_spatial_mv_pred,
         cabac_init_idc,
         slice_qp,
@@ -830,7 +882,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<SequenceParameters, AvcError> {
     if !frame_mbs_only {
         bits.read(1)?;
     }
-    bits.read(1)?; // direct_8x8_inference_flag
+    let direct_8x8_inference = bits.read(1)? != 0;
     let crop = if bits.read(1)? != 0 {
         [bits.ue()?, bits.ue()?, bits.ue()?, bits.ue()?]
     } else {
@@ -868,6 +920,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<SequenceParameters, AvcError> {
         width_mbs,
         frame_height_mbs: height_map_units * frame_height_units,
         frame_mbs_only,
+        direct_8x8_inference,
         frame_num_bits,
         max_num_ref_frames,
         pic_order_cnt_type,
@@ -1077,6 +1130,21 @@ pub(super) fn frame_from_yuv420(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_zero_picture_order_count_wraps_in_both_directions() {
+        assert_eq!(
+            type0_pic_order_count(2, 4, Some((0, 14))).unwrap(),
+            (16, 18)
+        );
+        assert_eq!(
+            type0_pic_order_count(14, 4, Some((16, 2))).unwrap(),
+            (0, 14)
+        );
+        assert_eq!(type0_pic_order_count(8, 4, Some((0, 0))).unwrap(), (0, 8));
+        assert_eq!(type0_pic_order_count(0, 4, Some((0, 8))).unwrap(), (16, 16));
+        assert!(type0_pic_order_count(16, 4, None).is_err());
+    }
 
     struct BitWriter(Vec<bool>);
 

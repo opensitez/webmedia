@@ -24,6 +24,7 @@ pub const WOFF2_MAGIC: [u8; 4] = [0x77, 0x4F, 0x46, 0x32];
 pub const WOFF1_MAGIC: [u8; 4] = [0x77, 0x4F, 0x46, 0x46];
 
 /// Decode a WOFF container into raw sfnt bytes.
+#[inline]
 pub fn decode(data: &[u8]) -> Option<Vec<u8>> {
     if data.starts_with(&WOFF2_MAGIC) {
         woff2::decode(data)
