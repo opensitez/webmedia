@@ -1,7 +1,8 @@
 //! Bounded ISO base media file parser for classic AVC-in-MP4 sample tables.
 //!
-//! A front-loaded `moov` is enough to index HTTP byte ranges before `mdat`
-//! arrives. Fragmented MP4 and external data references are not handled here.
+//! A front-loaded `moov` can be indexed before `mdat` arrives. Files with a
+//! trailing `moov` are indexed once the bounded input buffer reaches it.
+//! Fragmented MP4 and external data references are not handled here.
 
 use super::h264::{AvcConfig, AvcError};
 
@@ -127,8 +128,8 @@ fn table_u32(data: &[u8], entry_width: usize) -> Result<(usize, usize), Mp4Error
 }
 
 impl Mp4Index {
-    /// Parse a complete front-loaded `moov` from a file prefix. Later `mdat`
-    /// bytes are not needed; sample offsets refer to the full file.
+    /// Parse a complete `moov` from a file prefix. A trailing `moov` requires
+    /// the preceding `mdat` to be present; sample offsets refer to the full file.
     pub fn parse_prefix(prefix: &[u8]) -> Result<Self, Mp4Error> {
         let mut offset = 0;
         let moov = loop {
@@ -139,11 +140,6 @@ impl Mp4Index {
                     return Err(Mp4Error::TooLarge);
                 }
                 break atom_at(prefix, offset)?;
-            }
-            if &header[4..8] == b"mdat" {
-                return Err(Mp4Error::Unsupported(
-                    "moov after mdat requires a range request",
-                ));
             }
             let atom = atom_at(prefix, offset)?;
             offset = offset.checked_add(atom.size).ok_or(Mp4Error::TooLarge)?;
@@ -476,5 +472,31 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].decode_time <= pair[1].decode_time)
         );
+    }
+
+    #[test]
+    fn indexes_trailing_moov_when_fixture_is_available() {
+        let Ok(path) = std::env::var("WEBCORE_TRAILING_MOOV_FIXTURE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[0x2c..0x30], b"mdat");
+        let mdat_size = u32_at(&bytes, 0x28).unwrap() as usize;
+        let moov_offset = 0x28 + mdat_size;
+        assert_eq!(&bytes[moov_offset + 4..moov_offset + 8], b"moov");
+        assert_eq!(
+            Mp4Index::parse_prefix(&bytes[..moov_offset]),
+            Err(Mp4Error::Incomplete)
+        );
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        assert_eq!(index.config.sequence_parameters[0].profile_idc, 100);
+        assert_eq!(
+            (
+                index.config.sequence_parameters[0].width,
+                index.config.sequence_parameters[0].height
+            ),
+            (1920, 1080)
+        );
+        assert!(index.samples.len() > 100);
     }
 }

@@ -106,22 +106,11 @@ fn filter_edge(
         let p1 = plane[q - 2 * across] as i32;
         let q0 = plane[q] as i32;
         let q1 = plane[q + across] as i32;
-        if (p0 - q0).abs() >= alpha
-            || (p1 - p0).abs() >= beta
-            || (q1 - q0).abs() >= beta
-        {
+        if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
             continue;
         }
-        let p = [
-            p0,
-            p1,
-            plane[q - 3 * across] as i32,
-        ];
-        let r = [
-            q0,
-            q1,
-            plane[q + 2 * across] as i32,
-        ];
+        let p = [p0, p1, plane[q - 3 * across] as i32];
+        let r = [q0, q1, plane[q + 2 * across] as i32];
         let (mut p0, mut p1, mut p2) = (p[0], p[1], p[2]);
         let (mut q0, mut q1, mut q2) = (r[0], r[1], r[2]);
         if strength == 4 {
@@ -390,8 +379,17 @@ pub(super) fn filter_inter_picture(
                     vertical_chroma_strength[edge / 2][segment / 2] = strength;
                 }
                 filter_edge(
-                    luma, width, x * 16 + edge * 4, y * 16 + segment * 4,
-                    true, 4, strength, qp, alpha_offset, beta_offset, false,
+                    luma,
+                    width,
+                    x * 16 + edge * 4,
+                    y * 16 + segment * 4,
+                    true,
+                    4,
+                    strength,
+                    qp,
+                    alpha_offset,
+                    beta_offset,
+                    false,
                 );
             }
         }
@@ -403,15 +401,28 @@ pub(super) fn filter_inter_picture(
                 if edge == 0 && x == 0 {
                     continue;
                 }
-                let previous = if edge == 0 { &macroblocks[mb - 1] } else { current };
+                let previous = if edge == 0 {
+                    &macroblocks[mb - 1]
+                } else {
+                    current
+                };
                 let qpc = chroma_qp(current.qp, offset)?;
                 let ppc = chroma_qp(previous.qp, offset)?;
                 let qp = (qpc + ppc + 1) >> 1;
                 for segment in 0..2 {
                     let strength = vertical_chroma_strength[edge][segment];
                     filter_edge(
-                        plane, width / 2, x * 8 + edge * 4, y * 8 + segment * 4,
-                        true, 4, strength, qp, alpha_offset, beta_offset, true,
+                        plane,
+                        width / 2,
+                        x * 8 + edge * 4,
+                        y * 8 + segment * 4,
+                        true,
+                        4,
+                        strength,
+                        qp,
+                        alpha_offset,
+                        beta_offset,
+                        true,
                     );
                 }
             }
@@ -439,8 +450,17 @@ pub(super) fn filter_inter_picture(
                     horizontal_chroma_strength[edge / 2][segment / 2] = strength;
                 }
                 filter_edge(
-                    luma, width, x * 16 + segment * 4, y * 16 + edge * 4,
-                    false, 4, strength, qp, alpha_offset, beta_offset, false,
+                    luma,
+                    width,
+                    x * 16 + segment * 4,
+                    y * 16 + edge * 4,
+                    false,
+                    4,
+                    strength,
+                    qp,
+                    alpha_offset,
+                    beta_offset,
+                    false,
                 );
             }
         }
@@ -452,15 +472,28 @@ pub(super) fn filter_inter_picture(
                 if edge == 0 && y == 0 {
                     continue;
                 }
-                let previous = if edge == 0 { &macroblocks[mb - mb_width] } else { current };
+                let previous = if edge == 0 {
+                    &macroblocks[mb - mb_width]
+                } else {
+                    current
+                };
                 let qpc = chroma_qp(current.qp, offset)?;
                 let ppc = chroma_qp(previous.qp, offset)?;
                 let qp = (qpc + ppc + 1) >> 1;
                 for segment in 0..2 {
                     let strength = horizontal_chroma_strength[edge][segment];
                     filter_edge(
-                        plane, width / 2, x * 8 + segment * 4, y * 8 + edge * 4,
-                        false, 4, strength, qp, alpha_offset, beta_offset, true,
+                        plane,
+                        width / 2,
+                        x * 8 + segment * 4,
+                        y * 8 + edge * 4,
+                        false,
+                        4,
+                        strength,
+                        qp,
+                        alpha_offset,
+                        beta_offset,
+                        true,
                     );
                 }
             }

@@ -377,7 +377,11 @@ fn rbsp_from_nal(nal: &[u8], expected_type: u8) -> Result<Vec<u8>, AvcError> {
             continue;
         }
         rbsp.push(byte);
-        zero_count = if byte == 0 { (zero_count + 1).min(2) } else { 0 };
+        zero_count = if byte == 0 {
+            (zero_count + 1).min(2)
+        } else {
+            0
+        };
     }
     Ok(rbsp)
 }

@@ -54,6 +54,10 @@ pub trait StreamingVideoDecoder {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<VideoFrame>, MediaDecodeError>;
     fn metadata(&self) -> Option<MediaMetadata>;
     fn finish(&self) -> Result<(), MediaDecodeError>;
+
+    fn has_buffered_samples(&self) -> bool {
+        false
+    }
 }
 
 pub struct NullMediaDecoder;

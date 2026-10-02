@@ -12,6 +12,7 @@ use super::h264_inter::{decode_cabac_b_2005, decode_cabac_p_2005};
 use super::mp4::{Mp4Error, Mp4Index};
 
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAMES_PER_PUSH: usize = 4;
 
 #[derive(Default)]
 pub struct Mp4AvcStream {
@@ -291,7 +292,10 @@ impl StreamingVideoDecoder for Mp4AvcStream {
             }
         }
         let mut frames = Vec::new();
-        while let Some(sample) = self.index.as_ref().unwrap().samples.get(self.next_sample) {
+        while frames.len() < MAX_FRAMES_PER_PUSH {
+            let Some(sample) = self.index.as_ref().unwrap().samples.get(self.next_sample) else {
+                break;
+            };
             let end = sample
                 .offset
                 .checked_add(u64::from(sample.size))
@@ -425,6 +429,14 @@ impl StreamingVideoDecoder for Mp4AvcStream {
         } else {
             Err(Self::invalid("truncated MP4/AVC stream"))
         }
+    }
+
+    fn has_buffered_samples(&self) -> bool {
+        self.index
+            .as_ref()
+            .and_then(|index| index.samples.get(self.next_sample))
+            .and_then(|sample| sample.offset.checked_add(u64::from(sample.size)))
+            .is_some_and(|end| end <= self.base_offset + self.bytes.len() as u64)
     }
 }
 
@@ -623,6 +635,64 @@ mod tests {
     }
 
     #[test]
+    fn decodes_trailing_moov_fixture_first_frame() {
+        let Ok(path) = std::env::var("WEBCORE_TRAILING_MOOV_FIXTURE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let sample = &index.samples[9];
+        let end = (sample.offset + u64::from(sample.size)) as usize;
+        let mut decoder = Mp4AvcStream::new();
+        decoder.index = Some(index);
+        let mut frames = Vec::new();
+        for chunk in bytes[..end].chunks(16 * 1024) {
+            frames.extend(decoder.push(chunk).unwrap());
+        }
+        assert_eq!(decoder.next_sample, 10);
+        assert_eq!(decoder.dropped_nonreference_samples, 0);
+        assert_eq!(decoder.dropped_until_idr_samples, 0);
+        assert!(
+            !frames.is_empty(),
+            "pending={}, dropped B={}, dropped until IDR={}, next={}, first timestamps={:?}",
+            decoder.pending_pictures.len(),
+            decoder.dropped_nonreference_samples,
+            decoder.dropped_until_idr_samples,
+            decoder.next_sample,
+            &decoder.index.as_ref().unwrap().samples[..10]
+                .iter()
+                .map(|sample| sample.presentation_time)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!((frames[0].width, frames[0].height), (1920, 1080));
+    }
+
+    #[test]
+    fn streams_trailing_moov_fixture_in_bounded_batches() {
+        let Ok(path) = std::env::var("WEBCORE_TRAILING_MOOV_FIXTURE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let mut decoder = Mp4AvcStream::new();
+        let mut frames = Vec::new();
+        for chunk in bytes.chunks(16 * 1024) {
+            let batch = decoder.push(chunk).unwrap();
+            assert!(batch.len() <= MAX_FRAMES_PER_PUSH + 4);
+            frames.extend(batch);
+        }
+        let metadata = decoder.metadata().unwrap();
+        assert_eq!((metadata.width, metadata.height), (Some(1920), Some(1080)));
+        assert!(decoder.has_buffered_samples());
+        while frames.len() < 4 && decoder.has_buffered_samples() {
+            let batch = decoder.push(&[]).unwrap();
+            assert!(batch.len() <= MAX_FRAMES_PER_PUSH + 4);
+            frames.extend(batch);
+        }
+        assert!(!frames.is_empty());
+        assert_eq!((frames[0].width, frames[0].height), (1920, 1080));
+    }
+
+    #[test]
     fn decodes_entire_site_video_in_presentation_order() {
         let Ok(path) = std::env::var("WEBCORE_MP4_FULL_FIXTURE") else {
             return;
@@ -658,6 +728,16 @@ mod tests {
                 );
                 last_dropped_nonreference = decoder.dropped_nonreference_samples;
                 last_dropped_until_idr = decoder.dropped_until_idr_samples;
+            }
+        }
+        while decoder.has_buffered_samples() {
+            let decoded = decoder.push(&[]).unwrap_or_else(|error| {
+                panic!("failed at sample {}: {error:?}", decoder.next_sample)
+            });
+            for frame in decoded {
+                assert!(last_timestamp.is_none_or(|last| frame.timestamp >= last));
+                last_timestamp = Some(frame.timestamp);
+                frames += 1;
             }
         }
         decoder.finish().unwrap();
@@ -696,6 +776,9 @@ mod tests {
         decoder.next_sample = start;
         decoder.base_offset = start_offset as u64;
         decoder.push(&bytes[start_offset..end_offset]).unwrap();
+        while decoder.next_sample <= target && decoder.has_buffered_samples() {
+            decoder.push(&[]).unwrap();
+        }
         assert_eq!(
             decoder.next_sample,
             target + 1,
@@ -756,6 +839,43 @@ mod tests {
         assert_eq!(expected.len(), frame_bytes);
         let y_end = actual.width as usize * actual.height as usize;
         let cb_end = y_end + y_end / 4;
+        if let Some(picture) = picture.as_ref() {
+            for (name, actual_plane, expected_plane, plane_width, plane_height) in [
+                (
+                    "Y",
+                    &picture.luma,
+                    &expected[..y_end],
+                    actual.width as usize,
+                    actual.height as usize,
+                ),
+                (
+                    "Cb",
+                    &picture.cb,
+                    &expected[y_end..cb_end],
+                    actual.width as usize / 2,
+                    actual.height as usize / 2,
+                ),
+                (
+                    "Cr",
+                    &picture.cr,
+                    &expected[cb_end..],
+                    actual.width as usize / 2,
+                    actual.height as usize / 2,
+                ),
+            ] {
+                let error: u64 = actual_plane
+                    .chunks_exact(plane_width)
+                    .take(plane_height)
+                    .flatten()
+                    .zip(expected_plane.iter())
+                    .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                    .sum();
+                eprintln!(
+                    "sample {target} {name} MAE={:.3}",
+                    error as f64 / expected_plane.len() as f64
+                );
+            }
+        }
         let reference = frame_from_yuv420(
             &index.config.sequence_parameters[0],
             &expected[..y_end],
@@ -807,6 +927,80 @@ mod tests {
                     eprintln!("motion ({mx},{my}): {:?}", picture.motion[index]);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn site_gop_frame_error_profile() {
+        let (Ok(fixture), Ok(raw), Ok(first), Ok(last)) = (
+            std::env::var("WEBCORE_MP4_FULL_FIXTURE"),
+            std::env::var("WEBCORE_H264_GOP_REFERENCE_YUV"),
+            std::env::var("WEBCORE_H264_GOP_FIRST_FRAME"),
+            std::env::var("WEBCORE_H264_GOP_LAST_SAMPLE"),
+        ) else {
+            return;
+        };
+        let first: usize = first.parse().unwrap();
+        let last: usize = last.parse().unwrap();
+        let bytes = std::fs::read(fixture).unwrap();
+        let raw = std::fs::read(raw).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let mut presentation_times: Vec<_> = index
+            .samples
+            .iter()
+            .map(|sample| sample.presentation_time)
+            .collect();
+        presentation_times.sort_unstable();
+        let start = (0..=last)
+            .rev()
+            .find(|&sample| index.samples[sample].keyframe)
+            .unwrap();
+        let width = index.config.sequence_parameters[0].width as usize;
+        let height = index.config.sequence_parameters[0].height as usize;
+        let y_size = width * height;
+        let frame_size = y_size * 3 / 2;
+        let start_offset = index.samples[start].offset as usize;
+        let end = &index.samples[last];
+        let end_offset = end.offset as usize + end.size as usize;
+        let mut decoder = Mp4AvcStream::new();
+        decoder.index = Some(index.clone());
+        decoder.next_sample = start;
+        decoder.base_offset = start_offset as u64;
+        let mut frames = decoder.push(&bytes[start_offset..end_offset]).unwrap();
+        while decoder.next_sample <= last && decoder.has_buffered_samples() {
+            frames.extend(decoder.push(&[]).unwrap());
+        }
+        for frame in frames {
+            let presentation_time = (frame.timestamp * index.timescale as f32).round() as i64;
+            let number = presentation_times.partition_point(|&time| time < presentation_time);
+            if number < first {
+                continue;
+            }
+            let offset = (number - first) * frame_size;
+            let Some(expected) = raw.get(offset..offset + frame_size) else {
+                continue;
+            };
+            let reference = frame_from_yuv420(
+                &index.config.sequence_parameters[0],
+                &expected[..y_size],
+                &expected[y_size..y_size + y_size / 4],
+                &expected[y_size + y_size / 4..],
+            );
+            let error: u64 = frame
+                .rgba
+                .chunks_exact(4)
+                .zip(reference.rgba.chunks_exact(4))
+                .map(|(a, b)| {
+                    (0..3)
+                        .map(|channel| u64::from(a[channel].abs_diff(b[channel])))
+                        .sum::<u64>()
+                })
+                .sum();
+            eprintln!(
+                "frame {number} t={:.3} RGB MAE={:.3}",
+                frame.timestamp,
+                error as f64 / (y_size * 3) as f64
+            );
         }
     }
 

@@ -13,6 +13,19 @@ pub mod mp4;
 pub mod mp4_avc;
 #[cfg(feature = "audio-symphonia")]
 pub mod symphonia_backend;
+pub mod vp8;
+mod vp8_coeff;
+mod vp8_decoder;
+mod vp8_filter;
+mod vp8_inter;
+mod vp8_motion;
+mod vp8_keyframe;
+mod vp8_predict;
+mod vp8_probs;
+mod vp8_quant;
+mod vp8_residue;
+mod vp8_transform;
+pub mod webm;
 pub mod y4m;
 
 pub use backend::{

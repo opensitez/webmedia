@@ -2208,8 +2208,8 @@ impl CabacDecoder<'_> {
                     break;
                 }
                 magnitude_minus1 += 1;
-            if magnitude_minus1 == 14 {
-                let mut extra_bits = 0u32;
+                if magnitude_minus1 == 14 {
+                    let mut extra_bits = 0u32;
                     while self.bypass()? != 0 {
                         extra_bits += 1;
                         if extra_bits > 20 {
@@ -2808,7 +2808,14 @@ mod tests {
                 let mut node = 1usize;
                 for (index, bit) in code.bytes().enumerate() {
                     node = node * 2 + usize::from(bit == b'1');
-                    assert_eq!(tree[node], if index + 1 == code.len() { kind as i8 + 1 } else { 0 });
+                    assert_eq!(
+                        tree[node],
+                        if index + 1 == code.len() {
+                            kind as i8 + 1
+                        } else {
+                            0
+                        }
+                    );
                 }
             }
         }
@@ -2849,7 +2856,11 @@ mod tests {
             sum += u64::from(decoder.read_bit().unwrap());
         }
         std::hint::black_box(sum);
-        eprintln!("CABAC {} bits: {:?}", decoder.consumed_bits(), start.elapsed());
+        eprintln!(
+            "CABAC {} bits: {:?}",
+            decoder.consumed_bits(),
+            start.elapsed()
+        );
     }
 
     #[test]
