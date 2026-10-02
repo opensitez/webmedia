@@ -457,6 +457,23 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn streams_entire_supplied_webm() {
+        let Ok(path) = std::env::var("WEBMEDIA_WEBM_SAMPLE") else { return };
+        let bytes = std::fs::read(path).unwrap();
+        let mut decoder = WebmVp8Decoder::new();
+        let mut count = 0usize;
+        let start = std::time::Instant::now();
+        for chunk in bytes.chunks(16384) {
+            count += decoder.push(chunk).unwrap().len();
+        }
+        decoder.finish().unwrap();
+        assert!(count > 1);
+        if std::env::var_os("WEBMEDIA_VP8_REPORT").is_some() {
+            eprintln!("streamed {count} VP8 frames in {:.3}s", start.elapsed().as_secs_f64());
+        }
+    }
+
     fn element(id: &[u8], value: &[u8]) -> Vec<u8> {
         assert!(value.len() < 127);
         let mut bytes = id.to_vec();

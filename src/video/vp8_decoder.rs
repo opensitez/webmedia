@@ -53,7 +53,22 @@ impl Vp8Decoder {
         let mut layout = InterFrameLayout::parse(packet, state)?;
         let mb_width = state.mb_width;
         let mb_height = state.mb_height;
-        let modes = layout.read_macroblocks(state, mb_width, mb_height)?;
+        let modes = layout
+            .read_macroblocks(state, mb_width, mb_height)
+            .map_err(|error| {
+                MediaDecodeError::InvalidData(format!("VP8 macroblock modes: {error:?}"))
+            })?;
+        #[cfg(test)]
+        if std::env::var_os("WEBMEDIA_VP8_REPORT").is_some() {
+            let mut counts = [0usize; 10];
+            for mode in &modes {
+                counts[mode.mode as usize] += 1;
+            }
+            eprintln!("VP8 modes {counts:?} token bytes {:?}", layout.token_partitions.iter().map(|part| part.len()).collect::<Vec<_>>());
+            if mb_width <= 3 {
+                eprintln!("VP8 block modes {:?}", modes.iter().map(|mode| (mode.mode, mode.reference, mode.skip_coefficients)).collect::<Vec<_>>());
+            }
+        }
         let mut residues = ResidueDecoder::new(&layout)?;
         let last = self.last.as_ref().unwrap();
         let mut frame = YuvKeyFrame::new(last.width, last.height);
@@ -62,7 +77,14 @@ impl Vp8Decoder {
             for mb_x in 0..mb_width {
                 let index = mb_y * mb_width + mb_x;
                 let mode = &modes[index];
-                let blocks = residues.decode(&layout, mode, mb_x, mb_y)?;
+                let blocks = residues
+                    .decode(&layout, mode, mb_x, mb_y)
+                    .map_err(|error| {
+                        MediaDecodeError::InvalidData(format!(
+                            "VP8 residual at ({mb_x}, {mb_y}), mode={} ref={} skip={}: {error:?}",
+                            mode.mode, mode.reference, mode.skip_coefficients
+                        ))
+                    })?;
                 if mode.reference == 0 {
                     reconstruct_intra(
                         &mut frame,
