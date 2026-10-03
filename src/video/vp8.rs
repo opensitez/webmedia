@@ -434,6 +434,7 @@ impl<'a> BoolDecoder<'a> {
         })
     }
 
+    #[inline]
     pub fn read(&mut self, probability: u8) -> Result<bool, MediaDecodeError> {
         let split = 1 + ((self.range - 1) * u32::from(probability) >> 8);
         let threshold = split << 8;
@@ -444,21 +445,21 @@ impl<'a> BoolDecoder<'a> {
         } else {
             self.range = split;
         }
-        while self.range < 128 {
-            self.range <<= 1;
+        let shift = self.range.leading_zeros() - 24;
+        if shift != 0 {
             let byte = self.next_bit / 8;
-            if self.next_bit >= self.data.len() * 8 + 16 {
+            if self.next_bit + shift as usize > self.data.len() * 8 + 16 {
                 return Err(MediaDecodeError::InvalidData(
                     "truncated VP8 arithmetic code".into(),
                 ));
             }
-            let next = if byte < self.data.len() {
-                (self.data[byte] >> (7 - self.next_bit % 8)) & 1
-            } else {
-                0
-            };
-            self.value = (self.value << 1) | u32::from(next);
-            self.next_bit += 1;
+            let window = u32::from(self.data.get(byte).copied().unwrap_or(0)) << 8
+                | u32::from(self.data.get(byte + 1).copied().unwrap_or(0));
+            let next = (window >> (16 - self.next_bit % 8 - shift as usize))
+                & ((1 << shift) - 1);
+            self.range <<= shift;
+            self.value = (self.value << shift) | next;
+            self.next_bit += shift as usize;
         }
         Ok(bit)
     }
@@ -479,6 +480,51 @@ impl<'a> BoolDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_arithmetic_refill_matches_bitwise_reader() {
+        for length in [2, 3, 17, 128] {
+            let mut seed = 31u32;
+            let data: Vec<u8> = (0..length).map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            }).collect();
+            let mut bulk = BoolDecoder::new(&data).unwrap();
+            let mut scalar = BoolDecoder::new(&data).unwrap();
+            for i in 0..10000 {
+                let probability = (i * 73) as u8;
+                let split = 1 + ((scalar.range - 1) * u32::from(probability) >> 8);
+                let threshold = split << 8;
+                let expected = scalar.value >= threshold;
+                if expected {
+                    scalar.value -= threshold;
+                    scalar.range -= split;
+                } else {
+                    scalar.range = split;
+                }
+                let mut truncated = false;
+                while scalar.range < 128 {
+                    scalar.range <<= 1;
+                    if scalar.next_bit >= data.len() * 8 + 16 {
+                        truncated = true;
+                        break;
+                    }
+                    let next = data.get(scalar.next_bit / 8)
+                        .map_or(0, |byte| (byte >> (7 - scalar.next_bit % 8)) & 1);
+                    scalar.value = (scalar.value << 1) | u32::from(next);
+                    scalar.next_bit += 1;
+                }
+                let result = bulk.read(probability);
+                if truncated {
+                    assert!(result.is_err());
+                    break;
+                }
+                assert_eq!(result.unwrap(), expected);
+                assert_eq!((bulk.range, bulk.value, bulk.next_bit),
+                    (scalar.range, scalar.value, scalar.next_bit));
+            }
+        }
+    }
 
     #[test]
     fn parses_keyframe_dimensions_and_rejects_bad_marker() {

@@ -1,4 +1,4 @@
-//! Bounded ISO base media file parser for classic AVC-in-MP4 sample tables.
+//! Bounded ISO base media file parser for classic AVC/VP8/VP9 video sample tables.
 //!
 //! A front-loaded `moov` can be indexed before `mdat` arrives. Files with a
 //! trailing `moov` are indexed once the bounded input buffer reaches it.
@@ -38,6 +38,23 @@ pub struct Mp4Index {
     pub timescale: u32,
     pub duration_ticks: u64,
     pub config: AvcConfig,
+    pub samples: Vec<Sample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mp4VideoCodec {
+    Avc(AvcConfig),
+    Vp8,
+    Vp9,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mp4VideoIndex {
+    pub timescale: u32,
+    pub duration_ticks: u64,
+    pub codec: Mp4VideoCodec,
+    pub width: u32,
+    pub height: u32,
     pub samples: Vec<Sample>,
 }
 
@@ -128,6 +145,21 @@ fn table_u32(data: &[u8], entry_width: usize) -> Result<(usize, usize), Mp4Error
 }
 
 impl Mp4Index {
+    pub fn parse_prefix(prefix: &[u8]) -> Result<Self, Mp4Error> {
+        let index = Mp4VideoIndex::parse_prefix(prefix)?;
+        let Mp4VideoCodec::Avc(config) = index.codec else {
+            return Err(Mp4Error::Unsupported("video sample entry is not avc1"));
+        };
+        Ok(Self {
+            timescale: index.timescale,
+            duration_ticks: index.duration_ticks,
+            config,
+            samples: index.samples,
+        })
+    }
+}
+
+impl Mp4VideoIndex {
     /// Parse a complete `moov` from a file prefix. A trailing `moov` requires
     /// the preceding `mdat` to be present; sample offsets refer to the full file.
     pub fn parse_prefix(prefix: &[u8]) -> Result<Self, Mp4Error> {
@@ -179,11 +211,21 @@ impl Mp4Index {
             return Err(Mp4Error::Unsupported("multiple sample descriptions"));
         }
         let entry = atom_at(stsd.data, 8)?;
-        if entry.kind != *b"avc1" || entry.data.len() < 78 {
-            return Err(Mp4Error::Unsupported("video sample entry is not avc1"));
+        if entry.data.len() < 78 {
+            return Err(Mp4Error::Invalid("short visual sample entry"));
         }
-        let avcc = child(&entry.data[78..], b"avcC")?;
-        let config = AvcConfig::parse(avcc.data)?;
+        let width = u32::from(u16::from_be_bytes(entry.data[24..26].try_into().unwrap()));
+        let height = u32::from(u16::from_be_bytes(entry.data[26..28].try_into().unwrap()));
+        let codec = if entry.kind == *b"avc1" {
+            let avcc = child(&entry.data[78..], b"avcC")?;
+            Mp4VideoCodec::Avc(AvcConfig::parse(avcc.data)?)
+        } else if entry.kind == *b"vp08" {
+            Mp4VideoCodec::Vp8
+        } else if entry.kind == *b"vp09" {
+            Mp4VideoCodec::Vp9
+        } else {
+            return Err(Mp4Error::Unsupported("unsupported video sample entry"));
+        };
 
         let stsz = child(stbl.data, b"stsz")?;
         let sample_size = u32_at(stsz.data, 4)?;
@@ -334,7 +376,9 @@ impl Mp4Index {
         Ok(Self {
             timescale,
             duration_ticks: clock,
-            config,
+            codec,
+            width,
+            height,
             samples,
         })
     }

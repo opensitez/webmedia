@@ -11,6 +11,7 @@ pub mod h264_intra;
 pub mod h264_transform;
 pub mod mp4;
 pub mod mp4_avc;
+pub mod mp4_video;
 #[cfg(feature = "audio-symphonia")]
 pub mod symphonia_backend;
 pub mod vp8;
@@ -25,6 +26,20 @@ mod vp8_probs;
 mod vp8_quant;
 mod vp8_residue;
 mod vp8_transform;
+pub mod vp9;
+mod vp9_adapt;
+mod vp9_coef_probs;
+mod vp9_compressed;
+mod vp9_decoder;
+mod vp9_inter_probs;
+mod vp9_loop_filter;
+mod vp9_mode_probs;
+mod vp9_motion;
+mod vp9_predict;
+mod vp9_quant;
+mod vp9_scan;
+mod vp9_tile;
+mod vp9_transform;
 pub mod webm;
 pub mod y4m;
 
