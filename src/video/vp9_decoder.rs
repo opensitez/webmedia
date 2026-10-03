@@ -852,6 +852,7 @@ mod tests {
             .map(|value| value.split(',').map(|frame| frame.parse::<usize>().unwrap())
                 .collect::<Vec<_>>());
         let mut shown_count = 0usize;
+        let mut checked_frames = Vec::new();
         let mut dimensions = None;
         let convert_rgba = std::env::var_os("WEBMEDIA_VP9_TEST_RGBA").is_some();
         while decoded < target {
@@ -902,6 +903,7 @@ mod tests {
                                     assert_eq!(error, 0, "VP9 frame {shown_count} plane {plane_index} is not pixel-exact");
                                 }
                             }
+                            checked_frames.push(shown_count);
                         }
                         if convert_rgba { std::hint::black_box(frame.rgba()); }
                         shown_count += 1;
@@ -910,6 +912,13 @@ mod tests {
                     if decoded == target { break; }
                 }
                 if decoded == target { break; }
+            }
+        }
+        if reference.is_some() {
+            if let Some(frames) = reference_frames {
+                for index in frames {
+                    assert!(checked_frames.contains(&index), "VP9 reference frame {index} was not reached");
+                }
             }
         }
     }

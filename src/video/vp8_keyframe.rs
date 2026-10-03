@@ -132,35 +132,114 @@ impl YuvKeyFrame {
     }
 
     pub(super) fn rgba(&self) -> Vec<u8> {
+        self.rgba_row_pairs::<true>()
+    }
+
+    fn rgba_row_pairs<const VECTOR: bool>(&self) -> Vec<u8> {
         let mut rgba = vec![0; self.width * self.height * 4];
-        for y in 0..self.height {
+        if self.width == 0 { return rgba; }
+        for (pair, output) in rgba.chunks_mut(self.width * 8).enumerate() {
+            let y = pair * 2;
             let luma = &self.y.pixels[y * self.y.width..][..self.width];
+            let next_luma = if y + 1 < self.height {
+                &self.y.pixels[(y + 1) * self.y.width..][..self.width]
+            } else { &[] };
             let u = &self.u.pixels[(y / 2) * self.u.width..][..self.width.div_ceil(2)];
             let v = &self.v.pixels[(y / 2) * self.v.width..][..self.width.div_ceil(2)];
-            let target = &mut rgba[y * self.width * 4..(y + 1) * self.width * 4];
+            let (target, next_target) = output.split_at_mut(self.width * 4);
             #[cfg(target_arch = "aarch64")]
-            let processed = unsafe { rgba_row_neon(luma, u, v, target) };
+            let processed = if VECTOR {
+                if next_luma.is_empty() {
+                    unsafe { rgba_row_neon(luma, u, v, target) }
+                } else {
+                    unsafe { rgba_two_rows_neon(luma, next_luma, u, v, target, next_target) }
+                }
+            } else { 0 };
             #[cfg(not(target_arch = "aarch64"))]
             let processed = 0;
-            for (((pixels, samples), &cb), &cr) in target[processed * 4..].chunks_mut(8)
-                .zip(luma[processed..].chunks(2)).zip(&u[processed / 2..]).zip(&v[processed / 2..])
-            {
-                let cb = i32::from(cb) - 128;
-                let cr = i32::from(cr) - 128;
-                let red = 409 * cr + 128;
-                let green = -100 * cb - 208 * cr + 128;
-                let blue = 516 * cb + 128;
-                for (pixel, &sample) in pixels.chunks_exact_mut(4).zip(samples) {
-                    let luma = 298 * (i32::from(sample) - 16);
-                    pixel[0] = ((luma + red) >> 8).clamp(0, 255) as u8;
-                    pixel[1] = ((luma + green) >> 8).clamp(0, 255) as u8;
-                    pixel[2] = ((luma + blue) >> 8).clamp(0, 255) as u8;
-                    pixel[3] = 255;
-                }
-            }
+            rgba_two_rows_scalar(luma, next_luma, u, v, target, next_target, processed);
         }
         rgba
     }
+}
+
+fn rgba_two_rows_scalar(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
+    first_target: &mut [u8], second_target: &mut [u8], start: usize)
+{
+    #[inline]
+    fn write(samples: &[u8], target: &mut [u8], red: i32, green: i32, blue: i32) {
+        for (pixel, &sample) in target.chunks_exact_mut(4).zip(samples) {
+            let luma = 298 * (i32::from(sample) - 16);
+            pixel[0] = ((luma + red) >> 8).clamp(0, 255) as u8;
+            pixel[1] = ((luma + green) >> 8).clamp(0, 255) as u8;
+            pixel[2] = ((luma + blue) >> 8).clamp(0, 255) as u8;
+            pixel[3] = 255;
+        }
+    }
+    for x in (start..first.len()).step_by(2) {
+        let cb = i32::from(cb[x / 2]) - 128;
+        let cr = i32::from(cr[x / 2]) - 128;
+        let red = 409 * cr + 128;
+        let green = -100 * cb - 208 * cr + 128;
+        let blue = 516 * cb + 128;
+        let end = (x + 2).min(first.len());
+        write(&first[x..end], &mut first_target[x * 4..end * 4], red, green, blue);
+        if !second.is_empty() {
+            write(&second[x..end], &mut second_target[x * 4..end * 4], red, green, blue);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rgba_two_rows_neon(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
+    first_target: &mut [u8], second_target: &mut [u8]) -> usize
+{
+    use std::arch::aarch64::*;
+    let chroma = |cb, cr| {
+        let cb = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cb)), vdupq_n_s16(128));
+        let cr = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cr)), vdupq_n_s16(128));
+        let terms = |cb, cr| (
+            vmull_n_s16(cr, 409),
+            vsubq_s32(vnegq_s32(vmull_n_s16(cb, 100)), vmull_n_s16(cr, 208)),
+            vmull_n_s16(cb, 516),
+        );
+        [terms(vget_low_s16(cb), vget_low_s16(cr)),
+            terms(vget_high_s16(cb), vget_high_s16(cr))]
+    };
+    let convert = |luma, chroma: &[(int32x4_t, int32x4_t, int32x4_t); 2]| {
+        let luma = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(luma)), vdupq_n_s16(16));
+        let four = |luma, terms: &(int32x4_t, int32x4_t, int32x4_t)| {
+            let base = vmlal_n_s16(vdupq_n_s32(128), luma, 298);
+            let rounded = |value| vqmovun_s32(vshrq_n_s32::<8>(vaddq_s32(base, value)));
+            (rounded(terms.0), rounded(terms.1), rounded(terms.2))
+        };
+        let lo = four(vget_low_s16(luma), &chroma[0]);
+        let hi = four(vget_high_s16(luma), &chroma[1]);
+        uint8x8x4_t(vqmovn_u16(vcombine_u16(lo.0, hi.0)),
+            vqmovn_u16(vcombine_u16(lo.1, hi.1)),
+            vqmovn_u16(vcombine_u16(lo.2, hi.2)), vdup_n_u8(255))
+    };
+    let processed = first.len() / 16 * 16;
+    for x in (0..processed).step_by(16) {
+        let a = unsafe { vld1q_u8(first[x..x + 16].as_ptr()) };
+        let b = unsafe { vld1q_u8(second[x..x + 16].as_ptr()) };
+        let u = unsafe { vld1_u8(cb[x / 2..x / 2 + 8].as_ptr()) };
+        let v = unsafe { vld1_u8(cr[x / 2..x / 2 + 8].as_ptr()) };
+        // Each chroma sample serves a 2x2 luma block; retain its wide products
+        // for both output rows without changing BT.601 rounding or saturation.
+        let lo = chroma(vzip1_u8(u, u), vzip1_u8(v, v));
+        unsafe {
+            vst4_u8(first_target[x * 4..x * 4 + 32].as_mut_ptr(), convert(vget_low_u8(a), &lo));
+            vst4_u8(second_target[x * 4..x * 4 + 32].as_mut_ptr(), convert(vget_low_u8(b), &lo));
+        }
+        let hi = chroma(vzip2_u8(u, u), vzip2_u8(v, v));
+        unsafe {
+            vst4_u8(first_target[x * 4 + 32..x * 4 + 64].as_mut_ptr(), convert(vget_high_u8(a), &hi));
+            vst4_u8(second_target[x * 4 + 32..x * 4 + 64].as_mut_ptr(), convert(vget_high_u8(b), &hi));
+        }
+    }
+    processed
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -237,6 +316,7 @@ mod tests {
             (32, 7), (33, 17), (192, 108)] {
             let frame = patterned_frame(width, height);
             assert_eq!(frame.rgba(), scalar_rgba(&frame));
+            assert_eq!(frame.rgba_row_pairs::<false>(), scalar_rgba(&frame));
         }
     }
 
@@ -249,6 +329,15 @@ mod tests {
             let v: [u8; 8] = std::array::from_fn(|lane| (value as u8).wrapping_add(lane as u8 * 31));
             let mut actual = [91u8; 72];
             unsafe { assert_eq!(rgba_row_neon(&luma, &u, &v, &mut actual[4..68]), 16); }
+            let second = luma.map(|sample| sample.wrapping_add(113));
+            let mut paired = [91u8; 72];
+            let mut next = [91u8; 72];
+            unsafe { assert_eq!(rgba_two_rows_neon(&luma, &second, &u, &v,
+                &mut paired[4..68], &mut next[4..68]), 16); }
+            assert_eq!(paired, actual);
+            let mut expected_next = [91u8; 72];
+            rgba_two_rows_scalar(&second, &[], &u, &v, &mut expected_next[4..68], &mut [], 0);
+            assert_eq!(next, expected_next);
             assert!(actual[..4].iter().chain(&actual[68..]).all(|&sample| sample == 91));
             for lane in 0..16 {
                 let y = 298 * (i32::from(luma[lane]) - 16);
@@ -266,14 +355,40 @@ mod tests {
     #[test]
     #[ignore = "manual release-mode pixel conversion benchmark"]
     fn benchmark_paired_rgba_conversion() {
+        fn single_rows<const VECTOR: bool>(frame: &YuvKeyFrame) -> Vec<u8> {
+            let mut rgba = vec![0; frame.width * frame.height * 4];
+            for (y, target) in rgba.chunks_mut(frame.width * 4).enumerate() {
+                let luma = &frame.y.pixels[y * frame.y.width..][..frame.width];
+                let u = &frame.u.pixels[(y / 2) * frame.u.width..][..frame.width.div_ceil(2)];
+                let v = &frame.v.pixels[(y / 2) * frame.v.width..][..frame.width.div_ceil(2)];
+                #[cfg(target_arch = "aarch64")]
+                let processed = if VECTOR { unsafe { rgba_row_neon(luma, u, v, target) } } else { 0 };
+                #[cfg(not(target_arch = "aarch64"))]
+                let processed = 0;
+                rgba_two_rows_scalar(luma, &[], u, v, target, &mut [], processed);
+            }
+            rgba
+        }
+        fn measure(frame: &YuvKeyFrame, convert: fn(&YuvKeyFrame) -> Vec<u8>) -> std::time::Duration {
+            let start = std::time::Instant::now();
+            for _ in 0..30 { std::hint::black_box(convert(std::hint::black_box(frame))); }
+            start.elapsed()
+        }
         let frame = patterned_frame(1920, 1080);
-        for _ in 0..3 {
-            let start = std::time::Instant::now();
-            for _ in 0..30 { std::hint::black_box(scalar_rgba(std::hint::black_box(&frame))); }
-            let scalar = start.elapsed();
-            let start = std::time::Instant::now();
-            for _ in 0..30 { std::hint::black_box(std::hint::black_box(&frame).rgba()); }
-            eprintln!("VP8/VP9 RGBA: scalar={scalar:?} paired={:?}", start.elapsed());
+        for (label, single, paired) in [
+            ("scalar", single_rows::<false> as fn(&YuvKeyFrame) -> Vec<u8>, YuvKeyFrame::rgba_row_pairs::<false> as fn(&YuvKeyFrame) -> Vec<u8>),
+            ("vector", single_rows::<true> as fn(&YuvKeyFrame) -> Vec<u8>, YuvKeyFrame::rgba_row_pairs::<true> as fn(&YuvKeyFrame) -> Vec<u8>),
+        ] {
+            assert_eq!(single(&frame), paired(&frame));
+            for trial in 0..4 {
+                let (old, new) = if trial % 2 == 0 {
+                    (measure(&frame, single), measure(&frame, paired))
+                } else {
+                    let new = measure(&frame, paired);
+                    (measure(&frame, single), new)
+                };
+                eprintln!("VP8/VP9 RGBA {label}: single={old:?} paired={new:?}");
+            }
         }
     }
 }

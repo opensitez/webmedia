@@ -2,7 +2,7 @@
 
 use super::vp8_inter::MotionVector;
 use super::vp8_predict::Plane;
-use super::subpel::convolve_row;
+use super::subpel::{convolve_prepared_row, ConvolutionFilter};
 #[cfg(test)]
 use super::subpel::convolve_row_scalar;
 
@@ -27,30 +27,13 @@ const SIX_TAP: [[i32; 6]; 8] = [
     [0, -1, 12, 123, -6, 0],
 ];
 
-struct ActiveFilter {
-    taps: [(usize, i32); 6],
-    count: usize,
-    first_tap: usize,
-    last_tap: usize,
-}
+type ActiveFilter = ConvolutionFilter<6>;
 
 const fn active_filters(filters: &[[i32; 6]; 8]) -> [ActiveFilter; 8] {
-    let mut result = [const { ActiveFilter {
-        taps: [(0, 0); 6], count: 0, first_tap: 0, last_tap: 0,
-    } }; 8];
+    let mut result = [ActiveFilter::new([0; 6]); 8];
     let mut phase = 0;
     while phase < 8 {
-        let mut tap = 0;
-        while tap < 6 {
-            if filters[phase][tap] != 0 {
-                let count = result[phase].count;
-                if count == 0 { result[phase].first_tap = tap; }
-                result[phase].last_tap = tap;
-                result[phase].taps[count] = (tap, filters[phase][tap]);
-                result[phase].count += 1;
-            }
-            tap += 1;
-        }
+        result[phase] = ActiveFilter::new(filters[phase]);
         phase += 1;
     }
     result
@@ -99,7 +82,6 @@ pub(super) fn predict_block(
     let hfilter = &filters[hfrac];
     let vfilter = &filters[vfrac];
     let active_h = &hfilter.taps[..hfilter.count];
-    let active_v = &vfilter.taps[..vfilter.count];
     debug_assert!(width <= 16 && height <= 16);
     if hfrac == 0 && vfrac != 0 && origin_x >= 0 && origin_y >= 2
         && origin_x as usize + width <= visible_width
@@ -108,7 +90,7 @@ pub(super) fn predict_block(
         for row in 0..height {
             let source_start = (origin_y as usize + row - 2) * reference.width + origin_x as usize;
             let destination_start = (y + row) * destination.width + x;
-            convolve_row(&reference.pixels, source_start, reference.width, active_v,
+            convolve_prepared_row(&reference.pixels, source_start, reference.width, vfilter,
                 &mut destination.pixels[destination_start..destination_start + width]);
         }
         return;
@@ -141,7 +123,7 @@ pub(super) fn predict_block(
             if hfrac == 0 {
                 target.copy_from_slice(&source[origin_x as usize..origin_x as usize + width]);
             } else {
-                convolve_row(source, origin_x as usize - 2, 1, active_h, target);
+                convolve_prepared_row(source, origin_x as usize - 2, 1, hfilter, target);
             }
         } else {
             for (col, sample) in target.iter_mut().enumerate() {
@@ -159,7 +141,7 @@ pub(super) fn predict_block(
     }
     for row in 0..height {
         let target_start = (y + row) * destination.width + x;
-        convolve_row(&intermediate, row * width, width, active_v,
+        convolve_prepared_row(&intermediate, row * width, width, vfilter,
             &mut destination.pixels[target_start..target_start + width]);
     }
 }
@@ -273,7 +255,7 @@ mod tests {
                             let mut expected = vec![0; width];
                             let mut actual = vec![19; width + 8];
                             convolve_row_scalar(&source, origin, stride, &taps, &mut expected);
-                            convolve_row(&source, origin, stride, &taps, &mut actual[4..4 + width]);
+                            convolve_prepared_row(&source, origin, stride, &ActiveFilter::new(*filter), &mut actual[4..4 + width]);
                             assert_eq!(&actual[4..4 + width], expected);
                             assert!(actual[..4].iter().chain(&actual[4 + width..]).all(|&pixel| pixel == 19));
                         }

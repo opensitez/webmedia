@@ -1211,6 +1211,12 @@ mod tests {
             calls += 1;
             max_batch = max_batch.max(batch.len());
             max_call = max_call.max(elapsed);
+            if std::env::var_os("WEBMEDIA_WEBM_TRACE_DELIVERY").is_some() {
+                for frame in &batch {
+                    eprintln!("delivery frame={} timestamp={:.3} decode_us={}",
+                        frames, frame.timestamp, elapsed.as_micros());
+                }
+            }
             if frames == 0 && !batch.is_empty() {
                 eprintln!("first delivery {:?}: {} frames", started.elapsed(), batch.len());
             }
@@ -1225,13 +1231,26 @@ mod tests {
         let Ok(path) = std::env::var("WEBMEDIA_WEBM_SAMPLE") else { return };
         let bytes = std::fs::read(path).unwrap();
         let mut decoder = WebmVp8Decoder::new();
+        let mut stream = WebmVp8Stream::new();
+        let mut expected = 0usize;
         let mut count = 0usize;
+        let mut last_timestamp = None;
         let start = std::time::Instant::now();
         for chunk in bytes.chunks(16384) {
-            count += decoder.push(chunk).unwrap().len();
+            for packet in stream.push(chunk).unwrap() {
+                expected += usize::from(FrameHeader::parse(&packet.data).unwrap().show_frame);
+            }
+            for frame in decoder.push(chunk).unwrap() {
+                assert!(last_timestamp.is_none_or(|previous| frame.timestamp >= previous));
+                assert_eq!(frame.rgba.len(), frame.width as usize * frame.height as usize * 4);
+                last_timestamp = Some(frame.timestamp);
+                count += 1;
+            }
         }
+        stream.finish().unwrap();
         decoder.finish().unwrap();
         assert!(count > 1);
+        assert_eq!(count, expected, "every visible VP8 packet must produce a frame");
         if std::env::var_os("WEBMEDIA_VP8_REPORT").is_some() {
             eprintln!("streamed {count} VP8 frames in {:.3}s", start.elapsed().as_secs_f64());
         }

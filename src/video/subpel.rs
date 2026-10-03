@@ -1,7 +1,56 @@
 //! Seven-bit fixed-point row convolution shared by VP8 and VP9.
 
+#[derive(Clone, Copy)]
+pub(super) struct ConvolutionFilter<const N: usize> {
+    pub(super) taps: [(usize, i32); N],
+    pub(super) count: usize,
+    pub(super) first_tap: usize,
+    pub(super) last_tap: usize,
+    narrow: bool,
+}
+
+impl<const N: usize> ConvolutionFilter<N> {
+    pub(super) const fn new(coefficients: [i32; N]) -> Self {
+        let mut filter = Self { taps: [(0, 0); N], count: 0, first_tap: 0, last_tap: 0, narrow: false };
+        let mut sum = 0i64;
+        let mut magnitude = 0i64;
+        let mut tap = 0;
+        while tap < N {
+            let coefficient = coefficients[tap];
+            sum += coefficient as i64;
+            magnitude += (coefficient as i64).abs();
+            if coefficient != 0 {
+                if filter.count == 0 { filter.first_tap = tap; }
+                filter.last_tap = tap;
+                filter.taps[filter.count] = (tap, coefficient);
+                filter.count += 1;
+            }
+            tap += 1;
+        }
+        filter.narrow = sum == 128 && magnitude <= 256;
+        filter
+    }
+}
+
+#[inline]
+pub(super) fn convolve_prepared_row<const N: usize>(source: &[u8], origin: usize, stride: usize,
+    filter: &ConvolutionFilter<N>, output: &mut [u8])
+{
+    let taps = &filter.taps[..filter.count];
+    convolve_row_with_bound(source, origin, stride, taps, output, filter.narrow);
+}
+
+#[cfg(test)]
+#[inline(always)]
 pub(super) fn convolve_row(source: &[u8], origin: usize, stride: usize,
     taps: &[(usize, i32)], output: &mut [u8])
+{
+    convolve_row_with_bound(source, origin, stride, taps, output, false);
+}
+
+#[inline(always)]
+fn convolve_row_with_bound(source: &[u8], origin: usize, stride: usize,
+    taps: &[(usize, i32)], output: &mut [u8], _narrow: bool)
 {
     if let [(tap, 128)] = taps {
         let start = origin + tap * stride;
@@ -10,7 +59,11 @@ pub(super) fn convolve_row(source: &[u8], origin: usize, stride: usize,
     }
     #[cfg(target_arch = "aarch64")]
     if output.len() == 4 {
-        unsafe { convolve_four_neon(source, origin, stride, taps, output); }
+        if _narrow {
+            unsafe { convolve_four_centered_neon(source, origin, stride, taps, output); }
+        } else {
+            unsafe { convolve_four_neon(source, origin, stride, taps, output); }
+        }
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -20,6 +73,26 @@ pub(super) fn convolve_row(source: &[u8], origin: usize, stride: usize,
         return;
     }
     convolve_row_scalar(source, origin, stride, taps, output);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn convolve_four_centered_neon(source: &[u8], origin: usize, stride: usize,
+    taps: &[(usize, i32)], output: &mut [u8])
+{
+    use std::arch::aarch64::*;
+    // Centering samples bounds every partial sum by 128 * sum(abs(taps)).
+    // A unity-gain filter restores exactly 128 after the seven-bit rounding.
+    let mut sum = vdupq_n_s16(0);
+    for &(tap, coefficient) in taps {
+        let start = origin + tap * stride;
+        let packed = u32::from_le_bytes(source[start..start + 4].try_into().unwrap());
+        let centered = vreinterpret_s8_u8(veor_u8(vcreate_u8(u64::from(packed)), vdup_n_u8(128)));
+        sum = vmlaq_n_s16(sum, vmovl_s8(centered), coefficient as i16);
+    }
+    let result = vqmovun_s16(vaddq_s16(vrshrq_n_s16::<7>(sum), vdupq_n_s16(128)));
+    let packed = vget_lane_u32::<0>(vreinterpret_u32_u8(result));
+    output.copy_from_slice(&packed.to_le_bytes());
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -102,5 +175,61 @@ unsafe fn convolve_row_neon(source: &[u8], origin: usize, stride: usize,
         let result = vqmovun_s16(rounded);
         let destination = &mut output[column..column + 8];
         unsafe { vst1_u8(destination.as_mut_ptr(), result); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centered_rows_match_wide_arithmetic_and_preserve_bounds() {
+        for taps in [vec![(0, 128)], vec![(0, 77), (1, -16), (2, 77), (3, -10)],
+            vec![(0, 192), (1, -64)], vec![(0, 193), (1, -65)],
+            vec![(0, 63), (1, 64)]] {
+            for width in [4, 8, 16, 24, 32, 64] {
+                for stride in [1, 73] {
+                    for seed in 0..256usize {
+                        let length: usize = 1 + taps.last().unwrap().0 * stride + width;
+                        let source: Vec<_> = (0..length).map(|index|
+                            (index.wrapping_mul(73).wrapping_add(seed)) as u8).collect();
+                        let mut expected = vec![91; width + 8];
+                        let mut actual = expected.clone();
+                        convolve_row_scalar(&source, 1, stride, &taps, &mut expected[4..4 + width]);
+                        let mut coefficients = [0; 4];
+                        for &(tap, coefficient) in &taps { coefficients[tap] = coefficient; }
+                        convolve_prepared_row(&source, 1, stride, &ConvolutionFilter::new(coefficients), &mut actual[4..4 + width]);
+                        assert_eq!(actual, expected, "width={width} stride={stride} seed={seed} taps={taps:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual paired row convolution timing"]
+    fn benchmark_centered_rows() {
+        let source: Vec<_> = (0..600usize).map(|index| index.wrapping_mul(73) as u8).collect();
+        let filter = ConvolutionFilter::new([3, -16, 77, 77, -16, 3]);
+        for width in [4, 8, 16, 32, 64] {
+            let mut output = [0; 64];
+            let mut measure = |narrow| {
+                let start = std::time::Instant::now();
+                for _ in 0..2_000_000 {
+                    let source = std::hint::black_box(source.as_slice());
+                    let filter = std::hint::black_box(&filter);
+                    let taps = &filter.taps[..filter.count];
+                    let output = std::hint::black_box(&mut output[..width]);
+                    if narrow { convolve_prepared_row(source, 1, 73, filter, output); }
+                    else { convolve_row(source, 1, 73, taps, output); }
+                }
+                start.elapsed()
+            };
+            for trial in 0..4 {
+                let (old, new) = if trial % 2 == 0 { (measure(false), measure(true)) }
+                    else { let new = measure(true); (measure(false), new) };
+                eprintln!("convolution width={width}: wide={old:?} centered={new:?}");
+            }
+        }
     }
 }

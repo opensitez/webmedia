@@ -924,8 +924,12 @@ dependencies = [
 ]
 
 [[patch.unused]]
+name = "webcanvas"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "webcore"
-version = "0.3.4"
+version = "0.4.0"
 
 [[patch.unused]]
 name = "widgets"

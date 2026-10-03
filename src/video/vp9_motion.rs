@@ -5,7 +5,7 @@ use super::vp8::BoolDecoder;
 use super::vp8_predict::Plane;
 use super::vp9_inter_probs::InterframeProbabilities;
 use super::vp9_adapt::NonCoefficientCounts;
-use super::subpel::convolve_row;
+use super::subpel::{convolve_prepared_row, ConvolutionFilter};
 
 const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 const MV_CLASS_TREE: [i8; 20] = [
@@ -89,34 +89,21 @@ const SUBPEL_FILTERS: [[[i16; 8]; 16]; 4] = [
     ],
 ];
 
-#[derive(Clone, Copy)]
-struct ActiveFilter {
-    taps: [(usize, i32); 8],
-    count: usize,
-    first_tap: usize,
-    last_tap: usize,
-}
+type ActiveFilter = ConvolutionFilter<8>;
 
 const ACTIVE_FILTERS: [[ActiveFilter; 16]; 4] = {
-    let mut filters = [[ActiveFilter {
-        taps: [(0, 0); 8], count: 0, first_tap: 0, last_tap: 0,
-    }; 16]; 4];
+    let mut filters = [[ActiveFilter::new([0; 8]); 16]; 4];
     let mut kind = 0;
     while kind < 4 {
         let mut phase = 0;
         while phase < 16 {
             let mut tap = 0;
+            let mut coefficients = [0; 8];
             while tap < 8 {
-                let coefficient = SUBPEL_FILTERS[kind][phase][tap];
-                if coefficient != 0 {
-                    let count = filters[kind][phase].count;
-                    if count == 0 { filters[kind][phase].first_tap = tap; }
-                    filters[kind][phase].last_tap = tap;
-                    filters[kind][phase].taps[count] = (tap, coefficient as i32);
-                    filters[kind][phase].count += 1;
-                }
+                coefficients[tap] = SUBPEL_FILTERS[kind][phase][tap] as i32;
                 tap += 1;
             }
+            filters[kind][phase] = ActiveFilter::new(coefficients);
             phase += 1;
         }
         kind += 1;
@@ -355,8 +342,8 @@ pub(super) fn predict_block(
                     (source_y as usize + row - 3) * reference.width + source_x as usize
                 };
                 let to = (y + row) * destination.width + x;
-                convolve_row(&reference.pixels, from, if horizontal { 1 } else { reference.width },
-                    &active.taps[..active.count], &mut destination.pixels[to..to + width]);
+                convolve_prepared_row(&reference.pixels, from, if horizontal { 1 } else { reference.width },
+                    active, &mut destination.pixels[to..to + width]);
             }
             return Ok(());
         }
@@ -403,8 +390,7 @@ pub(super) fn predict_block(
                 target.copy_from_slice(&source[source_x as usize..source_x as usize + width]);
             } else {
                 let active = &ACTIVE_FILTERS[filter as usize][phase];
-                convolve_row(source, source_x as usize - 3, 1,
-                    &active.taps[..active.count], target);
+                convolve_prepared_row(source, source_x as usize - 3, 1, active, target);
             }
             continue;
         }
@@ -433,8 +419,8 @@ pub(super) fn predict_block(
         }
         let active = &ACTIVE_FILTERS[filter as usize][phase];
         let to = (y + row) * destination.width + x;
-        convolve_row(intermediate, base * width, width,
-            &active.taps[..active.count], &mut destination.pixels[to..to + width]);
+        convolve_prepared_row(intermediate, base * width, width,
+            active, &mut destination.pixels[to..to + width]);
     }
     Ok(())
 }
@@ -510,7 +496,7 @@ mod tests {
                             super::super::subpel::convolve_row_scalar(&source, 1, stride, &all, &mut expected);
                             let mut actual = vec![91u8; width + 8];
                             let required = 1 + active.taps[active.count - 1].0 * stride + width;
-                            convolve_row(&source[..required], 1, stride, &active.taps[..active.count],
+                            convolve_prepared_row(&source[..required], 1, stride, active,
                                 &mut actual[4..4 + width]);
                             assert_eq!(&actual[4..4 + width], expected,
                                 "width={width} stride={stride} kind={kind} phase={phase} pattern={pattern}");
@@ -539,7 +525,7 @@ mod tests {
                         let active = &ACTIVE_FILTERS[iteration % 4][iteration % 16];
                         let taps = black_box(&active.taps[..active.count]);
                         if accelerated {
-                            convolve_row(black_box(&source), 1, 73, taps, black_box(&mut output[..width]));
+                            convolve_prepared_row(black_box(&source), 1, 73, black_box(active), black_box(&mut output[..width]));
                         } else {
                             super::super::subpel::convolve_row_scalar(
                                 black_box(&source), 1, 73, taps, black_box(&mut output[..width]));
