@@ -72,6 +72,12 @@ pub struct WebmVp8Decoder {
 pub struct WebmVideoDecoder {
     stream: WebmVideoStream,
     codec: Option<CodecDecoder>,
+    pending: std::collections::VecDeque<PendingPacket>,
+}
+
+struct PendingPacket {
+    packet: VideoPacket,
+    next_frame: usize,
 }
 
 enum CodecDecoder {
@@ -110,15 +116,19 @@ impl Default for WebmVideoDecoder {
 
 impl WebmVideoDecoder {
     pub fn new() -> Self {
-        Self { stream: WebmVideoStream::new(), codec: None }
+        Self { stream: WebmVideoStream::new(), codec: None, pending: Default::default() }
     }
 }
 
 impl StreamingVideoDecoder for WebmVideoDecoder {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<VideoFrame>, MediaDecodeError> {
-        let packets = self.stream.push(bytes)?;
+        self.pending.extend(self.stream.push(bytes)?.into_iter()
+            .map(|packet| PendingPacket { packet, next_frame: 0 }));
         let mut frames = Vec::new();
-        for packet in packets {
+        // Publish after one coded frame, including hidden reference updates. The
+        // streaming caller drains buffered samples before reading more input.
+        if let Some(pending) = self.pending.front_mut() {
+            let packet = &pending.packet;
             if self.codec.is_none() {
                 self.codec = Some(match self.stream.video_codec().ok_or(MediaDecodeError::Unsupported)? {
                     WebmVideoCodec::Vp8 => CodecDecoder::Vp8(Vp8Decoder::new()),
@@ -138,18 +148,20 @@ impl StreamingVideoDecoder for WebmVideoDecoder {
                             timestamp: packet.timestamp,
                         });
                     }
+                    self.pending.pop_front();
                 }
                 CodecDecoder::Vp9(decoder) => {
-                    for data in split_superframe(&packet.data)? {
-                        if let Some(decoded) = decoder.decode(data)? {
-                            frames.push(VideoFrame {
-                                width: decoded.width as u32,
-                                height: decoded.height as u32,
-                                rgba: std::sync::Arc::new(decoded.rgba()),
-                                timestamp: packet.timestamp,
-                            });
-                        }
+                    let coded = split_superframe(&packet.data)?;
+                    if let Some(decoded) = decoder.decode(coded[pending.next_frame])? {
+                        frames.push(VideoFrame {
+                            width: decoded.width as u32,
+                            height: decoded.height as u32,
+                            rgba: std::sync::Arc::new(decoded.rgba()),
+                            timestamp: packet.timestamp,
+                        });
                     }
+                    pending.next_frame += 1;
+                    if pending.next_frame == coded.len() { self.pending.pop_front(); }
                 }
             }
         }
@@ -161,7 +173,13 @@ impl StreamingVideoDecoder for WebmVideoDecoder {
     }
 
     fn finish(&self) -> Result<(), MediaDecodeError> {
-        self.stream.finish()
+        self.stream.finish()?;
+        if self.pending.is_empty() { Ok(()) }
+        else { Err(MediaDecodeError::InvalidData("undrained WebM video frames".into())) }
+    }
+
+    fn has_buffered_samples(&self) -> bool {
+        !self.pending.is_empty()
     }
 }
 
@@ -548,6 +566,91 @@ fn element_size(bytes: &[u8]) -> Result<Option<(Option<u64>, usize)>, MediaDecod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_vp9_delivery_preserves_superframes_and_reference_order() {
+        for bytes in [include_bytes!("../../tests/fixtures/vp9-altref.webm").as_slice(),
+            include_bytes!("../../tests/fixtures/vp9-serial-motion.webm").as_slice(),
+            include_bytes!("../../tests/fixtures/vp9-lossless.webm").as_slice()]
+        {
+            let mut stream = WebmVideoStream::for_codec(WebmVideoCodec::Vp9);
+            let mut direct = Vp9Decoder::new();
+            let mut expected = Vec::new();
+            for packet in stream.push(bytes).unwrap() {
+                for data in split_superframe(&packet.data).unwrap() {
+                    if let Some(decoded) = direct.decode(data).unwrap() {
+                        expected.push(VideoFrame {
+                            width: decoded.width as u32, height: decoded.height as u32,
+                            rgba: std::sync::Arc::new(decoded.rgba()), timestamp: packet.timestamp,
+                        });
+                    }
+                }
+            }
+            assert!(!expected.is_empty());
+            for chunk_size in [1, 257, 16384, bytes.len()] {
+                let mut decoder = WebmVideoDecoder::new();
+                let mut actual = Vec::new();
+                for chunk in bytes.chunks(chunk_size) {
+                    let batch = decoder.push(chunk).unwrap();
+                    assert!(batch.len() <= 1);
+                    actual.extend(batch);
+                    while decoder.has_buffered_samples() {
+                        assert!(decoder.finish().is_err());
+                        let batch = decoder.push(&[]).unwrap();
+                        assert!(batch.len() <= 1);
+                        actual.extend(batch);
+                    }
+                }
+                decoder.finish().unwrap();
+                assert!(decoder.push(&[]).unwrap().is_empty());
+                assert_eq!(actual, expected, "chunk_size={chunk_size}");
+            }
+        }
+    }
+
+    #[test]
+    fn vp8_hidden_reference_stream_is_independent_of_input_chunk_boundaries() {
+        let bytes = include_bytes!("../../tests/fixtures/vp8-altref.webm");
+        let mut complete = WebmVp8Decoder::new();
+        let expected = complete.push(bytes).unwrap();
+        complete.finish().unwrap();
+        assert_eq!(expected.len(), 120);
+        let metadata = complete.metadata().unwrap();
+        let mut stream = WebmVp8Stream::new();
+        let timestamps: Vec<_> = stream.push(bytes).unwrap().into_iter()
+            .filter(|packet| FrameHeader::parse(&packet.data).unwrap().show_frame)
+            .map(|packet| packet.timestamp).collect();
+        assert_eq!(expected.iter().map(|frame| frame.timestamp).collect::<Vec<_>>(), timestamps);
+        for specialized in [false, true] {
+            for chunk_size in [1, 17, 257, 4096] {
+                let mut decoder: Box<dyn StreamingVideoDecoder> = if specialized {
+                    Box::new(WebmVp8Decoder::new())
+                } else {
+                    Box::new(WebmVideoDecoder::new())
+                };
+                assert!(decoder.metadata().is_none());
+                let mut actual = Vec::new();
+                let mut emitted_before_end = false;
+                for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+                    let frames = decoder.push(chunk).unwrap();
+                    if !frames.is_empty() && (index + 1) * chunk_size < bytes.len() {
+                        emitted_before_end = true;
+                    }
+                    actual.extend(frames);
+                    while decoder.has_buffered_samples() {
+                        let frames = decoder.push(&[]).unwrap();
+                        assert!(frames.len() <= 1);
+                        actual.extend(frames);
+                    }
+                }
+                assert!(emitted_before_end);
+                assert!(decoder.push(&[]).unwrap().is_empty());
+                decoder.finish().unwrap();
+                assert_eq!(decoder.metadata(), Some(metadata.clone()));
+                assert_eq!(actual, expected, "specialized={specialized}, chunk_size={chunk_size}");
+            }
+        }
+    }
 
     #[test]
     fn reconstructs_first_vp9_transform_against_reference() {
@@ -1071,6 +1174,9 @@ mod tests {
                 let count = std::io::Read::read(&mut source, &mut buffer).unwrap();
                 assert!(count != 0, "{variable} ended before three frames");
                 frames.extend(decoder.push(&buffer[..count]).unwrap());
+                while decoder.has_buffered_samples() {
+                    frames.extend(decoder.push(&[]).unwrap());
+                }
             }
             assert!(frames.len() >= 3);
             assert!(frames.windows(2).all(|pair| pair[0].timestamp <= pair[1].timestamp));
@@ -1078,6 +1184,40 @@ mod tests {
                 == frame.width as usize * frame.height as usize * 4));
             assert_eq!(decoder.metadata().unwrap().width, Some(frames[0].width));
         }
+    }
+
+    #[test]
+    #[ignore = "manual streamed frame-delivery timing"]
+    fn benchmark_streaming_delivery() {
+        use std::time::Instant;
+        let path = std::env::var("WEBMEDIA_VP9_SAMPLE")
+            .or_else(|_| std::env::var("WEBMEDIA_WEBM_SAMPLE")).unwrap();
+        let mut source = std::fs::File::open(path).unwrap();
+        let mut decoder = WebmVideoDecoder::new();
+        let mut buffer = [0u8; 16 * 1024];
+        let started = Instant::now();
+        let mut frames = 0usize;
+        let mut calls = 0usize;
+        let mut max_batch = 0usize;
+        let mut max_call = std::time::Duration::ZERO;
+        while frames < 120 {
+            let count = if decoder.has_buffered_samples() { 0 } else {
+                std::io::Read::read(&mut source, &mut buffer).unwrap()
+            };
+            assert!(count != 0 || decoder.has_buffered_samples(), "clip ended before 120 frames");
+            let before = Instant::now();
+            let batch = decoder.push(&buffer[..count]).unwrap();
+            let elapsed = before.elapsed();
+            calls += 1;
+            max_batch = max_batch.max(batch.len());
+            max_call = max_call.max(elapsed);
+            if frames == 0 && !batch.is_empty() {
+                eprintln!("first delivery {:?}: {} frames", started.elapsed(), batch.len());
+            }
+            frames += batch.len();
+        }
+        eprintln!("streamed frames={frames} calls={calls} max_batch={max_batch} max_call={max_call:?} total={:?}",
+            started.elapsed());
     }
 
     #[test]

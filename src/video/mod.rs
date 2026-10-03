@@ -20,6 +20,7 @@ mod vp8_decoder;
 mod vp8_filter;
 mod vp8_inter;
 mod vp8_motion;
+mod subpel;
 mod vp8_keyframe;
 mod vp8_predict;
 mod vp8_probs;

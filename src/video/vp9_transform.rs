@@ -12,14 +12,23 @@ const COS64_LOOKUP: [i32; 33] = [
     6270, 5520, 4756, 3981, 3196, 2404, 1606, 804, 0,
 ];
 
-fn cos64(angle: i32) -> i32 {
-    let angle = angle.rem_euclid(128) as usize;
-    match angle {
-        0..=32 => COS64_LOOKUP[angle],
-        33..=64 => -COS64_LOOKUP[64 - angle],
-        65..=96 => -COS64_LOOKUP[angle - 64],
-        _ => COS64_LOOKUP[128 - angle],
+const COS64_PERIODIC: [i32; 128] = {
+    let mut values = [0; 128];
+    let mut angle = 0;
+    while angle < values.len() {
+        values[angle] = match angle {
+            0..=32 => COS64_LOOKUP[angle],
+            33..=64 => -COS64_LOOKUP[64 - angle],
+            65..=96 => -COS64_LOOKUP[angle - 64],
+            _ => COS64_LOOKUP[128 - angle],
+        };
+        angle += 1;
     }
+    values
+};
+
+fn cos64(angle: i32) -> i32 {
+    COS64_PERIODIC[(angle & 127) as usize]
 }
 
 fn round2(value: i64, shift: u32) -> i32 {
@@ -105,6 +114,14 @@ fn idct_stage(values: &mut [i32], n: u32) {
 }
 
 fn idct(values: &mut [i32], n: u32) {
+    if values[1..].iter().all(|&value| value == 0) {
+        values.fill(round2(i64::from(values[0]) * i64::from(cos64(16)), 14));
+        return;
+    }
+    idct_full(values, n);
+}
+
+fn idct_full(values: &mut [i32], n: u32) {
     let mut source = [0i32; 32];
     source[..values.len()].copy_from_slice(values);
     for (index, value) in values.iter_mut().enumerate() {
@@ -368,22 +385,78 @@ pub(super) fn reconstruct_intra(
     vp9_predict::predict(plane, x, y, size, mode, have_left, have_above, not_on_right,
         visible_width, visible_height)?;
     if coefficients.iter().all(|&value| value == 0) { return Ok(()); }
+    let transform_type = tx_type(mode, chroma, size);
+    if !lossless && transform_type == 0 && coefficients[1..].iter().all(|&value| value == 0) {
+        let dc = i32::from(DC_QLOOKUP[0][dc_index.clamp(0, 255) as usize]);
+        let value = dc_residual(coefficients[0] * dc / if size == 32 { 2 } else { 1 }, size);
+        add_constant_residual(plane, x, y, size, value);
+        return Ok(());
+    }
     let mut storage = [0; 1024];
     let residual = &mut storage[..size * size];
     if lossless {
         residual.copy_from_slice(&inverse_lossless(coefficients));
     } else {
         inverse_transform_square(residual, coefficients, size, bit_depth, dc_index, ac_index,
-            tx_type(mode, chroma, size));
+            transform_type);
     }
     for row in 0..size {
-        for column in 0..size {
-            let index = (y + row) * plane.width + x + column;
-            plane.pixels[index] = (i32::from(plane.pixels[index])
-                + residual[row * size + column]).clamp(0, 255) as u8;
+        let start = (y + row) * plane.width + x;
+        for (pixel, &value) in plane.pixels[start..start + size].iter_mut()
+            .zip(&residual[row * size..(row + 1) * size])
+        {
+            *pixel = (i32::from(*pixel) + value).clamp(0, 255) as u8;
         }
     }
     Ok(())
+}
+
+fn add_constant_residual(plane: &mut Plane, x: usize, y: usize, size: usize, value: i32) {
+    if value == 0 { return; }
+    if value >= 255 || value <= -255 {
+        let clipped = if value > 0 { 255 } else { 0 };
+        for row in 0..size {
+            let start = (y + row) * plane.width + x;
+            plane.pixels[start..start + size].fill(clipped);
+        }
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if size >= 8 {
+        // Samples and a bounded constant fit unsigned bytes; saturation is exact clipping.
+        unsafe { add_constant_residual_neon(plane, x, y, size, value); }
+        return;
+    }
+    for row in 0..size {
+        let start = (y + row) * plane.width + x;
+        for pixel in &mut plane.pixels[start..start + size] {
+            *pixel = (i32::from(*pixel) + value).clamp(0, 255) as u8;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn add_constant_residual_neon(plane: &mut Plane, x: usize, y: usize, size: usize, value: i32) {
+    use std::arch::aarch64::*;
+    let delta = vdupq_n_u8(value.unsigned_abs() as u8);
+    for row in 0..size {
+        let start = (y + row) * plane.width + x;
+        let pixels = &mut plane.pixels[start..start + size];
+        if size == 8 {
+            let original = unsafe { vld1_u8(pixels.as_ptr()) };
+            let result = if value > 0 { vqadd_u8(original, vget_low_u8(delta)) }
+                else { vqsub_u8(original, vget_low_u8(delta)) };
+            unsafe { vst1_u8(pixels.as_mut_ptr(), result); }
+        } else {
+            for chunk in pixels.chunks_exact_mut(16) {
+                let original = unsafe { vld1q_u8(chunk.as_ptr()) };
+                let result = if value > 0 { vqaddq_u8(original, delta) }
+                    else { vqsubq_u8(original, delta) };
+                unsafe { vst1q_u8(chunk.as_mut_ptr(), result); }
+            }
+        }
+    }
 }
 
 pub(super) fn add_inter_residual(
@@ -398,14 +471,7 @@ pub(super) fn add_inter_residual(
     if !lossless && coefficients[1..].iter().all(|&value| value == 0) {
         let dc = i32::from(DC_QLOOKUP[0][dc_index.clamp(0, 255) as usize]);
         let value = dc_residual(coefficients[0] * dc / if size == 32 { 2 } else { 1 }, size);
-        if value != 0 {
-            for row in 0..size {
-                let start = (y + row) * plane.width + x;
-                for pixel in &mut plane.pixels[start..start + size] {
-                    *pixel = (i32::from(*pixel) + value).clamp(0, 255) as u8;
-                }
-            }
-        }
+        add_constant_residual(plane, x, y, size, value);
         return Ok(());
     }
     let mut storage = [0; 1024];
@@ -588,6 +654,130 @@ pub(super) fn reconstruct_4x4_intra(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_constant_residual_matches_signed_clipping() {
+        for size in [4, 8, 16, 32] {
+            let mut values: Vec<i32> = (-255..=255).collect();
+            values.extend([i32::MIN, i32::MAX]);
+            for value in values {
+                let mut plane = Plane::new(size + 5, size + 3);
+                for (index, pixel) in plane.pixels.iter_mut().enumerate() {
+                    *pixel = ((index * 37 + 19) & 255) as u8;
+                }
+                let mut expected = plane.pixels.clone();
+                for row in 0..size {
+                    let start = (row + 1) * plane.width + 2;
+                    for pixel in &mut expected[start..start + size] {
+                        *pixel = (i64::from(*pixel) + i64::from(value)).clamp(0, 255) as u8;
+                    }
+                }
+                add_constant_residual(&mut plane, 2, 1, size, value);
+                assert_eq!(plane.pixels, expected, "size={size} value={value}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual constant-residual kernel timing"]
+    fn benchmark_bulk_constant_residual() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut plane = Plane::new(40, 40);
+        plane.pixels.fill(128);
+        for trial in 0..5 {
+            for accelerated in if trial % 2 == 0 { [false, true] } else { [true, false] } {
+                let start = Instant::now();
+                for iteration in 0..20_000 {
+                    let value = black_box(if iteration % 2 == 0 { 1 } else { -1 });
+                    let plane = black_box(&mut plane);
+                    if accelerated {
+                        add_constant_residual(plane, 2, 1, 32, value);
+                    } else {
+                        for row in 0..32 {
+                            let start = (row + 1) * plane.width + 2;
+                            for pixel in &mut plane.pixels[start..start + 32] {
+                                *pixel = (i32::from(*pixel) + value).clamp(0, 255) as u8;
+                            }
+                        }
+                    }
+                }
+                eprintln!("VP9 residual trial={trial} accelerated={accelerated} elapsed={:?}", start.elapsed());
+            }
+        }
+    }
+
+    #[test]
+    fn one_dimensional_dc_shortcut_matches_every_transform_size() {
+        for n in 2..=5 {
+            let size = 1usize << n;
+            for dc in -32768..=32767 {
+                let mut expected = [0; 32];
+                expected[0] = dc;
+                let mut actual = expected;
+                idct_full(&mut expected[..size], n);
+                idct(&mut actual[..size], n);
+                assert_eq!(actual, expected, "size={size} dc={dc}");
+            }
+        }
+    }
+
+    #[test]
+    fn intra_residual_paths_match_full_transform() {
+        for size in [4, 8, 16, 32] {
+            for mode in 0..10 {
+                for chroma in [false, true] {
+                    for quantizer in [0, 46, 255] {
+                        for dc in [-1024, -17, 0, 1, 64, 1024] {
+                            for ac in [0, -7, 19] {
+                                let mut coefficients = vec![0; size * size];
+                                coefficients[0] = dc;
+                                coefficients[3] = ac;
+                                let mut plane = Plane::new(size + 8, size + 8);
+                                for (index, pixel) in plane.pixels.iter_mut().enumerate() {
+                                    *pixel = index.wrapping_mul(37) as u8;
+                                }
+                                let mut expected = plane.clone();
+                                vp9_predict::predict(&mut expected, 4, 4, size, mode,
+                                    true, true, false, size + 8, size + 8).unwrap();
+                                let mut residual = vec![0; size * size];
+                                let divisor = if size == 32 { 2 } else { 1 };
+                                residual[0] = dc * i32::from(DC_QLOOKUP[0][quantizer]) / divisor;
+                                residual[3] = ac * i32::from(AC_QLOOKUP[0][quantizer]) / divisor;
+                                inverse_transform_2d(&mut residual, size, tx_type(mode, chroma, size));
+                                for row in 0..size {
+                                    for col in 0..size {
+                                        let index = (row + 4) * expected.width + col + 4;
+                                        expected.pixels[index] = (i32::from(expected.pixels[index])
+                                            + residual[row * size + col]).clamp(0, 255) as u8;
+                                    }
+                                }
+                                reconstruct_intra(&mut plane, 4, 4, size, mode, chroma,
+                                    true, true, false, size + 8, size + 8, &coefficients,
+                                    8, quantizer as i32, quantizer as i32, false).unwrap();
+                                assert_eq!(plane.pixels, expected.pixels,
+                                    "size={size} mode={mode} chroma={chroma} q={quantizer} dc={dc} ac={ac}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn periodic_cosine_table_matches_signed_quadrants() {
+        for angle in -512i32..512 {
+            let reduced = angle.rem_euclid(128) as usize;
+            let expected = match reduced {
+                0..=32 => COS64_LOOKUP[reduced],
+                33..=64 => -COS64_LOOKUP[64 - reduced],
+                65..=96 => -COS64_LOOKUP[reduced - 64],
+                _ => COS64_LOOKUP[128 - reduced],
+            };
+            assert_eq!(cos64(angle), expected);
+        }
+    }
 
     #[test]
     fn direct_dc_addition_matches_full_transform_and_clipping() {

@@ -58,10 +58,6 @@ pub(super) fn predict(
             *sample = plane.pixels[(y + i).min(visible_height - 1) * plane.width + x - 1];
         }
     }
-    let a = |i: isize| above[(i + 1) as usize];
-    let mut out_storage = [0u8; 1024];
-    let out = &mut out_storage[..size * size];
-    let at = |row: usize, col: usize| row * size + col;
     match mode {
         0 => {
             let (sum, count) = match (have_left, have_above) {
@@ -73,18 +69,34 @@ pub(super) fn predict(
                 (false, true) => (above[1..=size].iter().map(|&v| u32::from(v)).sum(), size),
                 (false, false) => (128 * size as u32, size),
             };
-            out.fill(((sum + (count / 2) as u32) / count as u32) as u8);
+            let value = ((sum + (count / 2) as u32) / count as u32) as u8;
+            for row in 0..size {
+                let start = (y + row) * plane.width + x;
+                plane.pixels[start..start + size].fill(value);
+            }
+            return Ok(());
         }
         1 => {
             for row in 0..size {
-                out[row * size..(row + 1) * size].copy_from_slice(&above[1..=size]);
+                let start = (y + row) * plane.width + x;
+                plane.pixels[start..start + size].copy_from_slice(&above[1..=size]);
             }
+            return Ok(());
         }
         2 => {
             for row in 0..size {
-                out[row * size..(row + 1) * size].fill(left[row]);
+                let start = (y + row) * plane.width + x;
+                plane.pixels[start..start + size].fill(left[row]);
             }
+            return Ok(());
         }
+        _ => {}
+    }
+    let a = |i: isize| above[(i + 1) as usize];
+    let mut out_storage = [0u8; 1024];
+    let out = &mut out_storage[..size * size];
+    let at = |row: usize, col: usize| row * size + col;
+    match mode {
         3 => {
             for row in 0..size {
                 for col in 0..size {
@@ -219,6 +231,46 @@ mod tests {
             let mut plane = original.clone();
             predict(&mut plane, 1, 1, 4, mode, true, true, false, 8, 8).unwrap();
             assert_eq!(plane.pixels[9], expected, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn direct_prediction_preserves_edges_and_surrounding_pixels() {
+        for size in [4, 8, 16, 32] {
+            for mode in 0..3 {
+                for have_left in [false, true] {
+                    for have_above in [false, true] {
+                        for cropped in [false, true] {
+                            let mut plane = Plane::new(size + 8, size + 8);
+                            for (index, pixel) in plane.pixels.iter_mut().enumerate() {
+                                *pixel = index.wrapping_mul(37) as u8;
+                            }
+                            let mut expected = plane.pixels.clone();
+                            let visible = if cropped { size } else { size + 8 };
+                            let above: Vec<_> = (0..size).map(|col| if have_above {
+                                expected[3 * plane.width + (4 + col).min(visible - 1)]
+                            } else { 127 }).collect();
+                            let left: Vec<_> = (0..size).map(|row| if have_left {
+                                expected[(4 + row).min(visible - 1) * plane.width + 3]
+                            } else { 129 }).collect();
+                            let count = size * (usize::from(have_left) + usize::from(have_above));
+                            let sum: usize = if have_left { left.iter().map(|&v| usize::from(v)).sum() } else { 0 }
+                                + if have_above { above.iter().map(|&v| usize::from(v)).sum() } else { 0 };
+                            let dc = if count == 0 { 128 } else { ((sum + count / 2) / count) as u8 };
+                            for row in 0..size {
+                                for col in 0..size {
+                                    expected[(4 + row) * plane.width + 4 + col] = match mode {
+                                        0 => dc, 1 => above[col], _ => left[row],
+                                    };
+                                }
+                            }
+                            predict(&mut plane, 4, 4, size, mode, have_left, have_above,
+                                false, visible, visible).unwrap();
+                            assert_eq!(plane.pixels, expected);
+                        }
+                    }
+                }
+            }
         }
     }
 

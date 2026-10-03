@@ -65,15 +65,34 @@ impl Plane {
                 / (2 * size) as u32
         };
         let corner = self.top_left(x, y);
+        match mode {
+            0 => {
+                for row in 0..size {
+                    let start = (y + row) * self.width + x;
+                    self.pixels[start..start + size].fill(dc as u8);
+                }
+                return;
+            }
+            1 => {
+                for row in 0..size {
+                    let start = (y + row) * self.width + x;
+                    self.pixels[start..start + size].copy_from_slice(&above[..size]);
+                }
+                return;
+            }
+            2 => {
+                for row in 0..size {
+                    let start = (y + row) * self.width + x;
+                    self.pixels[start..start + size].fill(left[row]);
+                }
+                return;
+            }
+            3 => {}
+            _ => unreachable!("invalid VP8 large intra mode"),
+        }
         for row in 0..size {
             for col in 0..size {
-                let predicted = match mode {
-                    0 => dc as u8,
-                    1 => above[col],
-                    2 => left[row],
-                    3 => clamp(i32::from(left[row]) + i32::from(above[col]) - i32::from(corner)),
-                    _ => unreachable!("invalid VP8 large intra mode"),
-                };
+                let predicted = clamp(i32::from(left[row]) + i32::from(above[col]) - i32::from(corner));
                 self.pixels[(y + row) * self.width + x + col] = predicted;
             }
         }
@@ -151,10 +170,13 @@ impl Plane {
     }
 
     pub(super) fn add_residual(&mut self, x: usize, y: usize, values: &[i32; 16]) {
+        if values.iter().all(|&value| value == 0) { return; }
         for row in 0..4 {
-            for col in 0..4 {
-                let at = (y + row) * self.width + x + col;
-                self.pixels[at] = clamp(i32::from(self.pixels[at]) + values[row * 4 + col]);
+            let start = (y + row) * self.width + x;
+            for (pixel, &value) in self.pixels[start..start + 4].iter_mut()
+                .zip(&values[row * 4..row * 4 + 4])
+            {
+                *pixel = clamp(i32::from(*pixel).saturating_add(value));
             }
         }
     }
@@ -237,6 +259,59 @@ fn predict_horizontal_up(left: &[u8; 4], row: usize, col: usize) -> u8 {
 mod tests {
     use super::*;
 
+    fn scalar_large_prediction(plane: &mut Plane, x: usize, y: usize, size: usize, mode: u8) {
+        let above: Vec<_> = (0..size).map(|col| plane.top(x + col, y)).collect();
+        let left: Vec<_> = (0..size).map(|row| plane.left(x, y + row)).collect();
+        let (sum, count) = match (x == 0, y == 0) {
+            (true, true) => (128 * size as u32, size),
+            (false, true) => (left.iter().map(|&v| u32::from(v)).sum(), size),
+            (true, false) => (above.iter().map(|&v| u32::from(v)).sum(), size),
+            (false, false) => (above.iter().chain(&left).map(|&v| u32::from(v)).sum(), size * 2),
+        };
+        let dc = (sum + (count / 2) as u32) / count as u32;
+        let corner = plane.top_left(x, y);
+        for row in 0..size {
+            for col in 0..size {
+                let value = match mode {
+                    0 => dc as u8,
+                    1 => above[col],
+                    2 => left[row],
+                    _ => clamp(i32::from(left[row]) + i32::from(above[col]) - i32::from(corner)),
+                };
+                plane.pixels[(y + row) * plane.width + x + col] = value;
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_large_predictions_match_scalar_edges_and_clipping() {
+        for size in [8, 16] {
+            for x in [0, 8, 16] {
+                for y in [0, 8, 16] {
+                    for pattern in 0..4 {
+                        let mut original = Plane::new(32, 32);
+                        for (index, pixel) in original.pixels.iter_mut().enumerate() {
+                            *pixel = match pattern {
+                                0 => 0,
+                                1 => 255,
+                                2 => if index % 2 == 0 { 0 } else { 255 },
+                                _ => ((index * 37 + 19) & 255) as u8,
+                            };
+                        }
+                        for mode in 0..4 {
+                            let mut actual = original.clone();
+                            let mut expected = original.clone();
+                            actual.predict_large(x, y, size, mode);
+                            scalar_large_prediction(&mut expected, x, y, size, mode);
+                            assert_eq!(actual.pixels, expected.pixels,
+                                "size={size} x={x} y={y} mode={mode} pattern={pattern}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn default_edges_and_dc_modes() {
         let mut plane = Plane::new(32, 32);
@@ -244,5 +319,68 @@ mod tests {
         assert!(plane.pixels[..16].iter().all(|&pixel| pixel == 128));
         plane.predict_small(0, 0, 0, 0, 0);
         assert!(plane.pixels[..4].iter().all(|&pixel| pixel == 128));
+    }
+
+    #[test]
+    fn bulk_residual_matches_wide_clipped_addition() {
+        let mut original = Plane::new(13, 9);
+        for (index, pixel) in original.pixels.iter_mut().enumerate() {
+            *pixel = (index * 73) as u8;
+        }
+        let extremes = [i32::MIN, -32768, -256, -255, -1, 0, 1, 255, 256, 32767, i32::MAX];
+        for trial in 0..1024 {
+            let values = std::array::from_fn(|index| {
+                if trial < extremes.len() { extremes[(trial + index) % extremes.len()] }
+                else { ((trial * 37 + index * 73) % 1025) as i32 - 512 }
+            });
+            let (x, y) = (trial % 10, trial % 6);
+            let mut actual = original.clone();
+            let mut expected = original.clone();
+            actual.add_residual(x, y, &values);
+            for row in 0..4 {
+                for col in 0..4 {
+                    let at = (y + row) * expected.width + x + col;
+                    expected.pixels[at] = (i64::from(expected.pixels[at])
+                        + i64::from(values[row * 4 + col])).clamp(0, 255) as u8;
+                }
+            }
+            assert_eq!(actual.pixels, expected.pixels, "trial={trial}");
+        }
+        let mut actual = original.clone();
+        actual.add_residual(9, 5, &[0; 16]);
+        assert_eq!(actual.pixels, original.pixels);
+    }
+
+    #[test]
+    #[ignore = "manual VP8 residual addition kernel timing"]
+    fn benchmark_residual_addition() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut plane = Plane::new(13, 9);
+        let values = std::array::from_fn(|index| (index * 7 % 13) as i32 - 6);
+        for zero_every in [0, 4] {
+            for trial in 0..5 {
+                for bulk in if trial % 2 == 0 { [false, true] } else { [true, false] } {
+                    let start = Instant::now();
+                    for iteration in 0..1_000_000 {
+                        let plane = black_box(&mut plane);
+                        let values = black_box(if zero_every != 0 && iteration % zero_every == 0 {
+                            &[0; 16]
+                        } else { &values });
+                        if bulk { plane.add_residual(3, 2, values); }
+                        else {
+                            for row in 0..4 {
+                                for col in 0..4 {
+                                    let at = (2 + row) * plane.width + 3 + col;
+                                    plane.pixels[at] = clamp(i32::from(plane.pixels[at]) + values[row * 4 + col]);
+                                }
+                            }
+                        }
+                        black_box(&plane.pixels);
+                    }
+                    eprintln!("VP8 residual zero_every={zero_every} trial={trial} bulk={bulk} elapsed={:?}", start.elapsed());
+                }
+            }
+        }
     }
 }

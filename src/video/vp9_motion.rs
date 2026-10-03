@@ -5,6 +5,7 @@ use super::vp8::BoolDecoder;
 use super::vp8_predict::Plane;
 use super::vp9_inter_probs::InterframeProbabilities;
 use super::vp9_adapt::NonCoefficientCounts;
+use super::subpel::convolve_row;
 
 const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 const MV_CLASS_TREE: [i8; 20] = [
@@ -87,6 +88,41 @@ const SUBPEL_FILTERS: [[[i16; 8]; 16]; 4] = [
         [0, 0, 0, 8, 120, 0, 0, 0],
     ],
 ];
+
+#[derive(Clone, Copy)]
+struct ActiveFilter {
+    taps: [(usize, i32); 8],
+    count: usize,
+    first_tap: usize,
+    last_tap: usize,
+}
+
+const ACTIVE_FILTERS: [[ActiveFilter; 16]; 4] = {
+    let mut filters = [[ActiveFilter {
+        taps: [(0, 0); 8], count: 0, first_tap: 0, last_tap: 0,
+    }; 16]; 4];
+    let mut kind = 0;
+    while kind < 4 {
+        let mut phase = 0;
+        while phase < 16 {
+            let mut tap = 0;
+            while tap < 8 {
+                let coefficient = SUBPEL_FILTERS[kind][phase][tap];
+                if coefficient != 0 {
+                    let count = filters[kind][phase].count;
+                    if count == 0 { filters[kind][phase].first_tap = tap; }
+                    filters[kind][phase].last_tap = tap;
+                    filters[kind][phase].taps[count] = (tap, coefficient as i32);
+                    filters[kind][phase].count += 1;
+                }
+                tap += 1;
+            }
+            phase += 1;
+        }
+        kind += 1;
+    }
+    filters
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MotionSampling {
@@ -232,6 +268,16 @@ pub(super) fn scaled_motion(
         .clamp(top - extend_y, bottom + extend_y - 16);
     let mv_col = ((2 * i64::from(mv.1)) >> subsampling)
         .clamp(left - extend_x, right + extend_x - 16);
+    if frame_size == reference_size {
+        return Ok(MotionSampling {
+            start_x: i32::try_from((position.0 as i64) * 16 + mv_col)
+                .map_err(|_| MediaDecodeError::Unsupported)?,
+            start_y: i32::try_from((position.1 as i64) * 16 + mv_row)
+                .map_err(|_| MediaDecodeError::Unsupported)?,
+            step_x: 16,
+            step_y: 16,
+        });
+    }
     let x_scale = ((reference_width as i64) << 14) / frame_width as i64;
     let y_scale = ((reference_height as i64) << 14) / frame_height as i64;
     let (x, y) = (position.0 as i64, position.1 as i64);
@@ -292,6 +338,29 @@ pub(super) fn predict_block(
         }
         return Ok(());
     }
+    // Unscaled, single-axis motion needs only one convolution, not a scratch plane.
+    if step_x == 16 && step_y == 16 && source_x >= 3 && source_y >= 3
+        && source_x as usize + width + 4 <= visible_width
+        && source_y as usize + height + 4 <= visible_height
+    {
+        let phase_x = (start_x & 15) as usize;
+        let phase_y = (start_y & 15) as usize;
+        if phase_x == 0 || phase_y == 0 {
+            let horizontal = phase_y == 0;
+            let active = &ACTIVE_FILTERS[filter as usize][if horizontal { phase_x } else { phase_y }];
+            for row in 0..height {
+                let from = if horizontal {
+                    (source_y as usize + row) * reference.width + source_x as usize - 3
+                } else {
+                    (source_y as usize + row - 3) * reference.width + source_x as usize
+                };
+                let to = (y + row) * destination.width + x;
+                convolve_row(&reference.pixels, from, if horizontal { 1 } else { reference.width },
+                    &active.taps[..active.count], &mut destination.pixels[to..to + width]);
+            }
+            return Ok(());
+        }
+    }
     let intermediate_height = (((height - 1) as i32 * step_y + 15) >> 4) as usize + 8;
     let mut scratch = [0u8; 64 * 72];
     let mut scaled_scratch = Vec::new();
@@ -305,17 +374,25 @@ pub(super) fn predict_block(
     let filters = &SUBPEL_FILTERS[filter as usize];
     let mut columns = [[0usize; 8]; 64];
     let mut phases = [0usize; 64];
-    for col in 0..width {
-        let position = start_x + step_x * col as i32;
-        phases[col] = (position & 15) as usize;
-        for tap in 0..8 {
-            columns[col][tap] = ((position >> 4) + tap as i32 - 3)
-                .clamp(0, visible_width as i32 - 1) as usize;
-        }
-    }
     let contiguous = step_x == 16 && source_x >= 3
         && source_x as usize + width + 4 <= visible_width;
-    for row in 0..intermediate_height {
+    if contiguous {
+        phases[0] = (start_x & 15) as usize;
+    } else {
+        for col in 0..width {
+            let position = start_x + step_x * col as i32;
+            phases[col] = (position & 15) as usize;
+            for tap in 0..8 {
+                columns[col][tap] = ((position >> 4) + tap as i32 - 3)
+                    .clamp(0, visible_width as i32 - 1) as usize;
+            }
+        }
+    }
+    let (first_row, last_row) = if step_y == 16 {
+        let active = &ACTIVE_FILTERS[filter as usize][(start_y & 15) as usize];
+        (active.first_tap, height + active.last_tap)
+    } else { (0, intermediate_height) };
+    for row in first_row..last_row {
         let source_row = (start_y >> 4) + row as i32 - 3;
         let source_row = source_row.clamp(0, visible_height as i32 - 1) as usize;
         let source = &reference.pixels[source_row * reference.width..][..visible_width];
@@ -325,17 +402,9 @@ pub(super) fn predict_block(
             if phase == 0 {
                 target.copy_from_slice(&source[source_x as usize..source_x as usize + width]);
             } else {
-                let mut sums = [0i32; 64];
-                for (tap, &coefficient) in filters[phase].iter().enumerate() {
-                    if coefficient == 0 { continue; }
-                    let from = source_x as usize + tap - 3;
-                    for (sum, &sample) in sums[..width].iter_mut().zip(&source[from..from + width]) {
-                        *sum += i32::from(sample) * i32::from(coefficient);
-                    }
-                }
-                for (sample, sum) in target.iter_mut().zip(sums) {
-                    *sample = ((sum + 64) >> 7).clamp(0, 255) as u8;
-                }
+                let active = &ACTIVE_FILTERS[filter as usize][phase];
+                convolve_row(source, source_x as usize - 3, 1,
+                    &active.taps[..active.count], target);
             }
             continue;
         }
@@ -362,18 +431,10 @@ pub(super) fn predict_block(
                 .copy_from_slice(&intermediate[(base + 3) * width..(base + 4) * width]);
             continue;
         }
-        let mut sums = [0i32; 64];
-        for (tap, &coefficient) in filters[phase].iter().enumerate() {
-            if coefficient == 0 { continue; }
-            let source = &intermediate[(base + tap) * width..(base + tap + 1) * width];
-            for (sum, &sample) in sums[..width].iter_mut().zip(source) {
-                *sum += i32::from(sample) * i32::from(coefficient);
-            }
-        }
+        let active = &ACTIVE_FILTERS[filter as usize][phase];
         let to = (y + row) * destination.width + x;
-        for (sample, sum) in destination.pixels[to..to + width].iter_mut().zip(sums) {
-            *sample = ((sum + 64) >> 7).clamp(0, 255) as u8;
-        }
+        convolve_row(intermediate, base * width, width,
+            &active.taps[..active.count], &mut destination.pixels[to..to + width]);
     }
     Ok(())
 }
@@ -381,6 +442,115 @@ pub(super) fn predict_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_row_bounds_match_every_filter_phase() {
+        for kind in 0..4 {
+            for phase in 0..16 {
+                let coefficients = &SUBPEL_FILTERS[kind][phase];
+                let active = &ACTIVE_FILTERS[kind][phase];
+                assert_eq!(active.first_tap, coefficients.iter().position(|&value| value != 0).unwrap());
+                assert_eq!(active.last_tap, coefficients.iter().rposition(|&value| value != 0).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn active_rows_match_scalar_at_all_phases_and_clamped_edges() {
+        let mut reference = Plane::new(80, 80);
+        for (index, pixel) in reference.pixels.iter_mut().enumerate() {
+            *pixel = (index.wrapping_mul(73) ^ (index >> 3)) as u8;
+        }
+        for size in [4, 8, 16] {
+            for filter in 0..4 {
+                for phase_y in 0..16 {
+                    for phase_x in 0..16 {
+                        for (base_x, base_y) in [(-16, -16), (0, 0), (73 * 16, 71 * 16)] {
+                            let start_x = base_x + phase_x;
+                            let start_y = base_y + phase_y;
+                            let expected = scalar_prediction(&reference, size, size,
+                                start_x, start_y, 16, 16, filter);
+                            let mut actual = Plane::new(size + 2, size + 2);
+                            actual.pixels.fill(91);
+                            predict_block(&mut actual, &reference, 1, 1, size, size,
+                                start_x, start_y, 16, 16, filter, 80, 80).unwrap();
+                            for row in 0..size + 2 {
+                                for col in 0..size + 2 {
+                                    let value = if (1..=size).contains(&row) && (1..=size).contains(&col) {
+                                        expected[(row - 1) * size + col - 1]
+                                    } else { 91 };
+                                    assert_eq!(actual.pixels[row * actual.width + col], value,
+                                        "size={size} filter={filter} start=({start_x},{start_y}) row={row} col={col}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_filter_rows_match_all_portable_phases() {
+        for width in [4, 8, 16, 32, 64] {
+            for stride in [1, 73] {
+                for pattern in 0..4 {
+                    let source: Vec<u8> = (0..8 * 73 + 80).map(|index| match pattern {
+                        0 => 0,
+                        1 => 255,
+                        2 => if index % 2 == 0 { 0 } else { 255 },
+                        _ => ((index * 37 + 19) & 255) as u8,
+                    }).collect();
+                    for kind in 0..4 {
+                        for phase in 0..16 {
+                            let active = &ACTIVE_FILTERS[kind][phase];
+                            let all: Vec<_> = SUBPEL_FILTERS[kind][phase].iter().enumerate()
+                                .map(|(tap, &coefficient)| (tap, i32::from(coefficient))).collect();
+                            let mut expected = vec![0u8; width];
+                            super::super::subpel::convolve_row_scalar(&source, 1, stride, &all, &mut expected);
+                            let mut actual = vec![91u8; width + 8];
+                            let required = 1 + active.taps[active.count - 1].0 * stride + width;
+                            convolve_row(&source[..required], 1, stride, &active.taps[..active.count],
+                                &mut actual[4..4 + width]);
+                            assert_eq!(&actual[4..4 + width], expected,
+                                "width={width} stride={stride} kind={kind} phase={phase} pattern={pattern}");
+                            assert_eq!(&actual[..4], &[91; 4]);
+                            assert_eq!(&actual[4 + width..], &[91; 4]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual sub-pixel kernel timing"]
+    fn benchmark_bulk_filter_rows() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let source: Vec<u8> = (0..8 * 73 + 80)
+            .map(|index| ((index * 37 + 19) & 255) as u8).collect();
+        let mut output = [0u8; 64];
+        for width in [4, 8, 64] {
+            for trial in 0..5 {
+                for accelerated in if trial % 2 == 0 { [false, true] } else { [true, false] } {
+                    let start = Instant::now();
+                    for iteration in 0..20_000 {
+                        let active = &ACTIVE_FILTERS[iteration % 4][iteration % 16];
+                        let taps = black_box(&active.taps[..active.count]);
+                        if accelerated {
+                            convolve_row(black_box(&source), 1, 73, taps, black_box(&mut output[..width]));
+                        } else {
+                            super::super::subpel::convolve_row_scalar(
+                                black_box(&source), 1, 73, taps, black_box(&mut output[..width]));
+                        }
+                        black_box(&output);
+                    }
+                    eprintln!("VP9 row width={width} trial={trial} accelerated={accelerated} elapsed={:?}", start.elapsed());
+                }
+            }
+        }
+    }
 
     fn scalar_prediction(reference: &Plane, width: usize, height: usize,
         start_x: i32, start_y: i32, step_x: i32, step_y: i32, filter: u8) -> Vec<u8>
@@ -434,6 +604,37 @@ mod tests {
                             start_x, start_y, step_x, step_y, filter, 80, 80).unwrap();
                         assert_eq!(actual.pixels, expected,
                             "size={size} filter={filter} start=({start_x},{start_y}) step=({step_x},{step_y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_axis_prediction_matches_scalar_at_every_phase() {
+        let mut reference = Plane::new(96, 96);
+        for (index, value) in reference.pixels.iter_mut().enumerate() {
+            *value = (index.wrapping_mul(73) ^ (index >> 3)) as u8;
+        }
+        for (width, height) in [(4, 8), (8, 4), (16, 32), (64, 64)] {
+            for filter in 0..4 {
+                for phase in 0..16 {
+                    for (start_x, start_y) in [(128 + phase, 128), (128, 128 + phase)] {
+                        let expected = scalar_prediction(&reference, width, height,
+                            start_x, start_y, 16, 16, filter);
+                        let mut actual = Plane::new(width + 8, height + 8);
+                        actual.pixels.fill(19);
+                        predict_block(&mut actual, &reference, 4, 4, width, height,
+                            start_x, start_y, 16, 16, filter, 96, 96).unwrap();
+                        for row in 0..height + 8 {
+                            for col in 0..width + 8 {
+                                let expected = if (4..height + 4).contains(&row)
+                                    && (4..width + 4).contains(&col) {
+                                    expected[(row - 4) * width + col - 4]
+                                } else { 19 };
+                                assert_eq!(actual.pixels[row * actual.width + col], expected);
+                            }
+                        }
                     }
                 }
             }

@@ -3,6 +3,7 @@
 use super::backend::MediaDecodeError;
 use super::vp8::{read_bmode, BoolDecoder, FrameHeader, KeyFrameLayout};
 use super::vp8_coeff::CoeffProbs;
+use std::sync::Arc;
 
 const MV_UPDATE_PROBS: [[u8; 19]; 2] = [
     [
@@ -47,18 +48,22 @@ pub(super) struct MotionVector {
 }
 
 impl MotionVector {
-    fn add(self, other: Self) -> Self {
-        Self {
-            row: self.row + other.row,
-            col: self.col + other.col,
-        }
+    fn add(self, other: Self) -> Result<Self, MediaDecodeError> {
+        Ok(Self {
+            row: self.row.checked_add(other.row)
+                .ok_or_else(|| MediaDecodeError::InvalidData("VP8 motion vector overflow".into()))?,
+            col: self.col.checked_add(other.col)
+                .ok_or_else(|| MediaDecodeError::InvalidData("VP8 motion vector overflow".into()))?,
+        })
     }
 
-    fn negated(self) -> Self {
-        Self {
-            row: -self.row,
-            col: -self.col,
-        }
+    fn negated(self) -> Result<Self, MediaDecodeError> {
+        Ok(Self {
+            row: self.row.checked_neg()
+                .ok_or_else(|| MediaDecodeError::InvalidData("VP8 motion vector overflow".into()))?,
+            col: self.col.checked_neg()
+                .ok_or_else(|| MediaDecodeError::InvalidData("VP8 motion vector overflow".into()))?,
+        })
     }
 }
 
@@ -72,6 +77,7 @@ pub(super) struct InterMacroblock {
     pub(super) chroma: u8,
     pub(super) subblocks: [u8; 16],
     pub(super) motion: [MotionVector; 16],
+    pub(super) split_partition: u8,
 }
 
 impl Default for InterMacroblock {
@@ -85,11 +91,12 @@ impl Default for InterMacroblock {
             chroma: 0,
             subblocks: [0; 16],
             motion: [MotionVector::default(); 16],
+            split_partition: 3,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct InterState {
     pub(super) coeff_probs: CoeffProbs,
     pub(super) mv_probs: [[u8; 19]; 2],
@@ -98,7 +105,7 @@ pub(super) struct InterState {
     pub(super) segment_quantizers: [i16; 4],
     pub(super) segment_filter_levels: [i16; 4],
     pub(super) segment_absolute: bool,
-    pub(super) segment_map: Vec<u8>,
+    pub(super) segment_map: Arc<Vec<u8>>,
     pub(super) mb_width: usize,
     pub(super) mb_height: usize,
     pub(super) reference_filter_deltas: [i16; 4],
@@ -122,7 +129,7 @@ impl InterState {
             segment_quantizers,
             segment_filter_levels,
             segment_absolute,
-            segment_map: vec![0; layout.macroblocks_wide() * layout.macroblocks_high()],
+            segment_map: Arc::new(vec![0; layout.macroblocks_wide() * layout.macroblocks_high()]),
             mb_width: layout.macroblocks_wide(),
             mb_height: layout.macroblocks_high(),
             reference_filter_deltas,
@@ -195,6 +202,8 @@ impl<'a> InterFrameLayout<'a> {
                             } else {
                                 magnitude
                             };
+                        } else {
+                            *value = 0;
                         }
                     }
                 }
@@ -344,7 +353,9 @@ impl<'a> InterFrameLayout<'a> {
     }
 
     pub(super) fn dequant_factors(&self, segment: u8) -> [i32; 6] {
-        let base = if self.segment_absolute {
+        let base = if !self.segment_enabled {
+            i16::from(self.quantizer)
+        } else if self.segment_absolute {
             self.segment_quantizers[segment as usize]
         } else {
             i16::from(self.quantizer) + self.segment_quantizers[segment as usize]
@@ -353,24 +364,27 @@ impl<'a> InterFrameLayout<'a> {
     }
 
     pub(super) fn macroblock_filter_level(&self, mb: &InterMacroblock) -> u8 {
-        let level = if self.segment_absolute {
+        if self.filter_level == 0 { return 0; }
+        let level = if !self.segment_enabled {
+            i16::from(self.filter_level)
+        } else if self.segment_absolute {
             self.segment_filter_levels[mb.segment as usize]
         } else {
             i16::from(self.filter_level) + self.segment_filter_levels[mb.segment as usize]
-        };
+        }.clamp(0, 63);
         let level = if self.filter_adjustments {
-            let mode = if mb.reference == 0 {
-                usize::from(mb.mode == 4)
+            let mode_delta = if mb.reference == 0 {
+                if mb.mode == 4 { self.mode_filter_deltas[0] } else { 0 }
             } else if mb.mode == 7 {
-                1
+                self.mode_filter_deltas[1]
             } else if mb.mode == 9 {
-                3
+                self.mode_filter_deltas[3]
             } else {
-                2
+                self.mode_filter_deltas[2]
             };
             level
                 + self.reference_filter_deltas[mb.reference as usize]
-                + self.mode_filter_deltas[mode]
+                + mode_delta
         } else {
             level
         };
@@ -385,7 +399,7 @@ impl<'a> InterFrameLayout<'a> {
     ) -> Result<Vec<InterMacroblock>, MediaDecodeError> {
         let mut result = Vec::with_capacity(mb_width * mb_height);
         if state.segment_map.len() != mb_width * mb_height {
-            state.segment_map.resize(mb_width * mb_height, 0);
+            Arc::make_mut(&mut state.segment_map).resize(mb_width * mb_height, 0);
         }
         for y in 0..mb_height {
             for x in 0..mb_width {
@@ -395,7 +409,6 @@ impl<'a> InterFrameLayout<'a> {
                     if self.segment_enabled {
                         if self.segment_map_update {
                             mb.segment = read_segment(&mut self.control, &self.segment_probs)?;
-                            state.segment_map[index] = mb.segment;
                         } else {
                             mb.segment = state.segment_map[index];
                         }
@@ -418,7 +431,7 @@ impl<'a> InterFrameLayout<'a> {
                             3
                         };
                         let (nearest, near, best, counts) =
-                            near_vectors(&result, x, y, mb_width, mb_height, mb.reference, self.sign_bias);
+                            near_vectors(&result, x, y, mb_width, mb_height, mb.reference, self.sign_bias)?;
                         let probs = [
                             MODE_CONTEXTS[counts[0].min(5)][0],
                             MODE_CONTEXTS[counts[1].min(5)][1],
@@ -431,7 +444,10 @@ impl<'a> InterFrameLayout<'a> {
                             5 => nearest,
                             6 => near,
                             7 => MotionVector::default(),
-                            8 => best.add(read_motion_vector(&mut self.control, &self.mv_probs)?),
+                            8 => clamp_macroblock_vector(
+                                best.add(read_motion_vector(&mut self.control, &self.mv_probs)?)?,
+                                x, y, mb_width, mb_height,
+                            ),
                             9 => {
                                 read_split_vectors(
                                     &mut self.control,
@@ -457,6 +473,12 @@ impl<'a> InterFrameLayout<'a> {
                     MediaDecodeError::InvalidData(format!("VP8 mode at ({x}, {y}): {error:?}"))
                 })?;
                 result.push(mb);
+            }
+        }
+        if self.segment_enabled && self.segment_map_update {
+            let segments = Arc::make_mut(&mut state.segment_map);
+            for (segment, mode) in segments.iter_mut().zip(&result) {
+                *segment = mode.segment;
             }
         }
         Ok(result)
@@ -536,7 +558,7 @@ fn near_vectors(
     height: usize,
     reference: u8,
     sign_bias: [bool; 2],
-) -> (MotionVector, MotionVector, MotionVector, [usize; 4]) {
+) -> Result<(MotionVector, MotionVector, MotionVector, [usize; 4]), MediaDecodeError> {
     let mut vectors = [MotionVector::default(); 3];
     let mut scores = [0usize; 3];
     let mut split_score = 0;
@@ -560,7 +582,7 @@ fn near_vectors(
         let mut vector = neighbor.motion[if neighbor.mode == 9 { 15 } else { 0 }];
         let bias = |reference: u8| reference >= 2 && sign_bias[(reference - 2) as usize];
         if bias(neighbor.reference) != bias(reference) {
-            vector = vector.negated();
+            vector = vector.negated()?;
         }
         if let Some(index) = vectors.iter().position(|known| *known == vector) {
             scores[index] += weight;
@@ -572,9 +594,15 @@ fn near_vectors(
             split_score += weight;
         }
     }
-    let mut nonzero = (0..3)
-        .filter(|&index| scores[index] != 0 && vectors[index] != MotionVector::default())
-        .collect::<Vec<_>>();
+    let mut indices = [0usize; 3];
+    let mut count = 0;
+    for index in 0..3 {
+        if scores[index] != 0 && vectors[index] != MotionVector::default() {
+            indices[count] = index;
+            count += 1;
+        }
+    }
+    let nonzero = &mut indices[..count];
     nonzero.sort_by_key(|&index| std::cmp::Reverse(scores[index]));
     let nearest = nonzero
         .first()
@@ -595,11 +623,17 @@ fn near_vectors(
     } else {
         MotionVector::default()
     };
-    let clamp = |mv: MotionVector| MotionVector {
+    let clamp = |mv| clamp_macroblock_vector(mv, x, y, width, height);
+    Ok((clamp(nearest), clamp(near), clamp(best), [zero_score, nearest_score, near_score, split_score]))
+}
+
+fn clamp_macroblock_vector(mv: MotionVector, x: usize, y: usize,
+    width: usize, height: usize) -> MotionVector
+{
+    MotionVector {
         row: i32::from(mv.row).clamp(-64 * (y as i32 + 1), 64 * (height - y) as i32) as i16,
         col: i32::from(mv.col).clamp(-64 * (x as i32 + 1), 64 * (width - x) as i32) as i16,
-    };
-    (clamp(nearest), clamp(near), clamp(best), [zero_score, nearest_score, near_score, split_score])
+    }
 }
 
 fn read_motion_vector(
@@ -672,6 +706,7 @@ fn read_split_vectors(
         2 => 4,
         _ => 16,
     };
+    mb.split_partition = partition as u8;
     for piece in 0..pieces {
         let (row, col) = match partition {
             0 => (piece * 2, 0),
@@ -714,7 +749,7 @@ fn read_split_vectors(
         } else if !control.read(p[2])? {
             MotionVector::default()
         } else {
-            best.add(read_motion_vector(control, probs)?)
+            best.add(read_motion_vector(control, probs)?)?
         };
         for sub_row in 0..4 {
             for sub_col in 0..4 {
@@ -734,8 +769,223 @@ fn read_split_vectors(
 }
 
 #[cfg(test)]
+pub(super) struct TestBoolWriter {
+    range: u32,
+    shift: usize,
+    bits: Vec<u8>,
+}
+
+#[cfg(test)]
+impl TestBoolWriter {
+    pub(super) fn new() -> Self { Self { range: 255, shift: 0, bits: Vec::new() } }
+
+    pub(super) fn write(&mut self, bit: bool, probability: u8) {
+        let split = 1 + ((self.range - 1) * u32::from(probability) >> 8);
+        if bit {
+            // Accumulate the lower interval endpoint at the current binary scale.
+            self.bits.resize(self.shift + 8, 0);
+            let mut carry = split;
+            for index in (0..self.bits.len()).rev() {
+                let sum = u32::from(self.bits[index]) + (carry & 1);
+                self.bits[index] = (sum & 1) as u8;
+                carry = (carry >> 1) + (sum >> 1);
+                if carry == 0 { break; }
+            }
+            assert_eq!(carry, 0);
+            self.range -= split;
+        } else {
+            self.range = split;
+        }
+        let shift = self.range.leading_zeros() - 24;
+        self.range <<= shift;
+        self.shift += shift as usize;
+    }
+
+    fn literal(&mut self, value: u32, bits: usize) {
+        for index in (0..bits).rev() { self.write(value & (1 << index) != 0, 128); }
+    }
+
+    pub(super) fn finish(mut self) -> Vec<u8> {
+        self.bits.resize(self.shift + 24, 0);
+        self.bits.chunks(8).map(|bits| {
+            bits.iter().enumerate().fold(0, |byte, (index, bit)| byte | (bit << (7 - index)))
+        }).collect()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_interframe(state: &InterState, reference: Option<u8>, vertical: bool,
+    golden: u8, alternate: u8, refresh_last: bool) -> Vec<u8>
+{
+    assert!(golden <= 3 && alternate <= 3);
+    let mut writer = TestBoolWriter::new();
+    writer.write(false, 128); // segmentation disabled
+    writer.write(false, 128); // normal filter, level zero
+    writer.literal(0, 6);
+    writer.literal(0, 3);
+    writer.write(false, 128); // filter deltas disabled
+    writer.literal(0, 2); // one token partition
+    writer.literal(0, 7); // quantizer and five absent deltas
+    for _ in 0..5 { writer.write(false, 128); }
+    writer.write(golden == 3, 128);
+    writer.write(alternate == 3, 128);
+    if golden != 3 { writer.literal(u32::from(golden), 2); }
+    if alternate != 3 { writer.literal(u32::from(alternate), 2); }
+    for _ in 0..3 { writer.write(false, 128); } // sign biases and entropy refresh
+    writer.write(refresh_last, 128);
+    for probability in super::vp8_probs::COEFF_UPDATE_PROBS { writer.write(false, probability); }
+    writer.write(true, 128); // macroblock coefficient skipping
+    writer.literal(128, 8);
+    writer.literal(128, 8); // intra, last, and golden probabilities
+    writer.literal(128, 8);
+    writer.literal(128, 8);
+    writer.write(false, 128); // luma/chroma mode probability updates
+    writer.write(false, 128);
+    for probabilities in MV_UPDATE_PROBS {
+        for probability in probabilities { writer.write(false, probability); }
+    }
+    for y in 0..state.mb_height {
+        for x in 0..state.mb_width {
+            writer.write(true, 128); // no residual coefficients
+            writer.write(reference.is_some(), 128);
+            if let Some(reference) = reference {
+                assert!((1..=3).contains(&reference));
+                writer.write(reference != 1, 128);
+                if reference != 1 { writer.write(reference == 3, 128); }
+                let zero_score = usize::from(y > 0) * 2 + usize::from(x > 0) * 2
+                    + usize::from(x > 0 && y > 0);
+                writer.write(false, MODE_CONTEXTS[zero_score][0]); // ZEROMV
+            } else {
+                writer.write(vertical, state.ymode_probs[0]);
+                if vertical {
+                    writer.write(false, state.ymode_probs[1]);
+                    writer.write(false, state.ymode_probs[2]);
+                }
+                writer.write(vertical, state.uv_mode_probs[0]);
+                if vertical { writer.write(false, state.uv_mode_probs[1]); }
+            }
+        }
+    }
+    let control = writer.finish();
+    let tag = ((control.len() as u32) << 5) | 0x11;
+    let mut frame = tag.to_le_bytes()[..3].to_vec();
+    frame.extend(control);
+    frame.extend([0, 0]);
+    frame
+}
+
+#[cfg(test)]
+pub(super) fn test_segmented_interframe(state: &InterState, enabled: bool,
+    features: Option<(bool, [i16; 4], [i16; 4])>, map_update: bool) -> Vec<u8>
+{
+    let mut control = TestBoolWriter::new();
+    control.write(enabled, 128);
+    if enabled {
+        control.write(map_update, 128);
+        control.write(features.is_some(), 128);
+        if let Some((absolute, quantizers, levels)) = features {
+            control.write(absolute, 128);
+            for (bits, values) in [(7, quantizers), (6, levels)] {
+                for value in values {
+                    control.write(value != 0, 128);
+                    if value != 0 {
+                        control.literal(u32::from(value.unsigned_abs()), bits);
+                        control.write(value < 0, 128);
+                    }
+                }
+            }
+        }
+        if map_update {
+            for _ in 0..3 {
+                control.write(true, 128);
+                control.literal(128, 8);
+            }
+        }
+    }
+    control.write(false, 128); // normal loop filter
+    control.literal(16, 6);
+    control.literal(0, 3);
+    control.write(false, 128); // no reference/mode filter deltas
+    control.literal(0, 2); // one residual partition
+    control.literal(35, 7);
+    for _ in 0..5 { control.write(false, 128); }
+    control.write(false, 128); // keep golden and alternate references
+    control.write(false, 128);
+    control.literal(0, 2);
+    control.literal(0, 2);
+    for _ in 0..4 { control.write(false, 128); } // biases, entropy refresh, last refresh
+    // Uniform, frame-local probabilities keep the fixture writer independent of decoder state.
+    for probability in super::vp8_probs::COEFF_UPDATE_PROBS {
+        control.write(true, probability);
+        control.literal(128, 8);
+    }
+    control.write(true, 128); // explicit coefficient-skip flags
+    control.literal(128, 8);
+    for _ in 0..3 { control.literal(128, 8); }
+    control.write(false, 128); // unchanged intra mode probabilities
+    control.write(false, 128);
+    for probabilities in MV_UPDATE_PROBS {
+        for probability in probabilities { control.write(false, probability); }
+    }
+    let mut tokens = TestBoolWriter::new();
+    for y in 0..state.mb_height {
+        for x in 0..state.mb_width {
+            if enabled && map_update {
+                let segment = (y * state.mb_width + x) % 4;
+                control.write(segment >= 2, 128);
+                control.write(segment % 2 != 0, 128);
+            }
+            control.write(false, 128); // nonzero residuals
+            control.write(true, 128); // inter macroblock
+            control.write(false, 128); // last reference
+            let zero_score = usize::from(y > 0) * 2 + usize::from(x > 0) * 2
+                + usize::from(x > 0 && y > 0);
+            control.write(false, MODE_CONTEXTS[zero_score][0]);
+            let negative = (x + y) % 2 != 0;
+            let dc_four = |writer: &mut TestBoolWriter| {
+                // EOB, zero, one, small-value, two, and three/four decisions.
+                for bit in [true, true, true, false, true, true, negative, false] {
+                    writer.write(bit, 128);
+                }
+            };
+            dc_four(&mut tokens); // Y2 DC, followed by EOB
+            for _ in 0..16 { tokens.write(false, 128); } // zero luma AC blocks
+            for _ in 0..8 { dc_four(&mut tokens); } // chroma DC blocks
+        }
+    }
+    let control = control.finish();
+    let tag = ((control.len() as u32) << 5) | 0x11;
+    let mut packet = tag.to_le_bytes()[..3].to_vec();
+    packet.extend(control);
+    packet.extend(tokens.finish());
+    packet
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_writer_round_trips_arithmetic_intervals() {
+        for seed in [1u32, 17, 0xdeadbeef] {
+            let mut writer = TestBoolWriter::new();
+            let mut random = seed;
+            let mut decisions = Vec::new();
+            for index in 0..4096 {
+                random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                let probability = if index % 5 == 0 { [0, 1, 128, 254, 255][index % 25 / 5] }
+                    else { (random >> 24) as u8 };
+                let bit = random & 0x8000 != 0;
+                writer.write(bit, probability);
+                decisions.push((bit, probability));
+            }
+            let bytes = writer.finish();
+            let mut decoder = BoolDecoder::new(&bytes).unwrap();
+            for (index, (bit, probability)) in decisions.into_iter().enumerate() {
+                assert_eq!(decoder.read(probability).unwrap(), bit, "seed={seed} index={index}");
+            }
+        }
+    }
     use crate::video::webm::WebmVp8Stream;
 
     #[test]
@@ -745,10 +995,89 @@ mod tests {
         above.mode = 9;
         above.motion[0] = MotionVector { row: 3, col: 4 };
         above.motion[15] = MotionVector { row: 7, col: -2 };
-        let (nearest, _, best, counts) = near_vectors(&[above], 0, 1, 1, 2, 1, [true, false]);
+        let (nearest, _, best, counts) = near_vectors(&[above], 0, 1, 1, 2, 1, [true, false]).unwrap();
         assert_eq!(nearest, MotionVector { row: -7, col: 2 });
         assert_eq!(best, nearest);
         assert_eq!(counts, [0, 2, 0, 2]);
+    }
+
+    #[test]
+    fn new_motion_is_clamped_after_adding_the_difference() {
+        let best = MotionVector { row: 60, col: -60 };
+        let difference = MotionVector { row: 20, col: -20 };
+        let combined = best.add(difference).unwrap();
+        assert_eq!(combined, MotionVector { row: 80, col: -80 });
+        assert_eq!(clamp_macroblock_vector(combined, 0, 0, 1, 1),
+            MotionVector { row: 64, col: -64 });
+        assert_eq!(clamp_macroblock_vector(combined, 1, 1, 3, 3), combined);
+        assert_eq!(clamp_macroblock_vector(MotionVector { row: -300, col: 300 }, 1, 2, 4, 4),
+            MotionVector { row: -192, col: 192 });
+    }
+
+    #[test]
+    fn motion_overflow_is_an_error_not_a_panic_or_wraparound() {
+        assert!(MotionVector { row: i16::MAX, col: 0 }
+            .add(MotionVector { row: 1, col: 0 }).is_err());
+        assert!(MotionVector { row: 0, col: i16::MIN }
+            .add(MotionVector { row: 0, col: -1 }).is_err());
+        assert!(MotionVector { row: i16::MIN, col: 0 }.negated().is_err());
+        assert!(MotionVector { row: 0, col: i16::MIN }.negated().is_err());
+        assert_eq!(MotionVector { row: -7, col: 5 }.negated().unwrap(),
+            MotionVector { row: 7, col: -5 });
+    }
+
+    #[test]
+    fn segment_feature_update_clears_zero_entries() {
+        let mut stream = WebmVp8Stream::new();
+        let packets = stream.push(include_bytes!("../../tests/fixtures/vp8-motion.webm")).unwrap();
+        let key = KeyFrameLayout::parse(&packets[0].data).unwrap();
+        let mut state = InterState::after_keyframe(&key);
+        state.segment_quantizers = [12, 23, -7, 45];
+        state.segment_filter_levels = [5, 10, -5, 7];
+        // Arithmetic-coded header: segmentation and feature updates enabled, all values zero.
+        let mut frame = vec![0; 3 + 256 + 2];
+        frame[0] = 1;
+        frame[1] = 32;
+        frame[3] = 0x9f;
+        frame[4] = 0xc0;
+        let header = FrameHeader::parse(&frame).unwrap();
+        let mut control = BoolDecoder::new(header.control_partition(&frame)).unwrap();
+        assert!(control.read_bit().unwrap());
+        assert!(!control.read_bit().unwrap());
+        assert!(control.read_bit().unwrap());
+        assert!(!control.read_bit().unwrap());
+        let layout = InterFrameLayout::parse(&frame, &mut state).unwrap();
+        assert!(layout.segment_enabled);
+        assert_eq!(state.segment_quantizers, [0; 4]);
+        assert_eq!(state.segment_filter_levels, [0; 4]);
+    }
+
+    #[test]
+    fn disabled_segmentation_ignores_but_preserves_feature_tables() {
+        let mut stream = WebmVp8Stream::new();
+        let packets = stream.push(include_bytes!("../../tests/fixtures/vp8-motion.webm")).unwrap();
+        let key = KeyFrameLayout::parse(&packets[0].data).unwrap();
+        let initial = InterState::after_keyframe(&key);
+        let mut plain_state = initial.clone();
+        let plain = InterFrameLayout::parse(&packets[1].data, &mut plain_state).unwrap();
+        assert!(!plain.segment_enabled);
+        for absolute in [false, true] {
+            let mut previous = initial.clone();
+            previous.segment_quantizers = [12, 23, -7, 45];
+            previous.segment_filter_levels = [5, 10, -5, 7];
+            previous.segment_absolute = absolute;
+            let layout = InterFrameLayout::parse(&packets[1].data, &mut previous).unwrap();
+            assert!(!layout.segment_enabled);
+            assert_eq!(previous.segment_quantizers, [12, 23, -7, 45]);
+            assert_eq!(previous.segment_filter_levels, [5, 10, -5, 7]);
+            for segment in 0..4 {
+                assert_eq!(layout.dequant_factors(segment), plain.dequant_factors(segment));
+                for reference in 0..4 {
+                    let mb = InterMacroblock { segment, reference, mode: 8, ..Default::default() };
+                    assert_eq!(layout.macroblock_filter_level(&mb), plain.macroblock_filter_level(&mb));
+                }
+            }
+        }
     }
 
     #[test]

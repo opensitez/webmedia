@@ -157,9 +157,115 @@ pub(super) const DEFAULT_SCAN_32X32: [u16; 1024] = [
     924, 956, 925, 988, 957, 926, 1020, 989, 958, 927, 1021, 990, 959, 1022, 991, 1023,
 ];
 
+#[derive(Clone, Copy)]
+pub(super) struct CoefficientScan {
+    pub(super) position: u16,
+    pub(super) first: u16,
+    pub(super) second: u16,
+    pub(super) band: u8,
+}
+
+const fn widen<const N: usize>(input: &[u8; N]) -> [u16; N] {
+    let mut result = [0; N];
+    let mut index = 0;
+    while index < N {
+        result[index] = input[index] as u16;
+        index += 1;
+    }
+    result
+}
+
+const fn plan<const N: usize>(scan: &[u16; N], size: usize, direction: u8) -> [CoefficientScan; N] {
+    const BANDS: [u8; 21] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4];
+    let mut result = [CoefficientScan { position: 0, first: 0, second: 0, band: 0 }; N];
+    let mut index = 0;
+    while index < N {
+        let position = scan[index] as usize;
+        let (first, second) = if index == 0 { (0, 0) } else {
+            let above = if position >= size { position - size } else { position - 1 };
+            let left = if position % size != 0 { position - 1 } else { above };
+            if position >= size && position % size != 0 {
+                match direction {
+                    1 => (left, left),
+                    2 => (above, above),
+                    _ => (above, left),
+                }
+            } else { (above, left) }
+        };
+        let band = if (size == 4 && index >= 13) || index >= BANDS.len() { 5 }
+            else { BANDS[index] };
+        result[index] = CoefficientScan { position: position as u16,
+            first: first as u16, second: second as u16, band };
+        index += 1;
+    }
+    result
+}
+
+pub(super) fn coefficient_scan(tx_size: u8, direction: u8) -> &'static [CoefficientScan] {
+    static DEFAULT4: [CoefficientScan; 16] = plan(&widen(&DEFAULT_SCAN_4X4), 4, 0);
+    static ROW4: [CoefficientScan; 16] = plan(&widen(&ROW_SCAN_4X4), 4, 1);
+    static COL4: [CoefficientScan; 16] = plan(&widen(&COL_SCAN_4X4), 4, 2);
+    static DEFAULT8: [CoefficientScan; 64] = plan(&widen(&DEFAULT_SCAN_8X8), 8, 0);
+    static ROW8: [CoefficientScan; 64] = plan(&widen(&ROW_SCAN_8X8), 8, 1);
+    static COL8: [CoefficientScan; 64] = plan(&widen(&COL_SCAN_8X8), 8, 2);
+    static DEFAULT16: [CoefficientScan; 256] = plan(&widen(&DEFAULT_SCAN_16X16), 16, 0);
+    static ROW16: [CoefficientScan; 256] = plan(&widen(&ROW_SCAN_16X16), 16, 1);
+    static COL16: [CoefficientScan; 256] = plan(&widen(&COL_SCAN_16X16), 16, 2);
+    static DEFAULT32: [CoefficientScan; 1024] = plan(&DEFAULT_SCAN_32X32, 32, 0);
+    match (tx_size, direction) {
+        (3, _) => &DEFAULT32,
+        (2, 1) => &ROW16, (2, 2) => &COL16, (2, _) => &DEFAULT16,
+        (1, 1) => &ROW8, (1, 2) => &COL8, (1, _) => &DEFAULT8,
+        (_, 1) => &ROW4, (_, 2) => &COL4, _ => &DEFAULT4,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_scan_matches_positions_neighbors_and_bands() {
+        for tx_size in 0..4 {
+            let size = 4usize << tx_size;
+            for direction in 0..3 {
+                let positions: Vec<u16> = match (tx_size, direction) {
+                    (3, _) => DEFAULT_SCAN_32X32.to_vec(),
+                    (2, 1) => widen(&ROW_SCAN_16X16).to_vec(),
+                    (2, 2) => widen(&COL_SCAN_16X16).to_vec(),
+                    (2, _) => widen(&DEFAULT_SCAN_16X16).to_vec(),
+                    (1, 1) => widen(&ROW_SCAN_8X8).to_vec(),
+                    (1, 2) => widen(&COL_SCAN_8X8).to_vec(),
+                    (1, _) => widen(&DEFAULT_SCAN_8X8).to_vec(),
+                    (_, 1) => widen(&ROW_SCAN_4X4).to_vec(),
+                    (_, 2) => widen(&COL_SCAN_4X4).to_vec(),
+                    _ => widen(&DEFAULT_SCAN_4X4).to_vec(),
+                };
+                let scan = coefficient_scan(tx_size, direction);
+                assert_eq!(scan.len(), size * size);
+                for (index, entry) in scan.iter().enumerate() {
+                    assert_eq!(entry.position, positions[index]);
+                    let band = match index {
+                        0 => 0, 1..=2 => 1, 3..=5 => 2, 6..=9 => 3,
+                        10..=12 => 4, 13..=20 if tx_size != 0 => 4, _ => 5,
+                    };
+                    assert_eq!(entry.band, band);
+                    if index == 0 { continue; }
+                    let position = usize::from(entry.position);
+                    let above = if position >= size { position - size } else { position - 1 };
+                    let left = if position % size != 0 { position - 1 } else { above };
+                    let expected = if position >= size && position % size != 0 {
+                        match if tx_size == 3 { 0 } else { direction } {
+                            1 => (left, left), 2 => (above, above), _ => (above, left),
+                        }
+                    } else { (above, left) };
+                    assert_eq!((usize::from(entry.first), usize::from(entry.second)), expected);
+                    assert!(positions[..index].contains(&entry.first));
+                    assert!(positions[..index].contains(&entry.second));
+                }
+            }
+        }
+    }
 
     #[test]
     fn scan_covers_each_transform_coefficient_once() {

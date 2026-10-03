@@ -16,7 +16,7 @@ const CATEGORY_PROBS: [&[u8]; 6] = [
     &[254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129],
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CoeffProbs {
     values: [u8; 1056],
 }
@@ -61,6 +61,11 @@ impl CoeffProbs {
             if token == 11 {
                 break;
             }
+            if token == 0 {
+                context = 0;
+                previous_zero = true;
+                continue;
+            }
             let magnitude = if token <= 4 {
                 token as i32
             } else {
@@ -71,19 +76,15 @@ impl CoeffProbs {
                 }
                 CATEGORY_BASE[category] + extra
             };
-            let signed = if magnitude != 0 && decoder.read_bit()? {
+            let signed = if decoder.read_bit()? {
                 -magnitude
             } else {
                 magnitude
             };
             values[ZIGZAG[index]] = signed;
-            nonzero |= magnitude != 0;
-            context = match magnitude {
-                0 => 0,
-                1 => 1,
-                _ => 2,
-            };
-            previous_zero = magnitude == 0;
+            nonzero = true;
+            context = if magnitude == 1 { 1 } else { 2 };
+            previous_zero = false;
         }
         Ok((values, nonzero))
     }
@@ -121,6 +122,60 @@ fn decode_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_runs_preserve_context_eob_and_following_bits() {
+        use super::super::vp8_inter::TestBoolWriter;
+        let probabilities = CoeffProbs::default();
+        let sentinel = [(true, 13), (false, 211), (true, 128), (false, 37)];
+        for plane in 0..4 {
+            for initial_context in 0..3 {
+                for first in 0..2 {
+                    let mut writer = TestBoolWriter::new();
+                    let base = ((plane * 8 + BANDS[first]) * 3 + initial_context) * 11;
+                    writer.write(false, probabilities.values[base]);
+                    for (bit, probability) in sentinel { writer.write(bit, probability); }
+                    let data = writer.finish();
+                    let mut decoder = BoolDecoder::new(&data).unwrap();
+                    assert_eq!(probabilities.decode_block(&mut decoder, plane, initial_context, first).unwrap(),
+                        ([0; 16], false));
+                    for (bit, probability) in sentinel { assert_eq!(decoder.read(probability).unwrap(), bit); }
+                    for zeros in 0..=16 - first {
+                        let mut writer = TestBoolWriter::new();
+                        let mut context = initial_context;
+                        for index in first..first + zeros {
+                            let base = ((plane * 8 + BANDS[index]) * 3 + context) * 11;
+                            if index == first { writer.write(true, probabilities.values[base]); }
+                            writer.write(false, probabilities.values[base + 1]);
+                            context = 0;
+                        }
+                        let mut expected = [0; 16];
+                        let nonzero = first + zeros < 16;
+                        if nonzero {
+                            let index = first + zeros;
+                            let base = ((plane * 8 + BANDS[index]) * 3 + context) * 11;
+                            if zeros == 0 { writer.write(true, probabilities.values[base]); }
+                            writer.write(true, probabilities.values[base + 1]);
+                            writer.write(false, probabilities.values[base + 2]);
+                            let negative = zeros % 2 == 0;
+                            writer.write(negative, 128);
+                            expected[ZIGZAG[index]] = if negative { -1 } else { 1 };
+                            if index + 1 < 16 {
+                                let base = ((plane * 8 + BANDS[index + 1]) * 3 + 1) * 11;
+                                writer.write(false, probabilities.values[base]);
+                            }
+                        }
+                        for (bit, probability) in sentinel { writer.write(bit, probability); }
+                        let data = writer.finish();
+                        let mut decoder = BoolDecoder::new(&data).unwrap();
+                        assert_eq!(probabilities.decode_block(&mut decoder, plane, initial_context, first).unwrap(),
+                            (expected, nonzero), "plane={plane} context={initial_context} first={first} zeros={zeros}");
+                        for (bit, probability) in sentinel { assert_eq!(decoder.read(probability).unwrap(), bit); }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn probability_tables_have_expected_dimensions() {

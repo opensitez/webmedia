@@ -8,9 +8,7 @@ use super::vp9_compressed::CompressedHeader;
 use super::vp9_coef_probs::PARETO_TABLE;
 use super::vp9_mode_probs::KEYFRAME_LUMA_MODE_PROBS;
 use super::vp9_motion::{read_motion_difference, read_motion_difference_counted, use_high_precision};
-use super::vp9_scan::{COL_SCAN_4X4, COL_SCAN_8X8, COL_SCAN_16X16, DEFAULT_SCAN_4X4,
-    DEFAULT_SCAN_8X8, DEFAULT_SCAN_16X16, DEFAULT_SCAN_32X32, ROW_SCAN_4X4,
-    ROW_SCAN_8X8, ROW_SCAN_16X16};
+use super::vp9_scan::coefficient_scan;
 
 const INTRA_MODE_TREE: [i8; 18] = [
     0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7,
@@ -1139,6 +1137,18 @@ impl<'a, 'b> KeyframeTileReader<'a, 'b> {
         tx_size: u8, skip: bool, is_inter: bool, y_mode: u8,
         sub_modes: Option<[u8; 4]>,
     ) -> Result<(Vec<Vec<i32>>, [Vec<i32>; 2], [bool; 4], [bool; 2], bool), MediaDecodeError> {
+        if is_inter && skip {
+            for plane in 0..3 {
+                let scale = if plane == 0 { 1 } else { 2 };
+                let x4 = col * 2 / scale;
+                let y4 = row * 2 / scale;
+                let above_end = (x4 + width.max(8) / (4 * scale)).min(self.above_nonzero[plane].len());
+                let left_end = (y4 + height.max(8) / (4 * scale)).min(self.left_nonzero[plane].len());
+                if x4 < above_end { self.above_nonzero[plane][x4..above_end].fill(false); }
+                if y4 < left_end { self.left_nonzero[plane][y4..left_end].fill(false); }
+            }
+            return Ok((Vec::new(), [Vec::new(), Vec::new()], [false; 4], [false; 2], false));
+        }
         let mut luma = Vec::new();
         let mut chroma = [Vec::new(), Vec::new()];
         let mut luma_nonzero = [false; 4];
@@ -1512,14 +1522,10 @@ fn read_transform_with_reference(
     let mut token_cache = [0u8; 1024];
     let mut check_eob = true;
     let count = match tx_size { 3 => 1024, 2 => 256, 1 => 64, _ => 16 };
-    let size = 4usize << tx_size;
     let mut coefficients = vec![0; count];
     let mut first_token = None;
     let mut first_coefficient = None;
     let mut eob = 0;
-    const BAND_PREFIX: [usize; 21] = [
-        0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    ];
     let directional_scan = if reference_type != 0 || block_type != 0 || tx_size == 3 {
         0
     } else {
@@ -1529,44 +1535,14 @@ fn read_transform_with_reference(
             _ => 0,
         }
     };
-    for coefficient_index in 0..count {
-        let position = match tx_size {
-            3 => usize::from(DEFAULT_SCAN_32X32[coefficient_index]),
-            2 => usize::from(match directional_scan {
-                1 => ROW_SCAN_16X16[coefficient_index],
-                2 => COL_SCAN_16X16[coefficient_index],
-                _ => DEFAULT_SCAN_16X16[coefficient_index],
-            }),
-            1 => usize::from(match directional_scan {
-                1 => ROW_SCAN_8X8[coefficient_index],
-                2 => COL_SCAN_8X8[coefficient_index],
-                _ => DEFAULT_SCAN_8X8[coefficient_index],
-            }),
-            _ => usize::from(match directional_scan {
-                1 => ROW_SCAN_4X4[coefficient_index],
-                2 => COL_SCAN_4X4[coefficient_index],
-                _ => DEFAULT_SCAN_4X4[coefficient_index],
-            }),
-        };
+    for (coefficient_index, scan) in coefficient_scan(tx_size, directional_scan).iter().enumerate() {
+        let position = usize::from(scan.position);
         let context = if coefficient_index == 0 {
             initial_context
         } else {
-            let above = if position >= size { position - size } else { position - 1 };
-            let left = if position % size != 0 { position - 1 } else { above };
-            let (first, second) = if position >= size && position % size != 0 {
-                match directional_scan {
-                    1 => (left, left),
-                    2 => (above, above),
-                    _ => (above, left),
-                }
-            } else { (above, left) };
-            ((1 + token_cache[first] + token_cache[second]) >> 1) as usize
+            ((1 + token_cache[usize::from(scan.first)] + token_cache[usize::from(scan.second)]) >> 1) as usize
         };
-        let band = if tx_size == 0 && coefficient_index >= 13 {
-            5
-        } else {
-            BAND_PREFIX.get(coefficient_index).copied().unwrap_or(5)
-        };
+        let band = usize::from(scan.band);
         let probabilities = compressed.coef_probs[tx_size as usize][block_type][reference_type][band][context];
         if check_eob {
             let more = bits.read(probabilities[0])?;

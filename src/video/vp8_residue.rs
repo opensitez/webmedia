@@ -3,9 +3,10 @@
 use super::backend::MediaDecodeError;
 use super::vp8::{BoolDecoder, KeyFrameLayout, KeyMacroblockMode};
 use super::vp8_inter::{InterFrameLayout, InterMacroblock};
-use super::vp8_transform::{inverse_dct, inverse_walsh};
+use super::vp8_transform::{inverse_dct, inverse_dct_dc, inverse_walsh};
 
 pub(super) struct ResidualMacroblock {
+    pub(super) has_coefficients: bool,
     pub(super) y: [[i32; 16]; 16],
     pub(super) u: [[i32; 16]; 4],
     pub(super) v: [[i32; 16]; 4],
@@ -14,6 +15,7 @@ pub(super) struct ResidualMacroblock {
 impl Default for ResidualMacroblock {
     fn default() -> Self {
         Self {
+            has_coefficients: false,
             y: [[0; 16]; 16],
             u: [[0; 16]; 4],
             v: [[0; 16]; 4],
@@ -23,6 +25,7 @@ impl Default for ResidualMacroblock {
 
 pub(super) struct ResidueDecoder<'a> {
     partitions: Vec<Option<BoolDecoder<'a>>>,
+    quantizers: [[i32; 6]; 4],
     above_y2: Vec<bool>,
     above_y: Vec<bool>,
     above_u: Vec<bool>,
@@ -98,6 +101,7 @@ impl<'a> ResidueDecoder<'a> {
         let width = layout.macroblocks_wide();
         Ok(Self {
             partitions,
+            quantizers: std::array::from_fn(|segment| layout.dequant_factors(segment as u8)),
             above_y2: vec![false; width],
             above_y: vec![false; width * 4],
             above_u: vec![false; width * 2],
@@ -141,18 +145,21 @@ impl<'a> ResidueDecoder<'a> {
         let partition = self.partitions[partition_index]
             .as_mut()
             .ok_or_else(|| MediaDecodeError::InvalidData("empty VP8 token partition".into()))?;
-        let quant = layout.dequant_factors(mode.segment());
+        let quant = self.quantizers[mode.segment() as usize];
         let mut y2_dc = [0; 16];
         if has_y2 {
             let context = usize::from(self.above_y2[x]) + usize::from(self.left_y2);
             let (mut block, present) = layout.decode_coeff_block(partition, 1, context, 0)?;
+            result.has_coefficients |= present;
             self.above_y2[x] = present;
             self.left_y2 = present;
-            block[0] *= quant[2];
-            for value in &mut block[1..] {
-                *value *= quant[3];
+            if present {
+                block[0] *= quant[2];
+                for value in &mut block[1..] {
+                    *value *= quant[3];
+                }
+                y2_dc = inverse_walsh(&block);
             }
-            y2_dc = inverse_walsh(&block);
         }
         for block_y in 0..4 {
             for block_x in 0..4 {
@@ -168,6 +175,13 @@ impl<'a> ResidueDecoder<'a> {
                 )?;
                 *above = present;
                 *left = present;
+                result.has_coefficients |= present;
+                if !present {
+                    if has_y2 && y2_dc[index] != 0 {
+                        result.y[index] = inverse_dct_dc(y2_dc[index]);
+                    }
+                    continue;
+                }
                 if has_y2 {
                     block[0] = y2_dc[index];
                 } else {
@@ -193,6 +207,8 @@ impl<'a> ResidueDecoder<'a> {
                         layout.decode_coeff_block(partition, 2, context, 0)?;
                     *above = present;
                     *left = present;
+                    result.has_coefficients |= present;
+                    if !present { continue; }
                     block[0] *= quant[4];
                     for value in &mut block[1..] {
                         *value *= quant[5];

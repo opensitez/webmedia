@@ -379,14 +379,15 @@ impl<'a> KeyFrameLayout<'a> {
     }
 
     pub fn filter_level(&self, segment: u8, luma_mode: u8) -> u8 {
+        if self.loop_filter_level == 0 { return 0; }
         let base = if self.segment_absolute {
             self.segment_filter_levels[segment as usize]
         } else {
             i16::from(self.loop_filter_level) + self.segment_filter_levels[segment as usize]
-        };
+        }.clamp(0, 63);
         let level = if self.filter_adjustments {
             base + self.reference_filter_deltas[0]
-                + self.mode_filter_deltas[usize::from(luma_mode == 4)]
+                + if luma_mode == 4 { self.mode_filter_deltas[0] } else { 0 }
         } else {
             base
         };
@@ -483,7 +484,7 @@ mod tests {
 
     #[test]
     fn bulk_arithmetic_refill_matches_bitwise_reader() {
-        for length in [2, 3, 17, 128] {
+        for length in [2, 3, 4, 7, 8, 9, 17, 31, 32, 33, 128, 257, 1024] {
             let mut seed = 31u32;
             let data: Vec<u8> = (0..length).map(|_| {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
