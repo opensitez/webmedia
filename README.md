@@ -6,10 +6,17 @@ scheduling, and presentation.
 
 The `bitmap` module decodes PNG, JPEG, GIF, WebP, and BMP bytes into
 premultiplied RGBA8 pixels. Its complete-buffer API returns the first frame of
-an animated file. The `video` module offers incremental Y4M and MP4/AVC video
-decoders, plus AV1 OBU framing. AV1 framing is **not** an AV1 pixel decoder.
+an animated file. The `video` module offers incremental Y4M, WebM (VP8/VP9),
+and MP4 (AVC/VP8/VP9) video decoders, plus AV1 OBU framing.
+AV1 framing is **not** an AV1 pixel decoder.
 MP4/AVC decoding supports a subset of 2003 baseline and 2005 high-profile
 features; unsupported streams return `MediaDecodeError::Unsupported`.
+VP8 regression fixtures cover versions 0-3, hidden alternate-reference frames,
+one, two, four, and eight token partitions, delta/absolute segmentation features,
+segment-map persistence, odd-sized pictures,
+and byte-by-byte streaming. Rejected interframes leave committed entropy,
+segmentation, filter settings, and reference frames unchanged.
+Reserved VP8 versions return `MediaDecodeError::Unsupported`.
 The optional `font` module decodes WOFF1 and WOFF2 to sfnt bytes and provides
 EOT parsing and page-scoped decoding, including MTX-compressed EOT.
 
