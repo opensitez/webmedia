@@ -60,6 +60,24 @@ pub trait StreamingVideoDecoder {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum MediaSample {
+    Video(VideoFrame),
+    Audio {
+        timestamp_ns: i64,
+        samples: AudioSamples,
+    },
+    /// A failed audio track must not stop an independently decodable video track.
+    AudioError(MediaDecodeError),
+}
+
+pub trait StreamingMediaDecoder {
+    fn push_media(&mut self, bytes: &[u8]) -> Result<Vec<MediaSample>, MediaDecodeError>;
+    fn metadata(&self) -> Option<MediaMetadata>;
+    fn finish(&self) -> Result<(), MediaDecodeError>;
+    fn has_buffered_samples(&self) -> bool;
+}
+
 pub struct NullMediaDecoder;
 
 impl MediaDecoder for NullMediaDecoder {

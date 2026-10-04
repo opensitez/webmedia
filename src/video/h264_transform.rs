@@ -101,7 +101,8 @@ pub fn inverse_luma16x16_dc(levels: &[i32; 16], qp: i32) -> Result<[i32; 16], Av
         )));
     }
     let mut scaled = [0i32; 16];
-    let factor = i64::from(LEVEL_SCALE[(qp % 6) as usize][0]);
+    // LevelScale includes the flat scaling-list weight of 16 (2005, 8-312).
+    let factor = 16 * i64::from(LEVEL_SCALE[(qp % 6) as usize][0]);
     for column in 0..4 {
         let transformed =
             inverse_hadamard_4(std::array::from_fn(|row| horizontal[row * 4 + column]));
@@ -118,7 +119,12 @@ pub fn inverse_luma16x16_dc(levels: &[i32; 16], qp: i32) -> Result<[i32; 16], Av
                 .ok_or(AvcError::InvalidData("scaled Intra16x16 DC out of range"))?;
         }
     }
-    Ok(std::array::from_fn(|block| scaled[FRAME_ZIGZAG[block]]))
+    // Figure 8-6 assigns DC samples in luma block order, not coefficient scan order.
+    Ok(std::array::from_fn(|block| {
+        let row = (block / 8) * 2 + (block % 4) / 2;
+        let column = ((block / 4) % 2) * 2 + block % 2;
+        scaled[row * 4 + column]
+    }))
 }
 
 pub fn inverse_8x8_frame_scan(levels: &[i32; 64]) -> [i32; 64] {
@@ -320,10 +326,37 @@ mod tests {
     fn intra16x16_dc_hadamard_and_qp_scaling() {
         let mut levels = [0; 16];
         levels[0] = 512;
-        assert_eq!(inverse_luma16x16_dc(&levels, 0).unwrap(), [80; 16]);
-        assert_eq!(inverse_luma16x16_dc(&levels, 6).unwrap(), [160; 16]);
+        assert_eq!(inverse_luma16x16_dc(&levels, 0).unwrap(), [1280; 16]);
+        assert_eq!(inverse_luma16x16_dc(&levels, 6).unwrap(), [2560; 16]);
         assert!(inverse_luma16x16_dc(&levels, 52).is_err());
         assert!(inverse_luma16x16_dc(&[1_000_000; 16], 51).is_err());
+    }
+
+    #[test]
+    fn intra16x16_dc_matches_hadamard_matrix_and_luma_block_assignment() {
+        let signs = [[1, 1, 1, 1], [1, 1, -1, -1], [1, -1, -1, 1], [1, -1, 1, -1]];
+        let levels = std::array::from_fn(|i| i as i32 % 3 - 1);
+        let c = inverse_4x4_frame_scan(&levels);
+        for qp in 0..=51 {
+            let actual = inverse_luma16x16_dc(&levels, qp).unwrap();
+            for block in 0..16 {
+                let row = (block / 8) * 2 + (block % 4) / 2;
+                let col = ((block / 4) % 2) * 2 + block % 2;
+                let mut f = 0;
+                for i in 0..4 {
+                    for j in 0..4 {
+                        f += signs[row][i] * c[i * 4 + j] * signs[col][j];
+                    }
+                }
+                let product = f * LEVEL_SCALE[(qp % 6) as usize][0];
+                let expected = if qp >= 12 {
+                    product << (qp / 6 - 2)
+                } else {
+                    (product + (1 << (1 - qp / 6))) >> (2 - qp / 6)
+                };
+                assert_eq!(actual[block], expected, "qp={qp} block={block}");
+            }
+        }
     }
 
     #[test]

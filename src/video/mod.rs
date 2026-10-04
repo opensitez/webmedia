@@ -46,5 +46,5 @@ pub mod y4m;
 
 pub use backend::{
     AudioSamples, DecodedMedia, MediaDecodeError, MediaDecoder, MediaMetadata, NullMediaDecoder,
-    StreamingVideoDecoder, VideoFrame,
+    MediaSample, StreamingMediaDecoder, StreamingVideoDecoder, VideoFrame,
 };

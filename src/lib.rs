@@ -6,5 +6,8 @@ pub mod bitmap;
 #[cfg(feature = "video")]
 pub mod video;
 
+#[cfg(feature = "video")]
+pub mod audio;
+
 #[cfg(feature = "font")]
 pub mod font;

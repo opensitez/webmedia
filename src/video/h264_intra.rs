@@ -576,9 +576,9 @@ pub fn reconstruct_chroma(
                 .map(|&value| u32::from(value))
                 .sum::<u32>()
         });
-        let (top, side) = match (qx, qy) {
-            (1, 0) => (top, None),
-            (0, 1) => (None, side),
+        let (top, side) = match (qx, qy, top.is_some(), side.is_some()) {
+            (1, 0, true, true) => (top, None),
+            (0, 1, true, true) => (None, side),
             _ => (top, side),
         };
         let prediction = match (top, side) {
@@ -699,7 +699,7 @@ mod tests {
         let pixels =
             reconstruct_intra16x16_luma(1, &levels, &[[0; 15]; 16], 0, None, Some([64; 16]), None)
                 .unwrap();
-        assert_eq!(pixels, [65; 256]);
+        assert_eq!(pixels, [84; 256]);
         assert_eq!(predict_intra16x16(2, None, None, None).unwrap(), [128; 256]);
         assert!(predict_intra16x16(3, Some([64; 16]), Some([64; 16]), None).is_err());
     }
@@ -724,6 +724,20 @@ mod tests {
         assert_eq!(pixels[4], 10);
         assert_eq!(pixels[32], 30);
         assert_eq!(pixels[36], 20);
+    }
+
+    #[test]
+    fn chroma_dc_missing_edge_uses_the_available_edge_in_every_quadrant() {
+        let top = [20, 20, 20, 20, 60, 60, 60, 60];
+        let left = [40, 40, 40, 40, 80, 80, 80, 80];
+        let top_only = reconstruct_chroma_dc_only(&[0; 4], 26, Some(top), None).unwrap();
+        let left_only = reconstruct_chroma_dc_only(&[0; 4], 26, None, Some(left)).unwrap();
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(top_only[y * 8 + x], if x < 4 { 20 } else { 60 });
+                assert_eq!(left_only[y * 8 + x], if y < 4 { 40 } else { 80 });
+            }
+        }
     }
 
     #[test]

@@ -1179,7 +1179,7 @@ pub(super) fn frame_from_yuv420(
     cr: &[u8],
 ) -> super::VideoFrame {
     #[cfg(target_arch = "aarch64")]
-    let rgba = unsafe { rgba_from_yuv420_neon::<true>(sps, luma, cb, cr) };
+    let rgba = unsafe { rgba_from_yuv420_neon::<true, true>(sps, luma, cb, cr) };
     #[cfg(not(target_arch = "aarch64"))]
     let rgba = rgba_from_yuv420_scalar(sps, luma, cb, cr);
     super::VideoFrame {
@@ -1214,7 +1214,7 @@ fn rgba_from_yuv420_scalar(sps: &SequenceParameters, luma: &[u8], cb: &[u8], cr:
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool>(
+unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool, const PAIR_ROWS: bool>(
     sps: &SequenceParameters,
     luma: &[u8],
     cb: &[u8],
@@ -1224,25 +1224,33 @@ unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool>(
 
     #[inline]
     #[target_feature(enable = "neon")]
-    unsafe fn convert_four(
-        y: int16x4_t,
-        u: int16x4_t,
-        v: int16x4_t,
-    ) -> (uint16x4_t, uint16x4_t, uint16x4_t) {
-        let y = vmovl_s16(y);
+    unsafe fn chroma_terms(u: int16x4_t, v: int16x4_t) -> (int32x4_t, int32x4_t, int32x4_t) {
         let u = vsubq_s32(vmovl_s16(u), vdupq_n_s32(128));
         let v = vsubq_s32(vmovl_s16(v), vdupq_n_s32(128));
+        (
+            vmlaq_n_s32(vdupq_n_s32(128), v, 409),
+            vsubq_s32(
+                vsubq_s32(vdupq_n_s32(128), vmulq_n_s32(u, 100)),
+                vmulq_n_s32(v, 208),
+            ),
+            vmlaq_n_s32(vdupq_n_s32(128), u, 516),
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn convert_four(
+        y: int16x4_t,
+        terms: (int32x4_t, int32x4_t, int32x4_t),
+    ) -> (uint16x4_t, uint16x4_t, uint16x4_t) {
+        let y = vmovl_s16(y);
         let c = vmulq_n_s32(
             vmaxq_s32(vsubq_s32(y, vdupq_n_s32(16)), vdupq_n_s32(0)),
             298,
         );
-        let round = vdupq_n_s32(128);
-        let red = vshrq_n_s32::<8>(vaddq_s32(vmlaq_n_s32(c, v, 409), round));
-        let green = vshrq_n_s32::<8>(vaddq_s32(
-            vsubq_s32(vsubq_s32(c, vmulq_n_s32(u, 100)), vmulq_n_s32(v, 208)),
-            round,
-        ));
-        let blue = vshrq_n_s32::<8>(vaddq_s32(vmlaq_n_s32(c, u, 516), round));
+        let red = vshrq_n_s32::<8>(vaddq_s32(c, terms.0));
+        let green = vshrq_n_s32::<8>(vaddq_s32(c, terms.1));
+        let blue = vshrq_n_s32::<8>(vaddq_s32(c, terms.2));
         (vqmovun_s32(red), vqmovun_s32(green), vqmovun_s32(blue))
     }
 
@@ -1251,7 +1259,8 @@ unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool>(
         let height = sps.height as usize;
         let chroma_width = width / 2;
         let mut rgba = vec![0u8; width * height * 4];
-        for y in 0..height {
+        for y in (0..height).step_by(if PAIR_ROWS { 2 } else { 1 }) {
+            let rows = if PAIR_ROWS { (height - y).min(2) } else { 1 };
             let uv_row = y / 2 * chroma_width;
             let mut x = 0;
             while x + 8 <= width {
@@ -1269,31 +1278,37 @@ unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool>(
                     }
                     (vld1_u8(u.as_ptr()), vld1_u8(v.as_ptr()))
                 };
-                let y8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(luma.as_ptr().add(y * width + x))));
                 let u8 = vreinterpretq_s16_u16(vmovl_u8(u8));
                 let v8 = vreinterpretq_s16_u16(vmovl_u8(v8));
-                let (r0, g0, b0) =
-                    convert_four(vget_low_s16(y8), vget_low_s16(u8), vget_low_s16(v8));
-                let (r1, g1, b1) =
-                    convert_four(vget_high_s16(y8), vget_high_s16(u8), vget_high_s16(v8));
-                let red = vqmovn_u16(vcombine_u16(r0, r1));
-                let green = vqmovn_u16(vcombine_u16(g0, g1));
-                let blue = vqmovn_u16(vcombine_u16(b0, b1));
-                let channels = uint8x8x4_t(red, green, blue, vdup_n_u8(255));
-                vst4_u8(rgba.as_mut_ptr().add((y * width + x) * 4), channels);
+                let low = chroma_terms(vget_low_s16(u8), vget_low_s16(v8));
+                let high = chroma_terms(vget_high_s16(u8), vget_high_s16(v8));
+                for row in y..y + rows {
+                    let y8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(
+                        luma.as_ptr().add(row * width + x),
+                    )));
+                    let (r0, g0, b0) = convert_four(vget_low_s16(y8), low);
+                    let (r1, g1, b1) = convert_four(vget_high_s16(y8), high);
+                    let red = vqmovn_u16(vcombine_u16(r0, r1));
+                    let green = vqmovn_u16(vcombine_u16(g0, g1));
+                    let blue = vqmovn_u16(vcombine_u16(b0, b1));
+                    let channels = uint8x8x4_t(red, green, blue, vdup_n_u8(255));
+                    vst4_u8(rgba.as_mut_ptr().add((row * width + x) * 4), channels);
+                }
                 x += 8;
             }
             while x < width {
-                let value = i32::from(luma[y * width + x]) - 16;
                 let uv = uv_row + x / 2;
                 let u = i32::from(cb[uv]) - 128;
                 let v = i32::from(cr[uv]) - 128;
-                let c = value.max(0) * 298;
-                let offset = (y * width + x) * 4;
-                rgba[offset] = ((c + 409 * v + 128) >> 8).clamp(0, 255) as u8;
-                rgba[offset + 1] = ((c - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
-                rgba[offset + 2] = ((c + 516 * u + 128) >> 8).clamp(0, 255) as u8;
-                rgba[offset + 3] = 255;
+                for row in y..y + rows {
+                    let value = i32::from(luma[row * width + x]) - 16;
+                    let c = value.max(0) * 298;
+                    let offset = (row * width + x) * 4;
+                    rgba[offset] = ((c + 409 * v + 128) >> 8).clamp(0, 255) as u8;
+                    rgba[offset + 1] = ((c - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
+                    rgba[offset + 2] = ((c + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+                    rgba[offset + 3] = 255;
+                }
                 x += 1;
             }
         }
@@ -1346,8 +1361,10 @@ mod tests {
                 .map(|i| ((i * 71 + 29) & 255) as u8)
                 .collect();
             let expected = rgba_from_yuv420_scalar(&sps, &luma, &cb, &cr);
-            let actual = unsafe { rgba_from_yuv420_neon::<true>(&sps, &luma, &cb, &cr) };
+            let actual = unsafe { rgba_from_yuv420_neon::<true, true>(&sps, &luma, &cb, &cr) };
             assert_eq!(actual, expected, "width {width}");
+            let single = unsafe { rgba_from_yuv420_neon::<true, false>(&sps, &luma, &cb, &cr) };
+            assert_eq!(single, expected, "single row width {width}");
         }
     }
 
@@ -1383,18 +1400,18 @@ mod tests {
             .map(|i| ((i * 71 + 29) & 255) as u8)
             .collect();
         let runs = 40;
-        for vector_chroma_load in [false, true, true, false] {
+        for pair_rows in [false, true, true, false] {
             let start = std::time::Instant::now();
             for _ in 0..runs {
-                let rgba = if vector_chroma_load {
-                    unsafe { rgba_from_yuv420_neon::<true>(&sps, &luma, &cb, &cr) }
+                let rgba = if pair_rows {
+                    unsafe { rgba_from_yuv420_neon::<true, true>(&sps, &luma, &cb, &cr) }
                 } else {
-                    unsafe { rgba_from_yuv420_neon::<false>(&sps, &luma, &cb, &cr) }
+                    unsafe { rgba_from_yuv420_neon::<true, false>(&sps, &luma, &cb, &cr) }
                 };
                 std::hint::black_box(rgba);
             }
             eprintln!(
-                "1280x720 x{runs}: vector chroma load={vector_chroma_load}: {:?}",
+                "1280x720 x{runs}: paired rows={pair_rows}: {:?}",
                 start.elapsed()
             );
         }

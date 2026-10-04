@@ -1,6 +1,53 @@
 //! Incremental AV1 low-overhead bitstream framing.
 //!
-//! This is the byte-stream boundary for a local AV1 decoder, not a pixel decoder.
+//! Framing remains independent of the staged, clean-room decoder components.
+
+#[path = "av1/blend.rs"]
+mod blend;
+#[path = "av1/blend_tables.rs"]
+mod blend_tables;
+#[path = "av1/coefficients.rs"]
+mod coefficients;
+#[path = "av1/decoder.rs"]
+mod decoder;
+#[path = "av1/entropy.rs"]
+pub mod entropy;
+#[path = "av1/filters.rs"]
+mod filters;
+#[path = "av1/inter.rs"]
+mod inter;
+#[path = "av1/inter_tables.rs"]
+mod inter_tables;
+#[path = "av1/intra.rs"]
+mod intra;
+#[path = "av1/motion.rs"]
+mod motion;
+#[path = "av1/motion_tables.rs"]
+mod motion_tables;
+#[path = "av1/prediction.rs"]
+mod prediction;
+#[cfg(test)]
+#[path = "av1/profile.rs"]
+mod profile;
+#[path = "av1/reconstruction.rs"]
+pub mod reconstruction;
+#[path = "av1/restoration.rs"]
+mod restoration;
+#[path = "av1/syntax.rs"]
+pub mod syntax;
+#[path = "av1/tables.rs"]
+mod tables;
+#[path = "av1/temporal.rs"]
+mod temporal;
+#[path = "av1/transform.rs"]
+mod transform;
+#[path = "av1/warp.rs"]
+mod warp;
+#[path = "av1/warp_tables.rs"]
+mod warp_tables;
+pub use decoder::inspect_intra_decode;
+pub use decoder::{Av1Decoder, DecodedFrame, DecodedIntraFrame, DecodedPlane, decode_intra_frame};
+pub use intra::{IntraBlockInfo, IntraDecodeProgress};
 
 const MAX_OBU_BYTES: usize = 64 * 1024 * 1024;
 
@@ -10,6 +57,33 @@ pub struct Obu {
     pub temporal_id: u8,
     pub spatial_id: u8,
     pub payload: Vec<u8>,
+}
+
+/// Parsed coded intra frame, deliberately distinct from a decoded pixel frame.
+pub struct CodedIntraFrame<'a> {
+    pub header: syntax::IntraFrameHeader,
+    pub tiles: Vec<(usize, &'a [u8])>,
+}
+
+impl<'a> CodedIntraFrame<'a> {
+    pub fn parse(obu: &'a Obu, sequence: &syntax::SequenceHeader) -> Result<Self, syntax::Error> {
+        if obu.kind != 6 {
+            return Err(syntax::Error::Unsupported("expected combined OBU_FRAME"));
+        }
+        let header = syntax::IntraFrameHeader::parse(
+            &obu.payload,
+            sequence,
+            obu.temporal_id,
+            obu.spatial_id,
+        )?;
+        let tiles = syntax::tile_group(&obu.payload[header.header_bytes..], &header.tiles)?;
+        if tiles.len() != header.tiles.count() {
+            return Err(syntax::Error::Invalid(
+                "combined frame must contain all tiles",
+            ));
+        }
+        Ok(Self { header, tiles })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

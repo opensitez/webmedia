@@ -31,6 +31,8 @@ pub struct Yuv420Picture {
     pub cb: Vec<u8>,
     pub cr: Vec<u8>,
     pub motion: Vec<[MotionCell; 4]>,
+    // Reference identities at decode time, retained for temporal-direct mapping.
+    pub(super) reference_pocs: [Vec<i32>; 2],
     pub(super) luma_half: std::sync::OnceLock<super::h264_inter::HalfPelPlanes>,
 }
 
@@ -473,6 +475,7 @@ pub fn decode_cabac_i_yuv_2005(
             cb,
             cr,
             motion: vec![[MotionCell::default(); 4]; mb_count],
+            reference_pocs: Default::default(),
             luma_half: std::sync::OnceLock::new(),
         },
         slice.marking,

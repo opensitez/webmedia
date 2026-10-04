@@ -9,6 +9,12 @@ use super::vp8_residue::ResidueDecoder;
 use super::vp8_residue::ResidualMacroblock;
 use std::sync::Arc;
 
+#[derive(Clone, Copy)]
+pub(super) enum YuvMatrix {
+    Bt601,
+    Bt709,
+}
+
 #[derive(Clone)]
 pub(super) struct YuvKeyFrame {
     pub(super) width: usize,
@@ -132,10 +138,21 @@ impl YuvKeyFrame {
     }
 
     pub(super) fn rgba(&self) -> Vec<u8> {
-        self.rgba_row_pairs::<true>()
+        self.rgba_with_matrix(YuvMatrix::Bt601)
+    }
+
+    pub(super) fn rgba_with_matrix(&self, matrix: YuvMatrix) -> Vec<u8> {
+        match matrix {
+            YuvMatrix::Bt601 => self.rgba_row_pairs::<true>(),
+            YuvMatrix::Bt709 => self.rgba_row_pairs_matrix::<true, true>(),
+        }
     }
 
     fn rgba_row_pairs<const VECTOR: bool>(&self) -> Vec<u8> {
+        self.rgba_row_pairs_matrix::<VECTOR, false>()
+    }
+
+    fn rgba_row_pairs_matrix<const VECTOR: bool, const BT709: bool>(&self) -> Vec<u8> {
         let mut rgba = vec![0; self.width * self.height * 4];
         if self.width == 0 { return rgba; }
         for (pair, output) in rgba.chunks_mut(self.width * 8).enumerate() {
@@ -150,20 +167,20 @@ impl YuvKeyFrame {
             #[cfg(target_arch = "aarch64")]
             let processed = if VECTOR {
                 if next_luma.is_empty() {
-                    unsafe { rgba_row_neon(luma, u, v, target) }
+                    unsafe { rgba_row_neon_matrix::<BT709>(luma, u, v, target) }
                 } else {
-                    unsafe { rgba_two_rows_neon(luma, next_luma, u, v, target, next_target) }
+                    unsafe { rgba_two_rows_neon_matrix::<BT709>(luma, next_luma, u, v, target, next_target) }
                 }
             } else { 0 };
             #[cfg(not(target_arch = "aarch64"))]
             let processed = 0;
-            rgba_two_rows_scalar(luma, next_luma, u, v, target, next_target, processed);
+            rgba_two_rows_scalar::<BT709>(luma, next_luma, u, v, target, next_target, processed);
         }
         rgba
     }
 }
 
-fn rgba_two_rows_scalar(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
+fn rgba_two_rows_scalar<const BT709: bool>(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
     first_target: &mut [u8], second_target: &mut [u8], start: usize)
 {
     #[inline]
@@ -179,9 +196,10 @@ fn rgba_two_rows_scalar(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
     for x in (start..first.len()).step_by(2) {
         let cb = i32::from(cb[x / 2]) - 128;
         let cr = i32::from(cr[x / 2]) - 128;
-        let red = 409 * cr + 128;
-        let green = -100 * cb - 208 * cr + 128;
-        let blue = 516 * cb + 128;
+        let red = (if BT709 { 459 } else { 409 }) * cr + 128;
+        let green = -(if BT709 { 55 } else { 100 }) * cb
+            - (if BT709 { 136 } else { 208 }) * cr + 128;
+        let blue = (if BT709 { 541 } else { 516 }) * cb + 128;
         let end = (x + 2).min(first.len());
         write(&first[x..end], &mut first_target[x * 4..end * 4], red, green, blue);
         if !second.is_empty() {
@@ -191,8 +209,17 @@ fn rgba_two_rows_scalar(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(test)]
 #[target_feature(enable = "neon")]
 unsafe fn rgba_two_rows_neon(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
+    first_target: &mut [u8], second_target: &mut [u8]) -> usize
+{
+    unsafe { rgba_two_rows_neon_matrix::<false>(first, second, cb, cr, first_target, second_target) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rgba_two_rows_neon_matrix<const BT709: bool>(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
     first_target: &mut [u8], second_target: &mut [u8]) -> usize
 {
     use std::arch::aarch64::*;
@@ -200,9 +227,9 @@ unsafe fn rgba_two_rows_neon(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
         let cb = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cb)), vdupq_n_s16(128));
         let cr = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cr)), vdupq_n_s16(128));
         let terms = |cb, cr| (
-            vmull_n_s16(cr, 409),
-            vsubq_s32(vnegq_s32(vmull_n_s16(cb, 100)), vmull_n_s16(cr, 208)),
-            vmull_n_s16(cb, 516),
+            vmull_n_s16(cr, if BT709 { 459 } else { 409 }),
+            vsubq_s32(vnegq_s32(vmull_n_s16(cb, if BT709 { 55 } else { 100 })), vmull_n_s16(cr, if BT709 { 136 } else { 208 })),
+            vmull_n_s16(cb, if BT709 { 541 } else { 516 }),
         );
         [terms(vget_low_s16(cb), vget_low_s16(cr)),
             terms(vget_high_s16(cb), vget_high_s16(cr))]
@@ -227,7 +254,7 @@ unsafe fn rgba_two_rows_neon(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
         let u = unsafe { vld1_u8(cb[x / 2..x / 2 + 8].as_ptr()) };
         let v = unsafe { vld1_u8(cr[x / 2..x / 2 + 8].as_ptr()) };
         // Each chroma sample serves a 2x2 luma block; retain its wide products
-        // for both output rows without changing BT.601 rounding or saturation.
+        // for both output rows without changing rounding or saturation.
         let lo = chroma(vzip1_u8(u, u), vzip1_u8(v, v));
         unsafe {
             vst4_u8(first_target[x * 4..x * 4 + 32].as_mut_ptr(), convert(vget_low_u8(a), &lo));
@@ -243,8 +270,15 @@ unsafe fn rgba_two_rows_neon(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(test)]
 #[target_feature(enable = "neon")]
 unsafe fn rgba_row_neon(luma: &[u8], cb: &[u8], cr: &[u8], target: &mut [u8]) -> usize {
+    unsafe { rgba_row_neon_matrix::<false>(luma, cb, cr, target) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rgba_row_neon_matrix<const BT709: bool>(luma: &[u8], cb: &[u8], cr: &[u8], target: &mut [u8]) -> usize {
     use std::arch::aarch64::*;
     let convert_eight = |luma, cb, cr| {
         let luma = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(luma)), vdupq_n_s16(16));
@@ -252,9 +286,9 @@ unsafe fn rgba_row_neon(luma: &[u8], cb: &[u8], cr: &[u8], target: &mut [u8]) ->
         let cr = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cr)), vdupq_n_s16(128));
         let convert_four = |luma, cb, cr| {
             let base = vmull_n_s16(luma, 298);
-            let red = vmlal_n_s16(base, cr, 409);
-            let green = vsubq_s32(vsubq_s32(base, vmull_n_s16(cb, 100)), vmull_n_s16(cr, 208));
-            let blue = vmlal_n_s16(base, cb, 516);
+            let red = vmlal_n_s16(base, cr, if BT709 { 459 } else { 409 });
+            let green = vsubq_s32(vsubq_s32(base, vmull_n_s16(cb, if BT709 { 55 } else { 100 })), vmull_n_s16(cr, if BT709 { 136 } else { 208 }));
+            let blue = vmlal_n_s16(base, cb, if BT709 { 541 } else { 516 });
             let rounded = |value| vqmovun_s32(vshrq_n_s32::<8>(vaddq_s32(value, vdupq_n_s32(128))));
             (rounded(red), rounded(green), rounded(blue))
         };
@@ -282,6 +316,51 @@ unsafe fn rgba_row_neon(luma: &[u8], cb: &[u8], cr: &[u8], target: &mut [u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bt709_vector_conversion_matches_scalar_with_odd_rows_and_tails() {
+        for width in 1..=65 {
+            for height in 1..=5 {
+                let mut frame = YuvKeyFrame::new(width, height);
+                for (plane, seed) in [(&mut frame.y, 17), (&mut frame.u, 43), (&mut frame.v, 71)] {
+                    for (index, sample) in plane.pixels.iter_mut().enumerate() {
+                        *sample = (index * seed + 13) as u8;
+                    }
+                }
+                assert_eq!(frame.rgba_with_matrix(YuvMatrix::Bt709), frame.rgba_row_pairs_matrix::<false, true>());
+            }
+        }
+    }
+
+    #[test]
+    fn bt709_conversion_matches_independent_primary_color_equations() {
+        let mut frame = YuvKeyFrame::new(1, 1);
+        let kr = 0.2126;
+        let kb = 0.0722;
+        let kg = 1.0 - kr - kb;
+        for y in [0, 1, 16, 32, 80, 100, 235, 255] {
+            for cb in [0, 16, 128, 240, 255] {
+                for cr in [0, 16, 128, 240, 255] {
+                    frame.y.pixels[0] = y;
+                    frame.u.pixels[0] = cb;
+                    frame.v.pixels[0] = cr;
+                    let luma = (f64::from(y) - 16.0) * 255.0 / 219.0;
+                    let u = (f64::from(cb) - 128.0) * 255.0 / 224.0;
+                    let v = (f64::from(cr) - 128.0) * 255.0 / 224.0;
+                    let expected = [
+                        luma + 2.0 * (1.0 - kr) * v,
+                        luma - 2.0 * kb * (1.0 - kb) / kg * u - 2.0 * kr * (1.0 - kr) / kg * v,
+                        luma + 2.0 * (1.0 - kb) * u,
+                    ];
+                    let actual = frame.rgba_with_matrix(YuvMatrix::Bt709);
+                    for (value, expected) in actual.iter().zip(expected) {
+                        assert!((f64::from(*value) - expected.clamp(0.0, 255.0).round()).abs() <= 1.0);
+                    }
+                    assert_eq!(actual[3], 255);
+                }
+            }
+        }
+    }
 
     fn scalar_rgba(frame: &YuvKeyFrame) -> Vec<u8> {
         let mut rgba = vec![0; frame.width * frame.height * 4];
@@ -336,7 +415,7 @@ mod tests {
                 &mut paired[4..68], &mut next[4..68]), 16); }
             assert_eq!(paired, actual);
             let mut expected_next = [91u8; 72];
-            rgba_two_rows_scalar(&second, &[], &u, &v, &mut expected_next[4..68], &mut [], 0);
+            rgba_two_rows_scalar::<false>(&second, &[], &u, &v, &mut expected_next[4..68], &mut [], 0);
             assert_eq!(next, expected_next);
             assert!(actual[..4].iter().chain(&actual[68..]).all(|&sample| sample == 91));
             for lane in 0..16 {
@@ -365,7 +444,7 @@ mod tests {
                 let processed = if VECTOR { unsafe { rgba_row_neon(luma, u, v, target) } } else { 0 };
                 #[cfg(not(target_arch = "aarch64"))]
                 let processed = 0;
-                rgba_two_rows_scalar(luma, &[], u, v, target, &mut [], processed);
+                rgba_two_rows_scalar::<false>(luma, &[], u, v, target, &mut [], processed);
             }
             rgba
         }

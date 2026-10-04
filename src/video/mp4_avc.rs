@@ -825,6 +825,9 @@ mod tests {
             previous.offset as usize + previous.size as usize
         };
         decoder.push(&bytes[start_offset..preceding]).unwrap();
+        while decoder.next_sample < target && decoder.has_buffered_samples() {
+            decoder.push(&[]).unwrap();
+        }
         assert_eq!(decoder.next_sample, target);
         let (actual, picture, _, _) = Mp4AvcStream::decode_sample(
             &index,
@@ -870,10 +873,25 @@ mod tests {
                     .zip(expected_plane.iter())
                     .map(|(a, b)| u64::from(a.abs_diff(*b)))
                     .sum();
+                let max_error = actual_plane
+                    .chunks_exact(plane_width)
+                    .take(plane_height)
+                    .flatten()
+                    .zip(expected_plane.iter())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
                 eprintln!(
-                    "sample {target} {name} MAE={:.3}",
+                    "sample {target} {name} MAE={:.6} max={max_error}",
                     error as f64 / expected_plane.len() as f64
                 );
+                if let Ok(limit) = std::env::var("WEBCORE_H264_TARGET_MAX_YUV_MAE") {
+                    let limit: f64 = limit.parse().unwrap();
+                    assert!(
+                        error as f64 / expected_plane.len() as f64 <= limit,
+                        "sample {target} {name} exceeds MAE {limit}"
+                    );
+                }
             }
         }
         let reference = frame_from_yuv420(
@@ -931,6 +949,171 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "explicit native YUV decode benchmark; no RGBA conversion or pixel oracle"]
+    fn benchmark_site_native_yuv_decode() {
+        let path = std::env::var("WEBCORE_MP4_FULL_FIXTURE").expect("fixture required");
+        let count = std::env::var("WEBMEDIA_H264_BENCH_SAMPLES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(338);
+        let repeats = std::env::var("WEBMEDIA_H264_BENCH_REPEATS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
+        let compare_deblock = std::env::var_os("WEBMEDIA_H264_BENCH_DEBLOCK_AB").is_some();
+        let three_modes = std::env::var_os("WEBMEDIA_H264_BENCH_DEBLOCK_THREE").is_some();
+        let compare_deblock = compare_deblock || three_modes;
+        let modes: &[usize] = if three_modes { &[0, 1, 2] } else if compare_deblock { &[0, 2] } else { &[2] };
+        let bytes = std::fs::read(path).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let sps = &index.config.sequence_parameters[0];
+        let pps = parse_pps_2005(&index.config.picture_parameter_sets[0]).unwrap();
+        assert!(count > 0 && count <= index.samples.len() && repeats > 0);
+        let inputs: Vec<_> = index.samples[..count]
+            .iter()
+            .map(|sample| {
+                let payload =
+                    &bytes[sample.offset as usize..sample.offset as usize + sample.size as usize];
+                let mut stream = NalStream::new(index.config.nal_length_size).unwrap();
+                let nals = stream.push(payload).unwrap();
+                stream.finish().unwrap();
+                let mut pictures = nals.into_iter().filter(|nal| matches!(nal[0] & 31, 1 | 5));
+                let nal = pictures.next().expect("picture NAL");
+                assert!(pictures.next().is_none(), "single-slice benchmark required");
+                let kind = parse_slice_type(&nal).unwrap() % 5;
+                let marking = if kind != 2 {
+                    parse_cabac_inter_slice(&nal, sps, &pps.core)
+                        .unwrap()
+                        .marking
+                } else {
+                    Vec::new()
+                };
+                (nal, kind, marking)
+            })
+            .collect();
+        eprintln!(
+            "native YUV benchmark pid={} {}x{} samples={count} repeats={repeats}",
+            std::process::id(),
+            sps.width,
+            sps.height
+        );
+        for run in 0..repeats {
+            let mut references: [Vec<Yuv420Picture>; 3] = std::array::from_fn(|_| Vec::new());
+            let mut times = [[std::time::Duration::ZERO; 3]; 3];
+            let mut counts = [[0usize; 3]; 3];
+            for (sample_number, (nal, kind, marking)) in inputs.iter().enumerate() {
+                let idr = nal[0] & 31 == 5;
+                let mut decoded = [None, None, None];
+                // Independent DPBs keep halfpel-cache construction inside both timers.
+                // Alternating the first decoder avoids a systematic warm-cache advantage.
+                for turn in 0..modes.len() {
+                    let mode = modes[(turn + sample_number + run) % modes.len()];
+                    let timer = std::time::Instant::now();
+                    let (picture, marking) =
+                        super::super::h264_deblock::with_deblock_mode(mode as u8, || match kind {
+                            0 => (
+                                decode_cabac_p_2005(nal, sps, &pps, &references[mode]).unwrap(),
+                                marking.clone(),
+                            ),
+                            1 => (
+                                decode_cabac_b_2005(nal, sps, &pps, &references[mode]).unwrap(),
+                                marking.clone(),
+                            ),
+                            2 if idr => (
+                                decode_cabac_idr_yuv_2005(nal, sps, &pps).unwrap(),
+                                Vec::new(),
+                            ),
+                            2 => decode_cabac_i_yuv_2005(nal, sps, &pps, references[mode].last())
+                                .unwrap(),
+                            _ => panic!("unsupported slice type"),
+                        });
+                    let slot = match kind {
+                        2 => 0,
+                        0 => 1,
+                        _ => 2,
+                    };
+                    times[mode][slot] += timer.elapsed();
+                    counts[mode][slot] += 1;
+                    std::hint::black_box(picture.luma[picture.luma.len() / 2]);
+                    decoded[mode] = Some((picture, marking));
+                }
+                for &mode in modes.iter().skip(1) {
+                    let a = &decoded[0].as_ref().unwrap().0;
+                    let b = &decoded[mode].as_ref().unwrap().0;
+                    assert_eq!(
+                        (
+                            a.width,
+                            a.height,
+                            a.frame_num,
+                            a.pic_order_cnt_lsb,
+                            a.pic_order_cnt_msb
+                        ),
+                        (
+                            b.width,
+                            b.height,
+                            b.frame_num,
+                            b.pic_order_cnt_lsb,
+                            b.pic_order_cnt_msb
+                        )
+                    );
+                    assert!(a.luma == b.luma, "sample {sample_number} Y differs");
+                    assert!(a.cb == b.cb, "sample {sample_number} Cb differs");
+                    assert!(a.cr == b.cr, "sample {sample_number} Cr differs");
+                    assert_eq!(
+                        a.motion, b.motion,
+                        "sample {sample_number} reference motion differs"
+                    );
+                    assert_eq!(
+                        a.reference_pocs, b.reference_pocs,
+                        "sample {sample_number} reference order differs"
+                    );
+                }
+                for &mode in modes {
+                    let (picture, marking) = decoded[mode].take().unwrap();
+                    if idr {
+                        references[mode].clear();
+                    }
+                    if nal[0] & 0x60 != 0 {
+                        let max_frame_num = 1u32 << sps.frame_num_bits;
+                        for operation in marking {
+                            let MemoryManagement::ForgetShortTerm(distance) = operation;
+                            let target = (picture.frame_num + max_frame_num
+                                - (distance + 1) % max_frame_num)
+                                % max_frame_num;
+                            let at = references[mode]
+                                .iter()
+                                .position(|p| p.frame_num == target)
+                                .unwrap();
+                            references[mode].remove(at);
+                        }
+                        references[mode].push(picture);
+                        if references[mode].len() > sps.max_num_ref_frames as usize {
+                            references[mode].remove(0);
+                        }
+                    }
+                }
+            }
+            for &mode in modes {
+                assert_eq!(counts[mode].iter().sum::<usize>(), count);
+                let total: std::time::Duration = times[mode].iter().sum();
+                eprintln!(
+                    "run {run} deblock_mode={}: native {:.3} ms/frame {:.1} fps; I/P/B counts={:?} totals_ms={:?}",
+                    ["scalar", "horizontal", "both"][mode],
+                    total.as_secs_f64() * 1000.0 / count as f64,
+                    count as f64 / total.as_secs_f64(),
+                    counts[mode],
+                    times[mode].map(|t| t.as_secs_f64() * 1000.0)
+                );
+            }
+            if compare_deblock {
+                eprintln!(
+                    "run {run}: {count} samples full-plane Y/Cb/Cr and reference metadata byte equality passed (checks excluded from timers)"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn site_gop_frame_error_profile() {
         let (Ok(fixture), Ok(raw), Ok(first), Ok(last)) = (
             std::env::var("WEBCORE_MP4_FULL_FIXTURE"),
@@ -951,14 +1134,23 @@ mod tests {
             .map(|sample| sample.presentation_time)
             .collect();
         presentation_times.sort_unstable();
+        let first_time = *presentation_times
+            .get(first)
+            .expect("requested first frame absent");
         let start = (0..=last)
             .rev()
-            .find(|&sample| index.samples[sample].keyframe)
+            .find(|&sample| {
+                index.samples[sample].keyframe
+                    && index.samples[sample].presentation_time <= first_time
+            })
             .unwrap();
         let width = index.config.sequence_parameters[0].width as usize;
         let height = index.config.sequence_parameters[0].height as usize;
         let y_size = width * height;
         let frame_size = y_size * 3 / 2;
+        assert_eq!(raw.len() % frame_size, 0, "oracle has a partial YUV frame");
+        let reference_frames = raw.len() / frame_size;
+        assert!(reference_frames > 0, "oracle contains no frames");
         let start_offset = index.samples[start].offset as usize;
         let end = &index.samples[last];
         let end_offset = end.offset as usize + end.size as usize;
@@ -970,6 +1162,9 @@ mod tests {
         while decoder.next_sample <= last && decoder.has_buffered_samples() {
             frames.extend(decoder.push(&[]).unwrap());
         }
+        let mut compared = 0;
+        let mut maximum_mae = 0.0f64;
+        let mut compared_indices = std::collections::BTreeSet::new();
         for frame in frames {
             let presentation_time = (frame.timestamp * index.timescale as f32).round() as i64;
             let number = presentation_times.partition_point(|&time| time < presentation_time);
@@ -977,9 +1172,16 @@ mod tests {
                 continue;
             }
             let offset = (number - first) * frame_size;
-            let Some(expected) = raw.get(offset..offset + frame_size) else {
-                continue;
-            };
+            let expected = raw.get(offset..offset + frame_size).unwrap_or_else(|| {
+                panic!(
+                    "frame {number} is outside oracle range {first}..{}",
+                    first + reference_frames
+                )
+            });
+            assert!(
+                compared_indices.insert(number),
+                "duplicate presentation index {number}"
+            );
             let reference = frame_from_yuv420(
                 &index.config.sequence_parameters[0],
                 &expected[..y_size],
@@ -996,10 +1198,52 @@ mod tests {
                         .sum::<u64>()
                 })
                 .sum();
-            eprintln!(
-                "frame {number} t={:.3} RGB MAE={:.3}",
-                frame.timestamp,
-                error as f64 / (y_size * 3) as f64
+            let mae = error as f64 / (y_size * 3) as f64;
+            compared += 1;
+            maximum_mae = maximum_mae.max(mae);
+            eprintln!("frame {number} t={:.3} RGB MAE={:.3}", frame.timestamp, mae);
+        }
+        assert!(compared > 0, "supplied oracle compared no frames");
+        assert_eq!(
+            compared_indices.first(),
+            Some(&first),
+            "requested first oracle frame was not decoded"
+        );
+        assert_eq!(
+            compared,
+            compared_indices.last().unwrap() - first + 1,
+            "oracle comparison has missing presentation indices"
+        );
+        eprintln!(
+            "oracle range {first}..{}; compared indices {:?}..{:?}",
+            first + reference_frames,
+            compared_indices.first(),
+            compared_indices.last()
+        );
+        eprintln!(
+            "compared {compared} frames; maximum RGB MAE={maximum_mae:.6}; drops=({}, {})",
+            decoder.dropped_nonreference_samples, decoder.dropped_until_idr_samples
+        );
+        if let Ok(limit) = std::env::var("WEBCORE_H264_GOP_MAX_RGB_MAE") {
+            let limit: f64 = limit.parse().unwrap();
+            assert!(
+                maximum_mae <= limit,
+                "maximum RGB MAE {maximum_mae} exceeds {limit}"
+            );
+            assert_eq!(
+                decoder.next_sample,
+                last + 1,
+                "decode error: {:?}",
+                decoder.decode_error
+            );
+            assert_eq!(decoder.dropped_nonreference_samples, 0);
+            assert_eq!(decoder.dropped_until_idr_samples, 0);
+        }
+        if let Ok(minimum) = std::env::var("WEBCORE_H264_GOP_MIN_FRAMES") {
+            let minimum: usize = minimum.parse().unwrap();
+            assert!(
+                compared >= minimum,
+                "compared only {compared} frames, expected {minimum}"
             );
         }
     }

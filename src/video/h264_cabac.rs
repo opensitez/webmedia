@@ -2705,6 +2705,7 @@ impl<'a> CabacDecoder<'a> {
         Ok(decoder)
     }
 
+    #[inline]
     fn read_bit(&mut self) -> Result<u8, AvcError> {
         if self.bits_remaining == 0 {
             self.current_byte = *self.rbsp.get(self.bit / 8).ok_or(AvcError::Incomplete)?;
@@ -2717,8 +2718,19 @@ impl<'a> CabacDecoder<'a> {
         Ok(bit)
     }
 
+    #[inline]
     fn read_bits(&mut self, mut count: u32) -> Result<u32, AvcError> {
         debug_assert!(count <= 7);
+        if count <= u32::from(self.bits_remaining) {
+            if count == 0 {
+                return Ok(0);
+            }
+            let value = u32::from(self.current_byte >> (8 - count));
+            self.current_byte <<= count;
+            self.bits_remaining -= count as u8;
+            self.bit += count as usize;
+            return Ok(value);
+        }
         let mut value = 0u32;
         while count != 0 {
             if self.bits_remaining == 0 {
@@ -2735,6 +2747,7 @@ impl<'a> CabacDecoder<'a> {
         Ok(value)
     }
 
+    #[inline]
     fn renormalize(&mut self) -> Result<(), AvcError> {
         if self.range < 0x100 {
             let shift = self.range.leading_zeros() - 23;
