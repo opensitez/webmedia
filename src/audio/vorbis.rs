@@ -4,8 +4,8 @@
 use super::webm::split_lace;
 use crate::video::backend::MediaDecodeError;
 
-pub mod entropy;
 pub mod decoder;
+pub mod entropy;
 pub mod floor;
 pub mod floor_zero;
 pub mod residue;
@@ -80,7 +80,12 @@ impl Headers {
         entry_budget: usize,
         lookup_budget: usize,
     ) -> Result<setup::Setup, MediaDecodeError> {
-        setup::Setup::parse(&self.setup, self.identification.channels, entry_budget, lookup_budget)
+        setup::Setup::parse(
+            &self.setup,
+            self.identification.channels,
+            entry_budget,
+            lookup_budget,
+        )
     }
 
     pub fn from_webm(bytes: &[u8]) -> Result<Self, MediaDecodeError> {

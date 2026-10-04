@@ -58,6 +58,118 @@ pub struct Mp4VideoIndex {
     pub samples: Vec<Sample>,
 }
 
+/// AAC access units and their AudioSpecificConfig, independent of video codec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mp4AudioIndex {
+    pub timescale: u32,
+    pub duration_ticks: u64,
+    pub audio_specific_config: Vec<u8>,
+    pub samples: Vec<Sample>,
+}
+
+impl Mp4AudioIndex {
+    pub fn parse_prefix(prefix: &[u8]) -> Result<Option<Self>, Mp4Error> {
+        let moov = movie_box(prefix)?;
+        for track in children(moov.data)?
+            .into_iter()
+            .filter(|atom| atom.kind == *b"trak")
+        {
+            let media = child(track.data, b"mdia")?;
+            if child(media.data, b"hdlr")?.data.get(8..12) != Some(&b"soun"[..]) {
+                continue;
+            }
+            let mdhd = child(media.data, b"mdhd")?;
+            let timescale = u32_at(
+                mdhd.data,
+                if mdhd.data.first() == Some(&1) {
+                    20
+                } else {
+                    12
+                },
+            )?;
+            if timescale == 0 {
+                return Err(Mp4Error::Invalid("zero audio timescale"));
+            }
+            let stbl = path(media.data, &[*b"minf", *b"stbl"])?;
+            let stsd = child(stbl.data, b"stsd")?;
+            if u32_at(stsd.data, 4)? != 1 {
+                return Err(Mp4Error::Unsupported("multiple audio sample descriptions"));
+            }
+            let entry = atom_at(stsd.data, 8)?;
+            if entry.kind != *b"mp4a" {
+                return Err(Mp4Error::Unsupported("unsupported audio sample entry"));
+            }
+            if entry.data.len() < 28 {
+                return Err(Mp4Error::Incomplete);
+            }
+            if entry.data[8..10] != [0, 0] {
+                return Err(Mp4Error::Unsupported("versioned audio sample entry"));
+            }
+            let esds = child(&entry.data[28..], b"esds")?;
+            let audio_specific_config = aac_decoder_config(esds.data)?.to_vec();
+            let (samples, duration_ticks) = parse_samples(stbl.data)?;
+            return Ok(Some(Self {
+                timescale,
+                duration_ticks,
+                audio_specific_config,
+                samples,
+            }));
+        }
+        Ok(None)
+    }
+}
+
+fn descriptor(data: &[u8]) -> Result<(u8, &[u8]), Mp4Error> {
+    let tag = *data.first().ok_or(Mp4Error::Incomplete)?;
+    let mut size = 0usize;
+    for index in 1..=4 {
+        let byte = *data.get(index).ok_or(Mp4Error::Incomplete)?;
+        size = (size << 7) | usize::from(byte & 127);
+        if byte & 128 == 0 {
+            let start = index + 1;
+            return Ok((
+                tag,
+                data.get(start..start + size).ok_or(Mp4Error::Incomplete)?,
+            ));
+        }
+    }
+    Err(Mp4Error::Invalid("oversized descriptor length"))
+}
+
+fn aac_decoder_config(esds: &[u8]) -> Result<&[u8], Mp4Error> {
+    let (tag, es) = descriptor(esds.get(4..).ok_or(Mp4Error::Incomplete)?)?;
+    if tag != 3 {
+        return Err(Mp4Error::Invalid("missing ES descriptor"));
+    }
+    let flags = *es.get(2).ok_or(Mp4Error::Incomplete)?;
+    let mut offset = 3;
+    if flags & 128 != 0 {
+        offset += 2;
+    }
+    if flags & 64 != 0 {
+        offset += 1 + usize::from(*es.get(offset).ok_or(Mp4Error::Incomplete)?);
+    }
+    if flags & 32 != 0 {
+        offset += 2;
+    }
+    let (tag, decoder) = descriptor(es.get(offset..).ok_or(Mp4Error::Incomplete)?)?;
+    if tag != 4 {
+        return Err(Mp4Error::Invalid("missing decoder descriptor"));
+    }
+    let object = *decoder.first().ok_or(Mp4Error::Incomplete)?;
+    if ![0x40, 0x66, 0x67, 0x68].contains(&object) {
+        return Err(Mp4Error::Unsupported("audio is not MPEG AAC"));
+    }
+    if decoder.get(1).map(|byte| byte >> 2) != Some(5) {
+        return Err(Mp4Error::Invalid("decoder is not an audio stream"));
+    }
+    let (tag, config) = descriptor(decoder.get(13..).ok_or(Mp4Error::Incomplete)?)?;
+    if tag != 5 || config.is_empty() {
+        return Err(Mp4Error::Invalid("missing AudioSpecificConfig"));
+    }
+    Ok(config)
+}
+
 #[derive(Clone, Copy)]
 struct Atom<'a> {
     kind: [u8; 4],
@@ -163,19 +275,7 @@ impl Mp4VideoIndex {
     /// Parse a complete `moov` from a file prefix. A trailing `moov` requires
     /// the preceding `mdat` to be present; sample offsets refer to the full file.
     pub fn parse_prefix(prefix: &[u8]) -> Result<Self, Mp4Error> {
-        let mut offset = 0;
-        let moov = loop {
-            let header = prefix.get(offset..offset + 8).ok_or(Mp4Error::Incomplete)?;
-            let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as u64;
-            if &header[4..8] == b"moov" {
-                if size > MAX_MOOV_BYTES {
-                    return Err(Mp4Error::TooLarge);
-                }
-                break atom_at(prefix, offset)?;
-            }
-            let atom = atom_at(prefix, offset)?;
-            offset = offset.checked_add(atom.size).ok_or(Mp4Error::TooLarge)?;
-        };
+        let moov = movie_box(prefix)?;
 
         for track in children(moov.data)?
             .into_iter()
@@ -227,152 +327,7 @@ impl Mp4VideoIndex {
             return Err(Mp4Error::Unsupported("unsupported video sample entry"));
         };
 
-        let stsz = child(stbl.data, b"stsz")?;
-        let sample_size = u32_at(stsz.data, 4)?;
-        let sample_count = u32_at(stsz.data, 8)? as usize;
-        if sample_count > MAX_SAMPLES {
-            return Err(Mp4Error::TooLarge);
-        }
-        let sizes = if sample_size == 0 {
-            let end = 12usize
-                .checked_add(sample_count.checked_mul(4).ok_or(Mp4Error::TooLarge)?)
-                .ok_or(Mp4Error::TooLarge)?;
-            if stsz.data.len() < end {
-                return Err(Mp4Error::Incomplete);
-            }
-            (0..sample_count)
-                .map(|n| u32_at(stsz.data, 12 + n * 4).unwrap())
-                .collect::<Vec<_>>()
-        } else {
-            vec![sample_size; sample_count]
-        };
-
-        let offsets = if let Ok(stco) = child(stbl.data, b"stco") {
-            let (count, _) = table_u32(stco.data, 4)?;
-            (0..count)
-                .map(|n| u64::from(u32_at(stco.data, 8 + n * 4).unwrap()))
-                .collect::<Vec<_>>()
-        } else {
-            let co64 = child(stbl.data, b"co64")?;
-            let (count, _) = table_u32(co64.data, 8)?;
-            (0..count)
-                .map(|n| u64_at(co64.data, 8 + n * 8).unwrap())
-                .collect::<Vec<_>>()
-        };
-        let stsc = child(stbl.data, b"stsc")?;
-        let (stsc_count, _) = table_u32(stsc.data, 12)?;
-        if stsc_count == 0 || offsets.is_empty() {
-            return Err(Mp4Error::Invalid("empty chunk table"));
-        }
-        let mut chunks = Vec::with_capacity(stsc_count);
-        for n in 0..stsc_count {
-            let at = 8 + n * 12;
-            let first = u32_at(stsc.data, at)?;
-            let per_chunk = u32_at(stsc.data, at + 4)?;
-            let description = u32_at(stsc.data, at + 8)?;
-            if first == 0
-                || per_chunk == 0
-                || description != 1
-                || chunks.last().is_some_and(|(last, _)| first <= *last)
-            {
-                return Err(Mp4Error::Invalid("invalid sample-to-chunk table"));
-            }
-            chunks.push((first, per_chunk));
-        }
-        if chunks[0].0 != 1 {
-            return Err(Mp4Error::Invalid("first chunk not mapped"));
-        }
-
-        let stts = child(stbl.data, b"stts")?;
-        let (timing_count, _) = table_u32(stts.data, 8)?;
-        let mut decode_times = Vec::with_capacity(sample_count);
-        let mut clock = 0u64;
-        for n in 0..timing_count {
-            let count = u32_at(stts.data, 8 + n * 8)? as usize;
-            let delta = u32_at(stts.data, 12 + n * 8)?;
-            if count > sample_count - decode_times.len() {
-                return Err(Mp4Error::Invalid("timing count exceeds samples"));
-            }
-            for _ in 0..count {
-                decode_times.push(clock);
-                clock = clock
-                    .checked_add(u64::from(delta))
-                    .ok_or(Mp4Error::TooLarge)?;
-            }
-        }
-        if decode_times.len() != sample_count {
-            return Err(Mp4Error::Invalid("timing count mismatch"));
-        }
-
-        let mut composition_offsets = vec![0i64; sample_count];
-        if let Ok(ctts) = child(stbl.data, b"ctts") {
-            let (count, _) = table_u32(ctts.data, 8)?;
-            let mut sample = 0;
-            for n in 0..count {
-                let run = u32_at(ctts.data, 8 + n * 8)? as usize;
-                let raw = u32_at(ctts.data, 12 + n * 8)?;
-                let value = if ctts.data[0] == 1 {
-                    i64::from(raw as i32)
-                } else {
-                    i64::from(raw)
-                };
-                if run > sample_count - sample {
-                    return Err(Mp4Error::Invalid("composition count exceeds samples"));
-                }
-                composition_offsets[sample..sample + run].fill(value);
-                sample += run;
-            }
-            if sample != sample_count {
-                return Err(Mp4Error::Invalid("composition count mismatch"));
-            }
-        }
-        let mut sync = vec![true; sample_count];
-        if let Ok(stss) = child(stbl.data, b"stss") {
-            sync.fill(false);
-            let (count, _) = table_u32(stss.data, 4)?;
-            for n in 0..count {
-                let index = u32_at(stss.data, 8 + n * 4)? as usize;
-                if index == 0 || index > sample_count {
-                    return Err(Mp4Error::Invalid("sync sample out of range"));
-                }
-                sync[index - 1] = true;
-            }
-        }
-
-        let mut samples = Vec::with_capacity(sample_count);
-        let mut sample = 0;
-        let mut mapping = 0;
-        for (n, chunk_offset) in offsets.into_iter().enumerate() {
-            let chunk_index = n as u32 + 1;
-            while mapping + 1 < chunks.len() && chunks[mapping + 1].0 <= chunk_index {
-                mapping += 1;
-            }
-            let mut offset = chunk_offset;
-            for _ in 0..chunks[mapping].1 {
-                if sample >= sample_count {
-                    return Err(Mp4Error::Invalid("chunk count exceeds samples"));
-                }
-                let size = sizes[sample];
-                let presentation_time = i64::try_from(decode_times[sample])
-                    .map_err(|_| Mp4Error::TooLarge)?
-                    .checked_add(composition_offsets[sample])
-                    .ok_or(Mp4Error::TooLarge)?;
-                samples.push(Sample {
-                    offset,
-                    size,
-                    decode_time: decode_times[sample],
-                    presentation_time,
-                    keyframe: sync[sample],
-                });
-                offset = offset
-                    .checked_add(u64::from(size))
-                    .ok_or(Mp4Error::TooLarge)?;
-                sample += 1;
-            }
-        }
-        if sample != sample_count {
-            return Err(Mp4Error::Invalid("chunk count mismatch"));
-        }
+        let (samples, clock) = parse_samples(stbl.data)?;
         Ok(Self {
             timescale,
             duration_ticks: clock,
@@ -384,10 +339,225 @@ impl Mp4VideoIndex {
     }
 }
 
+fn movie_box(prefix: &[u8]) -> Result<Atom<'_>, Mp4Error> {
+    let mut offset = 0;
+    loop {
+        let header = prefix.get(offset..offset + 8).ok_or(Mp4Error::Incomplete)?;
+        if &header[4..8] == b"moov" {
+            let size = match u32_at(prefix, offset)? {
+                0 => (prefix.len() - offset) as u64,
+                1 => u64_at(prefix, offset + 8)?,
+                size => u64::from(size),
+            };
+            if size > MAX_MOOV_BYTES {
+                return Err(Mp4Error::TooLarge);
+            }
+            return atom_at(prefix, offset);
+        }
+        offset = offset
+            .checked_add(atom_at(prefix, offset)?.size)
+            .ok_or(Mp4Error::TooLarge)?;
+    }
+}
+
+fn parse_samples(table: &[u8]) -> Result<(Vec<Sample>, u64), Mp4Error> {
+    let stsz = child(table, b"stsz")?;
+    let sample_size = u32_at(stsz.data, 4)?;
+    let sample_count = u32_at(stsz.data, 8)? as usize;
+    if sample_count > MAX_SAMPLES {
+        return Err(Mp4Error::TooLarge);
+    }
+    let sizes = if sample_size == 0 {
+        let end = 12usize
+            .checked_add(sample_count.checked_mul(4).ok_or(Mp4Error::TooLarge)?)
+            .ok_or(Mp4Error::TooLarge)?;
+        if stsz.data.len() < end {
+            return Err(Mp4Error::Incomplete);
+        }
+        (0..sample_count)
+            .map(|n| u32_at(stsz.data, 12 + n * 4).unwrap())
+            .collect::<Vec<_>>()
+    } else {
+        vec![sample_size; sample_count]
+    };
+
+    let offsets = if let Ok(stco) = child(table, b"stco") {
+        let (count, _) = table_u32(stco.data, 4)?;
+        (0..count)
+            .map(|n| u64::from(u32_at(stco.data, 8 + n * 4).unwrap()))
+            .collect::<Vec<_>>()
+    } else {
+        let co64 = child(table, b"co64")?;
+        let (count, _) = table_u32(co64.data, 8)?;
+        (0..count)
+            .map(|n| u64_at(co64.data, 8 + n * 8).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let stsc = child(table, b"stsc")?;
+    let (stsc_count, _) = table_u32(stsc.data, 12)?;
+    if stsc_count == 0 || offsets.is_empty() {
+        return Err(Mp4Error::Invalid("empty chunk table"));
+    }
+    let mut chunks = Vec::with_capacity(stsc_count);
+    for n in 0..stsc_count {
+        let at = 8 + n * 12;
+        let first = u32_at(stsc.data, at)?;
+        let per_chunk = u32_at(stsc.data, at + 4)?;
+        let description = u32_at(stsc.data, at + 8)?;
+        if first == 0
+            || per_chunk == 0
+            || description != 1
+            || chunks.last().is_some_and(|(last, _)| first <= *last)
+        {
+            return Err(Mp4Error::Invalid("invalid sample-to-chunk table"));
+        }
+        chunks.push((first, per_chunk));
+    }
+    if chunks[0].0 != 1 {
+        return Err(Mp4Error::Invalid("first chunk not mapped"));
+    }
+
+    let stts = child(table, b"stts")?;
+    let (timing_count, _) = table_u32(stts.data, 8)?;
+    let mut decode_times = Vec::with_capacity(sample_count);
+    let mut clock = 0u64;
+    for n in 0..timing_count {
+        let count = u32_at(stts.data, 8 + n * 8)? as usize;
+        let delta = u32_at(stts.data, 12 + n * 8)?;
+        if count > sample_count - decode_times.len() {
+            return Err(Mp4Error::Invalid("timing count exceeds samples"));
+        }
+        for _ in 0..count {
+            decode_times.push(clock);
+            clock = clock
+                .checked_add(u64::from(delta))
+                .ok_or(Mp4Error::TooLarge)?;
+        }
+    }
+    if decode_times.len() != sample_count {
+        return Err(Mp4Error::Invalid("timing count mismatch"));
+    }
+
+    let mut composition_offsets = vec![0i64; sample_count];
+    if let Ok(ctts) = child(table, b"ctts") {
+        let (count, _) = table_u32(ctts.data, 8)?;
+        let mut sample = 0;
+        for n in 0..count {
+            let run = u32_at(ctts.data, 8 + n * 8)? as usize;
+            let raw = u32_at(ctts.data, 12 + n * 8)?;
+            let value = if ctts.data[0] == 1 {
+                i64::from(raw as i32)
+            } else {
+                i64::from(raw)
+            };
+            if run > sample_count - sample {
+                return Err(Mp4Error::Invalid("composition count exceeds samples"));
+            }
+            composition_offsets[sample..sample + run].fill(value);
+            sample += run;
+        }
+        if sample != sample_count {
+            return Err(Mp4Error::Invalid("composition count mismatch"));
+        }
+    }
+    let mut sync = vec![true; sample_count];
+    if let Ok(stss) = child(table, b"stss") {
+        sync.fill(false);
+        let (count, _) = table_u32(stss.data, 4)?;
+        for n in 0..count {
+            let index = u32_at(stss.data, 8 + n * 4)? as usize;
+            if index == 0 || index > sample_count {
+                return Err(Mp4Error::Invalid("sync sample out of range"));
+            }
+            sync[index - 1] = true;
+        }
+    }
+
+    let mut samples = Vec::with_capacity(sample_count);
+    let mut sample = 0;
+    let mut mapping = 0;
+    for (n, chunk_offset) in offsets.into_iter().enumerate() {
+        let chunk_index = n as u32 + 1;
+        while mapping + 1 < chunks.len() && chunks[mapping + 1].0 <= chunk_index {
+            mapping += 1;
+        }
+        let mut offset = chunk_offset;
+        for _ in 0..chunks[mapping].1 {
+            if sample >= sample_count {
+                return Err(Mp4Error::Invalid("chunk count exceeds samples"));
+            }
+            let size = sizes[sample];
+            let presentation_time = i64::try_from(decode_times[sample])
+                .map_err(|_| Mp4Error::TooLarge)?
+                .checked_add(composition_offsets[sample])
+                .ok_or(Mp4Error::TooLarge)?;
+            samples.push(Sample {
+                offset,
+                size,
+                decode_time: decode_times[sample],
+                presentation_time,
+                keyframe: sync[sample],
+            });
+            offset = offset
+                .checked_add(u64::from(size))
+                .ok_or(Mp4Error::TooLarge)?;
+            sample += 1;
+        }
+    }
+    if sample != sample_count {
+        return Err(Mp4Error::Invalid("chunk count mismatch"));
+    }
+    Ok((samples, clock))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::video::h264::NalStream;
+
+    #[test]
+    fn aac_descriptor_lengths_and_flags_are_bounded() {
+        let mut decoder = vec![0x40, 0x15];
+        decoder.resize(13, 0);
+        decoder.extend([5, 2, 0x12, 0x10]);
+        let mut es = vec![0, 1, 0xe0, 0, 2, 3, b'a', b'b', b'c', 0, 3];
+        es.extend([4, decoder.len() as u8]);
+        es.extend(decoder);
+        let mut esds = vec![0; 4];
+        esds.extend([3, es.len() as u8]);
+        esds.extend(es);
+        assert_eq!(aac_decoder_config(&esds).unwrap(), [0x12, 0x10]);
+        for end in 0..esds.len() {
+            assert!(aac_decoder_config(&esds[..end]).is_err());
+        }
+        assert_eq!(
+            descriptor(&[5, 0x80, 0x80, 0x80, 2, 0x12, 0x10]).unwrap(),
+            (5, &[0x12, 0x10][..])
+        );
+        assert!(descriptor(&[5, 0x80, 0x80, 0x80, 0x80]).is_err());
+    }
+
+    #[test]
+    #[ignore = "set WEBMEDIA_AAC_MP4 to an AAC-LC MP4 fixture"]
+    fn indexes_real_aac_access_units() {
+        let bytes = std::fs::read(std::env::var("WEBMEDIA_AAC_MP4").unwrap()).unwrap();
+        let audio = Mp4AudioIndex::parse_prefix(&bytes).unwrap().unwrap();
+        assert_eq!(audio.timescale, 44100);
+        assert_eq!(audio.audio_specific_config[0] >> 3, 2);
+        assert!(!audio.samples.is_empty());
+        for sample in &audio.samples {
+            assert!(sample.size > 0);
+            assert!(
+                sample.offset.checked_add(u64::from(sample.size)).unwrap() <= bytes.len() as u64
+            );
+        }
+        assert!(
+            audio
+                .samples
+                .windows(2)
+                .all(|pair| pair[0].decode_time < pair[1].decode_time)
+        );
+    }
 
     fn boxed(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
         let mut result = Vec::with_capacity(data.len() + 8);

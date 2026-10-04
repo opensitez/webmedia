@@ -25,13 +25,18 @@ impl<'a> Bits<'a> {
         {
             return Err(Error::Truncated);
         }
-        let mut value = 0;
-        for _ in 0..n {
-            value = (value << 1)
-                | u32::from((self.data[self.position / 8] >> (7 - self.position % 8)) & 1);
-            self.position += 1;
+        if n == 0 { return Ok(0); }
+        let offset = self.position % 8;
+        let count = (offset + usize::from(n)).div_ceil(8);
+        let first = self.position / 8;
+        let mut word = 0u64;
+        for &byte in &self.data[first..first + count] {
+            word = (word << 8) | u64::from(byte);
         }
-        Ok(value)
+        let value = (word >> (count * 8 - offset - usize::from(n)))
+            & ((1u64 << n) - 1);
+        self.position += usize::from(n);
+        Ok(value as u32)
     }
     pub(crate) fn flag(&mut self) -> Result<bool, Error> {
         Ok(self.read(1)? != 0)
@@ -1121,6 +1126,66 @@ pub fn tile_group<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_bitwise(bits: &mut Bits<'_>, n: u8) -> Result<u32, Error> {
+        if n > 32 || bits.position.checked_add(usize::from(n))
+            .is_none_or(|end| end > bits.data.len().saturating_mul(8))
+        { return Err(Error::Truncated); }
+        let mut value = 0;
+        for _ in 0..n {
+            value = (value << 1)
+                | u32::from((bits.data[bits.position / 8] >> (7 - bits.position % 8)) & 1);
+            bits.position += 1;
+        }
+        Ok(value)
+    }
+
+    #[test]
+    fn bulk_bit_reader_matches_bitwise_values_cursors_and_truncation() {
+        let data: Vec<u8> = (0..48u32).map(|i| i.wrapping_mul(197).wrapping_add(37) as u8).collect();
+        for len in 0..=data.len() {
+            for position in (0..=len * 8 + 1).chain([usize::MAX - 32, usize::MAX]) {
+                for n in 0..=40 {
+                    let mut actual = Bits { data: &data[..len], position };
+                    let mut expected = Bits { data: &data[..len], position };
+                    assert_eq!(actual.read(n), read_bitwise(&mut expected, n),
+                        "length={len} position={position} width={n}");
+                    assert_eq!(actual.position, expected.position);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "same-binary ABBA bulk bit-reader benchmark"]
+    fn benchmark_bulk_bit_reader() {
+        use std::{hint::black_box, time::Instant};
+        #[inline(never)]
+        fn bulk(bits: &mut Bits<'_>, n: u8) -> Result<u32, Error> { bits.read(n) }
+        #[inline(never)]
+        fn scalar(bits: &mut Bits<'_>, n: u8) -> Result<u32, Error> { read_bitwise(bits, n) }
+        let bytes: Vec<_> = (0..8192u32).map(|i| i.wrapping_mul(197) as u8).collect();
+        for widths in [&[1, 2, 3, 4, 5, 6, 7, 8][..], &[9, 12, 15, 16, 24, 32][..]] {
+            let mut times = [std::time::Duration::ZERO; 2];
+            let mut checksums = [None; 2];
+            for arm in [0, 1, 1, 0, 1, 0, 0, 1] {
+                let read = if arm == 0 { scalar } else { bulk };
+                let start = Instant::now();
+                let mut bits = Bits::new(black_box(&bytes));
+                let mut sum = 0u64;
+                for index in 0..1_000_000usize {
+                    if bits.position + 32 > bytes.len() * 8 { bits.position = 0; }
+                    sum = sum.wrapping_add(u64::from(read(&mut bits, black_box(widths[index % widths.len()])).unwrap()));
+                }
+                times[arm] += start.elapsed();
+                if let Some(expected) = checksums[arm] { assert_eq!(sum, expected); }
+                checksums[arm] = Some(black_box(sum));
+            }
+            assert_eq!(checksums[0], checksums[1]);
+            eprintln!("bit widths={widths:?} bitwise={:?} bulk={:?} speedup={:.3}", times[0], times[1],
+                times[0].as_secs_f64() / times[1].as_secs_f64());
+        }
+    }
 
     #[derive(Default)]
     struct Writer {

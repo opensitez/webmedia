@@ -35,7 +35,7 @@ struct ReferenceFrame {
 }
 
 /// Persistent sequence, reference-slot and entropy state. Failed frames are not committed.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Av1Decoder {
     sequence: Option<SequenceHeader>,
     references: [Option<Arc<ReferenceFrame>>; 8],
@@ -56,6 +56,10 @@ impl Av1Decoder {
 
     /// Feed one complete low-overhead OBU. Hidden frames update state but return no output.
     pub fn decode_obu(&mut self, obu: &Obu) -> Result<Option<DecodedFrame>, Error> {
+        #[cfg(test)]
+        let old_lifecycle = LIFECYCLE_REFERENCE.with(|flag| flag.get());
+        #[cfg(not(test))]
+        let old_lifecycle = false;
         if obu.kind == 1 {
             let sequence = SequenceHeader::parse(&obu.payload)?;
             if self.sequence.as_ref() != Some(&sequence) {
@@ -160,38 +164,90 @@ impl Av1Decoder {
                     .map(|i| self.references[i as usize].as_ref().map(|r| &r.motion)),
             ));
         }
-        let initial = tile.save_cdfs();
+        let store_reference = header.refresh_frame_flags != 0;
+        let initial = (old_lifecycle || store_reference && header.disable_frame_end_update_cdf)
+            .then(|| tile.save_cdfs());
+        #[cfg(not(test))]
         tile.run()?;
-        let mut cdfs = if header.disable_frame_end_update_cdf {
-            initial
+        #[cfg(test)]
+        if super::profile::enabled() {
+            let mut last = std::time::Instant::now();
+            let mut stage = 0;
+            tile.run_with_observer(|_, _| {
+                let now = std::time::Instant::now();
+                super::profile::record_stage(stage, now.duration_since(last).as_nanos());
+                last = now;
+                stage += 1;
+            })?;
         } else {
-            tile.save_cdfs()
+            tile.run()?;
+        }
+        let saved = if old_lifecycle || store_reference {
+            let mut cdfs = if header.disable_frame_end_update_cdf {
+                initial.expect("initial reference CDFs")
+            } else {
+                tile.save_cdfs()
+            };
+            cdfs.reset_counts();
+            Some((cdfs, tile.save_motion()))
+        } else {
+            None
         };
-        cdfs.reset_counts();
-        let motion = tile.save_motion();
         let output = DecodedFrame {
             bit_depth: sequence.bit_depth,
             sequence: sequence.clone(),
             planes: tile.finish_planes(),
             header,
         };
-        let reference = Arc::new(ReferenceFrame {
-            frame: Arc::new(output.clone()),
-            cdfs,
-            motion,
-        });
+        let refresh = output.header.refresh_frame_flags;
+        let hints = output.header.ref_order_hints;
+        let show = output.header.show_frame;
+        let (output, reference) = if let Some((cdfs, motion)) = saved {
+            if old_lifecycle {
+                let reference = Arc::new(ReferenceFrame {
+                    frame: Arc::new(output.clone()),
+                    cdfs,
+                    motion,
+                });
+                (show.then_some(output), Some(reference))
+            } else {
+                // Hidden references own the finished planes directly. Only a
+                // displayed, refreshing frame needs a second owned plane set.
+                let frame = Arc::new(output);
+                let displayed = show.then(|| (*frame).clone());
+                (
+                    displayed,
+                    Some(Arc::new(ReferenceFrame {
+                        frame,
+                        cdfs,
+                        motion,
+                    })),
+                )
+            }
+        } else {
+            (show.then_some(output), None)
+        };
         for (i, slot) in self.references.iter_mut().enumerate() {
-            if output.header.refresh_frame_flags & (1 << i) != 0 {
-                *slot = Some(reference.clone());
-            } else if output.header.ref_order_hints[i].is_some_and(|hint| {
+            if refresh & (1 << i) != 0 {
+                *slot = Some(reference.as_ref().expect("refreshed reference").clone());
+            } else if hints[i].is_some_and(|hint| {
                 slot.as_ref()
                     .is_some_and(|r| r.frame.header.order_hint != hint)
             }) {
                 *slot = None;
             }
         }
-        Ok(output.header.show_frame.then_some(output))
+        Ok(output)
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LIFECYCLE_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn lifecycle_reference() -> bool {
+    LIFECYCLE_REFERENCE.with(|flag| flag.get())
 }
 
 /// Decode a combined OBU_FRAME without using any external decoder.
@@ -228,6 +284,217 @@ pub fn inspect_intra_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "later-clip phase distributions; requires AV1_STREAM_OBU"]
+    fn spacewalk_later_frame_profile() {
+        use std::time::Instant;
+        let first = std::env::var("AV1_BENCH_START_DISPLAY")
+            .ok()
+            .map_or(256, |v| v.parse::<usize>().unwrap());
+        let count = std::env::var("AV1_PROFILE_COUNT")
+            .ok()
+            .map_or(64, |v| v.parse::<usize>().unwrap());
+        let bytes = std::fs::read(std::env::var("AV1_STREAM_OBU").unwrap()).unwrap();
+        let mut stream = super::super::ObuStream::new();
+        let mut decoder = Av1Decoder::new();
+        let mut displayed = 0;
+        let mut records = Vec::new();
+        for obu in stream.push(&bytes).unwrap() {
+            let coded = obu.kind == 6 && obu.payload.first().is_some_and(|b| b & 128 == 0);
+            let sampling = coded && displayed >= first;
+            let header = if sampling {
+                let refs = decoder
+                    .references
+                    .each_ref()
+                    .map(|r| r.as_ref().map(|r| &r.frame.header));
+                Some(
+                    IntraFrameHeader::parse_with_refs(
+                        &obu.payload,
+                        decoder.sequence.as_ref().unwrap(),
+                        obu.temporal_id,
+                        obu.spatial_id,
+                        &refs,
+                    )
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            super::super::profile::reset(sampling);
+            let start = Instant::now();
+            let output = decoder.decode_obu(&obu).unwrap();
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            if let Some(header) = header {
+                let stages = super::super::profile::stages().map(|v| v as f64 / 1_000_000.0);
+                let details = super::super::profile::times().map(|v| v as f64 / 1_000_000.0);
+                records.push((
+                    displayed,
+                    header.order_hint,
+                    header.show_frame,
+                    elapsed,
+                    stages,
+                    details,
+                ));
+            }
+            if output.is_some() {
+                displayed += 1;
+            }
+            std::hint::black_box(&output);
+            if records.len() == count {
+                break;
+            }
+        }
+        super::super::profile::reset(false);
+        assert_eq!(records.len(), count);
+        let percentile = |mut values: Vec<f64>, percent: usize| {
+            values.sort_by(f64::total_cmp);
+            values[((values.len() - 1) * percent / 100).min(values.len() - 1)]
+        };
+        for show in [false, true] {
+            let group: Vec<_> = records.iter().filter(|r| r.2 == show).collect();
+            if group.is_empty() {
+                continue;
+            }
+            let times: Vec<_> = group.iter().map(|r| r.3).collect();
+            let average = times.iter().sum::<f64>() / times.len() as f64;
+            let stages = std::array::from_fn::<_, 4, _>(|i| {
+                group.iter().map(|r| r.4[i]).sum::<f64>() / group.len() as f64
+            });
+            let details = std::array::from_fn::<_, 5, _>(|i| {
+                group.iter().map(|r| r.5[i]).sum::<f64>() / group.len() as f64
+            });
+            eprintln!(
+                "LATER first={first} show={show} count={} avg_ms={average:.3} p50_ms={:.3} p90_ms={:.3} max_ms={:.3} reconstruct={:.3} deblock={:.3} cdef={:.3} restoration={:.3} motion={:.3} coefficients={:.3} transform={:.3} intra={:.3} warp={:.3}",
+                group.len(),
+                percentile(times.clone(), 50),
+                percentile(times.clone(), 90),
+                percentile(times, 100),
+                stages[0],
+                stages[1],
+                stages[2],
+                stages[3],
+                details[0],
+                details[1],
+                details[2],
+                details[3],
+                details[4]
+            );
+        }
+        records.sort_by(|a, b| b.3.total_cmp(&a.3));
+        for r in records.iter().take(12) {
+            eprintln!(
+                "SPIKE display={} hint={} show={} total={:.3} stages={:?} details={:?}",
+                r.0, r.1, r.2, r.3, r.4, r.5
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "same-state lifecycle A/B benchmark; requires AV1_STREAM_OBU"]
+    fn spacewalk_lifecycle_same_frame_benchmark() {
+        use std::time::Instant;
+        let repeats = std::env::var("AV1_BENCH_REPEATS")
+            .ok()
+            .map_or(12, |v| v.parse::<usize>().unwrap());
+        assert!(repeats >= 3);
+        let first_display = std::env::var("AV1_BENCH_START_DISPLAY")
+            .ok()
+            .map_or(0, |v| v.parse::<usize>().unwrap());
+        let bytes = std::fs::read(std::env::var("AV1_STREAM_OBU").unwrap()).unwrap();
+        let mut stream = super::super::ObuStream::new();
+        let mut decoder = Av1Decoder::new();
+        let mut targets = vec![0, 16, 8, 1];
+        let mut displayed = 0;
+        for obu in stream.push(&bytes).unwrap() {
+            if obu.kind == 6
+                && obu.payload.first().is_some_and(|b| b & 128 == 0)
+                && displayed >= first_display
+            {
+                let sequence = decoder.sequence.as_ref().unwrap();
+                let refs = decoder
+                    .references
+                    .each_ref()
+                    .map(|r| r.as_ref().map(|r| &r.frame.header));
+                let h = IntraFrameHeader::parse_with_refs(
+                    &obu.payload,
+                    sequence,
+                    obu.temporal_id,
+                    obu.spatial_id,
+                    &refs,
+                )
+                .unwrap();
+                let target = if first_display != 0 {
+                    Some(0)
+                } else {
+                    targets.iter().position(|&v| v == h.order_hint)
+                };
+                if let Some(target) = target {
+                    let mut times: [Vec<f64>; 2] = Default::default();
+                    let mut expected: Option<(Option<DecodedFrame>, Av1Decoder)> = None;
+                    for repeat in 0..repeats * 2 + 4 {
+                        let reference = [true, false, false, true][repeat % 4];
+                        let mut trial = decoder.clone();
+                        LIFECYCLE_REFERENCE.with(|flag| flag.set(reference));
+                        let start = Instant::now();
+                        let result = trial.decode_obu(&obu).unwrap();
+                        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                        LIFECYCLE_REFERENCE.with(|flag| flag.set(false));
+                        if let Some((output, saved)) = &expected {
+                            assert_eq!(&result, output, "lifecycle changed output");
+                            for (i, (actual, expected)) in
+                                trial.references.iter().zip(&saved.references).enumerate()
+                            {
+                                match (actual, expected) {
+                                    (Some(a), Some(b)) => {
+                                        if !Arc::ptr_eq(a, b)
+                                            && !saved.references[..i].iter().any(|r| {
+                                                r.as_ref().is_some_and(|r| Arc::ptr_eq(r, b))
+                                            })
+                                        {
+                                            assert_eq!(
+                                                a.frame, b.frame,
+                                                "lifecycle changed reference slot {i}"
+                                            );
+                                        }
+                                    }
+                                    (None, None) => {}
+                                    _ => panic!("lifecycle changed slot presence {i}"),
+                                }
+                            }
+                        } else {
+                            expected = Some((result.clone(), trial.clone()));
+                        }
+                        if repeat >= 4 {
+                            times[usize::from(reference)].push(elapsed);
+                        }
+                        std::hint::black_box(&result);
+                    }
+                    let medians = times.map(|mut values| {
+                        values.sort_by(f64::total_cmp);
+                        values[values.len() / 2]
+                    });
+                    eprintln!(
+                        "LIFECYCLE display={displayed} hint={} show={} refresh={} repeats={repeats} optimized_ms={:.3} original_ms={:.3} speedup={:.3}",
+                        h.order_hint,
+                        h.show_frame,
+                        h.refresh_frame_flags,
+                        medians[0],
+                        medians[1],
+                        medians[1] / medians[0]
+                    );
+                    targets.remove(target);
+                }
+            }
+            if decoder.decode_obu(&obu).unwrap().is_some() {
+                displayed += 1;
+            }
+            if targets.is_empty() {
+                return;
+            }
+        }
+        panic!("lifecycle benchmark target frames missing");
+    }
 
     #[test]
     fn persistent_decoder_preserves_references_on_failed_frame() {
@@ -563,14 +830,23 @@ mod tests {
         let deblock_ab = std::env::var_os("AV1_BENCH_DEBLOCK_AB").is_some();
         let motion_ab = std::env::var_os("AV1_BENCH_MOTION_AB").is_some();
         let buffers_ab = std::env::var_os("AV1_BENCH_CDEF_BUFFERS_AB").is_some();
-        let ab = cdef_ab || deblock_ab || motion_ab || buffers_ab;
+        let restoration_ab = std::env::var_os("AV1_BENCH_RESTORATION_AB").is_some();
+        let scratch_ab = std::env::var_os("AV1_BENCH_INTER_SCRATCH_AB").is_some();
+        let ab = cdef_ab || deblock_ab || motion_ab || buffers_ab || restoration_ab || scratch_ab;
         let profile = std::env::var_os("AV1_BENCH_PROFILE").is_some();
+        let first_display = std::env::var("AV1_BENCH_START_DISPLAY")
+            .ok()
+            .map_or(0, |v| v.parse::<usize>().unwrap());
         let bytes = std::fs::read(std::env::var("AV1_STREAM_OBU").unwrap()).unwrap();
         let mut stream = super::super::ObuStream::new();
         let mut decoder = Av1Decoder::new();
         let mut targets = vec![0, 16, 8, 1];
+        let mut displayed = 0;
         for obu in stream.push(&bytes).unwrap() {
-            if obu.kind == 6 && obu.payload.first().is_some_and(|b| b & 128 == 0) {
+            if obu.kind == 6
+                && obu.payload.first().is_some_and(|b| b & 128 == 0)
+                && displayed >= first_display
+            {
                 let sequence = decoder.sequence.as_ref().unwrap();
                 let refs = decoder
                     .references
@@ -584,20 +860,29 @@ mod tests {
                     &refs,
                 )
                 .unwrap();
-                if let Some(target) = targets.iter().position(|&v| v == h.order_hint) {
+                let target = if first_display != 0 {
+                    Some(0)
+                } else {
+                    targets.iter().position(|&v| v == h.order_hint)
+                };
+                if let Some(target) = target {
                     let groups =
                         super::super::syntax::tile_group(&obu.payload[h.header_bytes..], &h.tiles)
                             .unwrap();
                     let mut timings: [[Vec<f64>; 5]; 2] = Default::default();
-                    let mut details: [Vec<f64>; 4] = Default::default();
+                    let mut details: [Vec<f64>; 5] = Default::default();
                     let mut expected = None;
                     let trials = if ab { repeats * 2 + 4 } else { repeats + 2 };
                     for repeat in 0..trials {
                         let reference = ab && [true, false, false, true][repeat % 4];
+                        super::super::intra::set_inter_scratch_reference(reference && scratch_ab);
                         super::super::filters::set_cdef_reference(reference && cdef_ab);
                         super::super::filters::set_deblock_reference(reference && deblock_ab);
                         super::super::motion::set_motion_reference(reference && motion_ab);
                         super::super::filters::set_cdef_snapshot_reference(reference && buffers_ab);
+                        super::super::restoration::set_restoration_reference(
+                            reference && restoration_ab,
+                        );
                         let mut tile = IntraTile::new(sequence, &h, groups[0].1).unwrap();
                         if h.primary_ref_frame != 7 {
                             tile.load_cdfs(
@@ -659,6 +944,8 @@ mod tests {
                     super::super::filters::set_deblock_reference(false);
                     super::super::motion::set_motion_reference(false);
                     super::super::filters::set_cdef_snapshot_reference(false);
+                    super::super::restoration::set_restoration_reference(false);
+                    super::super::intra::set_inter_scratch_reference(false);
                     super::super::profile::reset(false);
                     if profile {
                         let medians = details.map(|mut values| {
@@ -666,8 +953,13 @@ mod tests {
                             values[values.len() / 2]
                         });
                         eprintln!(
-                            "PROFILE hint={} motion_ms={:.3} coefficients_ms={:.3} transform_ms={:.3} intra_prediction_ms={:.3}",
-                            h.order_hint, medians[0], medians[1], medians[2], medians[3]
+                            "PROFILE hint={} motion_ms={:.3} coefficients_ms={:.3} transform_ms={:.3} intra_prediction_ms={:.3} warp_ms={:.3}",
+                            h.order_hint,
+                            medians[0],
+                            medians[1],
+                            medians[2],
+                            medians[3],
+                            medians[4]
                         );
                     }
                     for (mode, times) in timings.into_iter().enumerate() {
@@ -692,7 +984,9 @@ mod tests {
                     targets.remove(target);
                 }
             }
-            decoder.decode_obu(&obu).unwrap();
+            if decoder.decode_obu(&obu).unwrap().is_some() {
+                displayed += 1;
+            }
             if targets.is_empty() {
                 return;
             }

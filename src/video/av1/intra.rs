@@ -9,7 +9,7 @@ use super::reconstruction::{
 };
 use super::syntax::{Error, IntraFrameHeader, SequenceHeader};
 use super::tables;
-use super::transform::inverse_transform;
+use super::transform::inverse_transform_into;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntraBlockInfo {
@@ -200,6 +200,36 @@ struct Cell {
     tx_height: u8,
 }
 
+#[derive(Default)]
+struct InterScratch {
+    predictions: [Vec<i32>; 2],
+    intermediate: super::motion::PredictionScratch,
+    blended: Vec<u16>,
+    residual: Vec<i32>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INTER_SCRATCH_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_inter_scratch_reference(reference: bool) {
+    INTER_SCRATCH_REFERENCE.with(|flag| flag.set(reference));
+}
+
+impl InterScratch {
+    fn prepare(&mut self, list: usize) {
+        #[cfg(test)]
+        if INTER_SCRATCH_REFERENCE.with(|flag| flag.get()) {
+            self.predictions[list] = Vec::new();
+            self.intermediate = Default::default();
+        }
+        #[cfg(not(test))]
+        let _ = list;
+    }
+}
+
 pub(crate) struct IntraTile<'a> {
     s: &'a SequenceHeader,
     h: &'a IntraFrameHeader,
@@ -225,6 +255,8 @@ pub(crate) struct IntraTile<'a> {
     references: [Option<&'a DecodedFrame>; 7],
     motion_cells: Vec<Option<MotionCell>>,
     motion_field: Option<super::temporal::MotionField>,
+    inter_scratch: InterScratch,
+    use_neon: bool,
     tx_types: Vec<usize>,
     restoration: super::restoration::Restoration,
     qindex: u8,
@@ -372,6 +404,7 @@ impl<'a> IntraTile<'a> {
 
     fn predict_inter(
         &self,
+        scratch: &mut InterScratch,
         info: &InterBlock,
         plane: usize,
         x: usize,
@@ -382,7 +415,6 @@ impl<'a> IntraTile<'a> {
         let sx = plane > 0 && self.s.subsampling_x;
         let sy = plane > 0 && self.s.subsampling_y;
         let compound = info.cell.refs[1] > 0;
-        let mut predictions = Vec::new();
         let mut post = 0;
         for list in 0..if compound { 2 } else { 1 } {
             let r = info.cell.refs[list] as usize - 1;
@@ -394,11 +426,11 @@ impl<'a> IntraTile<'a> {
                 [self.h.height, self.h.width],
                 [reference.header.height, reference.header.upscaled_width],
             )?;
-            let (samples, bits) = if let Some(params) = info
+            let bits = if let Some(params) = info
                 .warp
                 .filter(|_| w >= 8 && h >= 8 && !self.h.force_integer_mv)
             {
-                super::warp::predict(
+                let (samples, bits) = super::warp::predict(
                     &reference.planes[plane],
                     [y, x],
                     [h, w],
@@ -406,9 +438,12 @@ impl<'a> IntraTile<'a> {
                     self.s.bit_depth,
                     params,
                     compound,
-                )?
+                )?;
+                scratch.predictions[list] = samples;
+                bits
             } else {
-                super::motion::predict(
+                scratch.prepare(list);
+                super::motion::predict_into(
                     &reference.planes[plane],
                     w,
                     h,
@@ -416,10 +451,12 @@ impl<'a> IntraTile<'a> {
                     location,
                     info.cell.filters,
                     compound,
+                    self.motion_neon(),
+                    &mut scratch.predictions[list],
+                    &mut scratch.intermediate,
                 )?
             };
             post = bits;
-            predictions.push(samples);
         }
         let weights = if compound && info.distance_weighted {
             let distances = info.cell.refs.map(|r| {
@@ -451,19 +488,23 @@ impl<'a> IntraTile<'a> {
         };
         let shift = post + if info.distance_weighted { 4 } else { 1 };
         let max = (1 << self.s.bit_depth) - 1;
-        let mut output: Vec<u16> = (0..w * h)
-            .map(|i| {
-                let value = if !compound {
-                    predictions[0][i]
-                } else {
-                    (weights[0] * predictions[0][i]
-                        + weights[1] * predictions[1][i]
-                        + (1 << (shift - 1)))
-                        >> shift
-                };
-                value.clamp(0, max) as u16
-            })
-            .collect();
+        #[cfg(test)]
+        if INTER_SCRATCH_REFERENCE.with(|flag| flag.get()) {
+            scratch.blended = Vec::new();
+        }
+        let mut output = std::mem::take(&mut scratch.blended);
+        output.resize(w * h, 0);
+        for (i, target) in output.iter_mut().enumerate() {
+            let value = if !compound {
+                scratch.predictions[0][i]
+            } else {
+                (weights[0] * scratch.predictions[0][i]
+                    + weights[1] * scratch.predictions[1][i]
+                    + (1 << (shift - 1)))
+                    >> shift
+            };
+            *target = value.clamp(0, max) as u16;
+        }
         if let Some(mode) = info.inter_intra {
             let p = &self.planes[plane];
             let above = (y > 0).then(|| {
@@ -513,7 +554,7 @@ impl<'a> IntraTile<'a> {
             }
         }
         if info.obmc {
-            self.blend_obmc(info, plane, [y, x], [h, w], &mut output)?;
+            self.blend_obmc(info, plane, [y, x], [h, w], &mut output, scratch)?;
         }
         Ok(output)
     }
@@ -525,6 +566,7 @@ impl<'a> IntraTile<'a> {
         origin: [usize; 2],
         size: [usize; 2],
         output: &mut [u16],
+        scratch: &mut InterScratch,
     ) -> Result<(), Error> {
         const MASK2: [i32; 2] = [45, 64];
         const MASK4: [i32; 4] = [39, 50, 59, 64];
@@ -609,7 +651,8 @@ impl<'a> IntraTile<'a> {
                         [self.h.height, self.h.width],
                         [reference.header.height, reference.header.upscaled_width],
                     )?;
-                    let (prediction, _) = super::motion::predict(
+                    scratch.prepare(0);
+                    super::motion::predict_into(
                         &reference.planes[plane],
                         pw,
                         ph,
@@ -617,7 +660,11 @@ impl<'a> IntraTile<'a> {
                         location,
                         cell.filters,
                         false,
+                        self.motion_neon(),
+                        &mut scratch.predictions[0],
+                        &mut scratch.intermediate,
                     )?;
+                    let prediction = &scratch.predictions[0];
                     for iy in 0..ph {
                         for ix in 0..pw {
                             let index = (iy + if pass == 1 { offset } else { 0 }) * w
@@ -637,6 +684,14 @@ impl<'a> IntraTile<'a> {
         Ok(())
     }
 
+    fn motion_neon(&self) -> bool {
+        #[cfg(test)]
+        if INTER_SCRATCH_REFERENCE.with(|flag| flag.get()) {
+            return std::env::var_os("AV1_DISABLE_NEON").is_none();
+        }
+        self.use_neon
+    }
+
     pub(crate) fn save_cdfs(&self) -> FrameCdfs {
         FrameCdfs {
             partitions: self.partitions.clone(),
@@ -652,7 +707,7 @@ impl<'a> IntraTile<'a> {
             delta_q: self.delta_q_cdf,
             cfl_sign: self.cfl_sign,
             cfl_alpha: self.cfl_alpha.clone(),
-            coefficients: self.coefficients.clone(),
+            coefficients: self.coefficients.snapshot_cdfs(),
             inter: self.inter_cdfs.clone(),
         }
     }
@@ -765,6 +820,8 @@ impl<'a> IntraTile<'a> {
             references: [None; 7],
             motion_cells: vec![None; cols * rows],
             motion_field: None,
+            inter_scratch: InterScratch::default(),
+            use_neon: std::env::var_os("AV1_DISABLE_NEON").is_none(),
             tx_types: vec![0; cols * rows],
             restoration: super::restoration::Restoration::new(s, h)?,
             qindex: h.base_q_idx,
@@ -835,7 +892,11 @@ impl<'a> IntraTile<'a> {
             self.cols,
         )?;
         observer("deblocked", self);
-        let deblocked = self.planes.clone();
+        let deblocked = if self.restoration.has_filter() {
+            self.planes.clone()
+        } else {
+            Vec::new()
+        };
         super::filters::cdef(
             &mut self.planes,
             self.s,
@@ -1191,6 +1252,7 @@ impl<'a> IntraTile<'a> {
         } else {
             None
         };
+        let mut inter_scratch = std::mem::take(&mut self.inter_scratch);
         for plane in 0..if has_chroma { 3 } else { 1 } {
             let sx = usize::from(plane > 0 && self.s.subsampling_x);
             let sy = usize::from(plane > 0 && self.s.subsampling_y);
@@ -1220,7 +1282,7 @@ impl<'a> IntraTile<'a> {
             }
             let inter_prediction = info
                 .as_ref()
-                .map(|i| self.predict_inter(i, plane, px, py, pw, ph))
+                .map(|i| self.predict_inter(&mut inter_scratch, i, plane, px, py, pw, ph))
                 .transpose()?;
             let transforms = if plane == 0 && !inter_txs.is_empty() {
                 inter_txs.clone()
@@ -1450,25 +1512,31 @@ impl<'a> IntraTile<'a> {
                             let dequant = ((product.abs() & 0xffffff) / denom) * product.signum();
                             *coefficient = dequant.clamp(-bound, bound - 1) as i32;
                         }
-                        let residual = if self.h.coded_lossless {
-                            inverse_lossless_4x4(
-                                coefficients
-                                    .as_slice()
-                                    .try_into()
-                                    .map_err(|_| Error::Invalid("lossless transform dimensions"))?,
-                                self.s.bit_depth,
-                            )?
-                            .to_vec()
+                        #[cfg(test)]
+                        if INTER_SCRATCH_REFERENCE.with(|flag| flag.get()) {
+                            inter_scratch.residual = Vec::new();
+                        }
+                        inter_scratch.residual.resize(ptw * pth, 0);
+                        if self.h.coded_lossless {
+                            inter_scratch
+                                .residual
+                                .copy_from_slice(&inverse_lossless_4x4(
+                                    coefficients.as_slice().try_into().map_err(|_| {
+                                        Error::Invalid("lossless transform dimensions")
+                                    })?,
+                                    self.s.bit_depth,
+                                )?);
                         } else {
-                            inverse_transform(
+                            inverse_transform_into(
                                 ptw,
                                 pth,
                                 &coefficients,
                                 self.s.bit_depth,
                                 decoded.tx_type,
-                            )?
-                        };
-                        add_residual(&mut prediction, &residual, self.s.bit_depth)?;
+                                &mut inter_scratch.residual,
+                            )?;
+                        }
+                        add_residual(&mut prediction, &inter_scratch.residual, self.s.bit_depth)?;
                     }
                 }
                 if plane == 0 {
@@ -1497,7 +1565,11 @@ impl<'a> IntraTile<'a> {
                     }
                 }
             }
+            if let Some(prediction) = inter_prediction {
+                inter_scratch.blended = prediction;
+            }
         }
+        self.inter_scratch = inter_scratch;
         self.progress.blocks[index].reconstructed = true;
         for row in y..(y + h / 4).min(self.rows) {
             for col in x..(x + w / 4).min(self.cols) {
@@ -1544,13 +1616,21 @@ impl<'a> IntraTile<'a> {
             let width = (self.h.width as usize).div_ceil(1 << sx);
             let height = (self.h.height as usize).div_ceil(1 << sy);
             if width != p.width || height != p.height {
-                p.samples = (0..height)
-                    .flat_map(|y| {
-                        p.samples[y * p.stride..y * p.stride + width]
-                            .iter()
-                            .copied()
-                    })
-                    .collect();
+                #[cfg(test)]
+                let old_crop = super::decoder::lifecycle_reference();
+                #[cfg(not(test))]
+                let old_crop = false;
+                if !old_crop && width == p.width && p.stride == width {
+                    p.samples.truncate(height * p.stride);
+                } else {
+                    p.samples = (0..height)
+                        .flat_map(|y| {
+                            p.samples[y * p.stride..y * p.stride + width]
+                                .iter()
+                                .copied()
+                        })
+                        .collect();
+                }
                 p.width = width;
                 p.height = height;
                 p.stride = width;

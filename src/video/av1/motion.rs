@@ -169,6 +169,7 @@ pub(crate) fn sampling(
 
 /// Returns prediction in the precision used for compound blending (4 fractional bits at 8-bit).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn predict(
     plane: &DecodedPlane,
     width: usize,
@@ -178,9 +179,49 @@ pub(crate) fn predict(
     filters: [u8; 2],
     compound: bool,
 ) -> Result<(Vec<i32>, u32), Error> {
+    let mut output = Vec::new();
+    let mut intermediate = PredictionScratch::default();
+    let post = predict_into(
+        plane,
+        width,
+        height,
+        bit_depth,
+        location,
+        filters,
+        compound,
+        std::env::var_os("AV1_DISABLE_NEON").is_none(),
+        &mut output,
+        &mut intermediate,
+    )?;
+    Ok((output, post))
+}
+
+#[derive(Default)]
+pub(crate) struct PredictionScratch {
+    wide: Vec<i32>,
+    #[cfg(test)]
+    narrow: Vec<i16>,
+}
+
+pub(crate) fn predict_into(
+    plane: &DecodedPlane,
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    location: Sampling,
+    filters: [u8; 2],
+    compound: bool,
+    use_neon: bool,
+    output: &mut Vec<i32>,
+    scratch: &mut PredictionScratch,
+) -> Result<u32, Error> {
+    let intermediate = &mut scratch.wide;
     #[cfg(test)]
     if MOTION_REFERENCE.with(|flag| flag.get()) {
-        return predict_reference(plane, width, height, bit_depth, location, filters, compound);
+        let (samples, post) =
+            predict_reference(plane, width, height, bit_depth, location, filters, compound)?;
+        *output = samples;
+        return Ok(post);
     }
     #[cfg(test)]
     let _measure = super::profile::measure(0);
@@ -207,7 +248,8 @@ pub(crate) fn predict(
     if location.step == [1024; 2] && location.start.iter().all(|&p| ((p >> 6) & 15) == 0) {
         let base_y = location.start[0] >> 10;
         let base_x = location.start[1] >> 10;
-        let mut output = Vec::with_capacity(width * height);
+        output.clear();
+        output.reserve(width * height);
         for row in 0..height {
             let y = (base_y + row as i64).clamp(0, plane.height as i64 - 1) as usize;
             for col in 0..width {
@@ -215,7 +257,7 @@ pub(crate) fn predict(
                 output.push(i32::from(plane.samples[y * plane.stride + x]) << post);
             }
         }
-        return Ok((output, post));
+        return Ok(post);
     }
     let ih = (((height - 1) as i64 * location.step[0] + 1023) >> 10) as usize + 8;
     let filter = |f: u8, n: usize| -> usize {
@@ -229,7 +271,6 @@ pub(crate) fn predict(
     };
     let xf = filter(filters[1], width);
     let yf = filter(filters[0], height);
-    let use_neon = std::env::var_os("AV1_DISABLE_NEON").is_none();
     let mut coordinates = [[0usize; 8]; 128];
     let mut horizontal_weights = [[0i16; 8]; 128];
     for col in 0..width {
@@ -240,7 +281,208 @@ pub(crate) fn predict(
                 ((p >> 10) + tap as i64 - 3).clamp(0, plane.width as i64 - 1) as usize;
         }
     }
-    let mut intermediate = vec![0i32; ih * width];
+    intermediate.resize(ih * width, 0);
+    for row in 0..ih {
+        let y =
+            ((location.start[0] >> 10) + row as i64 - 3).clamp(0, plane.height as i64 - 1) as usize;
+        let samples = &plane.samples[y * plane.stride..y * plane.stride + plane.width];
+        let target = &mut intermediate[row * width..(row + 1) * width];
+        let mut col = 0;
+        #[cfg(target_arch = "aarch64")]
+        if use_neon
+            && location.step[1] == 1024
+            && (location.start[1] >> 10) >= 3
+            && (location.start[1] >> 10) + width as i64 + 4 <= plane.width as i64
+        {
+            let base = (location.start[1] >> 10) as usize - 3;
+            while col + 8 <= width {
+                // Full rows and their seven-sample tap halo were checked above.
+                unsafe {
+                    horizontal_neon_wide(
+                        samples.as_ptr().add(base + col),
+                        target.as_mut_ptr().add(col),
+                        &horizontal_weights[0],
+                        round0,
+                    );
+                }
+                col += 8;
+            }
+        }
+        for col in col..width {
+            let mut sum = 0;
+            for tap in 0..8 {
+                let weight = horizontal_weights[col][tap];
+                if weight != 0 {
+                    sum += i32::from(weight) * i32::from(samples[coordinates[col][tap]]);
+                }
+            }
+            target[col] = (sum + (1 << (round0 - 1))) >> round0;
+        }
+    }
+    output.resize(width * height, 0);
+    for row in 0..height {
+        let p = (location.start[0] & 1023) + location.step[0] * row as i64;
+        let weights = &SUBPEL_FILTERS[yf][((p >> 6) & 15) as usize];
+        let top = (p >> 10) as usize * width;
+        let mut col = 0;
+        #[cfg(target_arch = "aarch64")]
+        if use_neon {
+            while col + 4 <= width {
+                unsafe {
+                    vertical_neon_wide(
+                        intermediate.as_ptr().add(top + col),
+                        width,
+                        output.as_mut_ptr().add(row * width + col),
+                        weights,
+                        round1,
+                    );
+                }
+                col += 4;
+            }
+        }
+        for col in col..width {
+            let mut sum = 0;
+            for (tap, &weight) in weights.iter().enumerate() {
+                if weight != 0 {
+                    sum += i32::from(weight) * intermediate[top + tap * width + col];
+                }
+            }
+            output[row * width + col] = (sum + (1 << (round1 - 1))) >> round1;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = use_neon;
+    Ok(post)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn horizontal_neon_wide(
+    source: *const u16,
+    target: *mut i32,
+    weights: &[i16; 8],
+    round: u32,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut lo = vdupq_n_s32(0);
+        let mut hi = lo;
+        for (tap, &weight) in weights.iter().enumerate() {
+            if weight != 0 {
+                let values = vreinterpretq_s16_u16(vld1q_u16(source.add(tap)));
+                lo = vmlal_n_s16(lo, vget_low_s16(values), weight);
+                hi = vmlal_n_s16(hi, vget_high_s16(values), weight);
+            }
+        }
+        let rounding = vdupq_n_s32(1 << (round - 1));
+        let shift = vdupq_n_s32(-(round as i32));
+        vst1q_s32(target, vshlq_s32(vaddq_s32(lo, rounding), shift));
+        vst1q_s32(target.add(4), vshlq_s32(vaddq_s32(hi, rounding), shift));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn vertical_neon_wide(
+    source: *const i32,
+    stride: usize,
+    target: *mut i32,
+    weights: &[i16; 8],
+    round: u32,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut sum = vdupq_n_s32(0);
+        for (tap, &weight) in weights.iter().enumerate() {
+            if weight != 0 {
+                sum = vmlaq_n_s32(sum, vld1q_s32(source.add(tap * stride)), i32::from(weight));
+            }
+        }
+        let rounded = vaddq_s32(sum, vdupq_n_s32(1 << (round - 1)));
+        vst1q_s32(target, vshlq_s32(rounded, vdupq_n_s32(-(round as i32))));
+    }
+}
+
+#[cfg(test)]
+fn predict_into_narrow(
+    plane: &DecodedPlane,
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    location: Sampling,
+    filters: [u8; 2],
+    compound: bool,
+    use_neon: bool,
+    output: &mut Vec<i32>,
+    scratch: &mut PredictionScratch,
+) -> Result<u32, Error> {
+    let intermediate = &mut scratch.narrow;
+    #[cfg(test)]
+    if MOTION_REFERENCE.with(|flag| flag.get()) {
+        let (samples, post) =
+            predict_reference(plane, width, height, bit_depth, location, filters, compound)?;
+        *output = samples;
+        return Ok(post);
+    }
+    #[cfg(test)]
+    let _measure = super::profile::measure(0);
+    if ![8, 10, 12].contains(&bit_depth)
+        || width == 0
+        || height == 0
+        || width > 128
+        || height > 128
+        || filters.iter().any(|&f| f > 3)
+        || plane.width == 0
+        || plane.height == 0
+        || plane.stride < plane.width
+        || plane
+            .height
+            .checked_mul(plane.stride)
+            .is_none_or(|n| n > plane.samples.len())
+        || location.step.iter().any(|&s| !(64..=2048).contains(&s))
+    {
+        return Err(Error::Invalid("inter prediction inputs"));
+    }
+    let round0 = if bit_depth == 12 { 5 } else { 3 };
+    let round1 = if compound { 7 } else { 14 - round0 };
+    let post = 14 - round0 - round1;
+    if location.step == [1024; 2] && location.start.iter().all(|&p| ((p >> 6) & 15) == 0) {
+        let base_y = location.start[0] >> 10;
+        let base_x = location.start[1] >> 10;
+        output.clear();
+        output.reserve(width * height);
+        for row in 0..height {
+            let y = (base_y + row as i64).clamp(0, plane.height as i64 - 1) as usize;
+            for col in 0..width {
+                let x = (base_x + col as i64).clamp(0, plane.width as i64 - 1) as usize;
+                output.push(i32::from(plane.samples[y * plane.stride + x]) << post);
+            }
+        }
+        return Ok(post);
+    }
+    let ih = (((height - 1) as i64 * location.step[0] + 1023) >> 10) as usize + 8;
+    let filter = |f: u8, n: usize| -> usize {
+        if n > 4 || f == 3 {
+            f as usize
+        } else if f == 1 {
+            5
+        } else {
+            4
+        }
+    };
+    let xf = filter(filters[1], width);
+    let yf = filter(filters[0], height);
+    let mut coordinates = [[0usize; 8]; 128];
+    let mut horizontal_weights = [[0i16; 8]; 128];
+    for col in 0..width {
+        let p = location.start[1] + location.step[1] * col as i64;
+        horizontal_weights[col] = SUBPEL_FILTERS[xf][((p >> 6) & 15) as usize];
+        for tap in 0..8 {
+            coordinates[col][tap] =
+                ((p >> 10) + tap as i64 - 3).clamp(0, plane.width as i64 - 1) as usize;
+        }
+    }
+    intermediate.resize(ih * width, 0);
     for row in 0..ih {
         let y =
             ((location.start[0] >> 10) + row as i64 - 3).clamp(0, plane.height as i64 - 1) as usize;
@@ -275,10 +517,12 @@ pub(crate) fn predict(
                     sum += i32::from(weight) * i32::from(samples[coordinates[col][tap]]);
                 }
             }
-            target[col] = (sum + (1 << (round0 - 1))) >> round0;
+            // Normative tap sums are at most +184/-56. Decoded 8/10/12-bit
+            // samples and round0 constrain this intermediate to signed 16 bits.
+            target[col] = ((sum + (1 << (round0 - 1))) >> round0) as i16;
         }
     }
-    let mut output = vec![0; width * height];
+    output.resize(width * height, 0);
     for row in 0..height {
         let p = (location.start[0] & 1023) + location.step[0] * row as i64;
         let weights = &SUBPEL_FILTERS[yf][((p >> 6) & 15) as usize];
@@ -286,7 +530,7 @@ pub(crate) fn predict(
         let mut col = 0;
         #[cfg(target_arch = "aarch64")]
         if use_neon {
-            while col + 4 <= width {
+            while col + 8 <= width {
                 unsafe {
                     vertical_neon(
                         intermediate.as_ptr().add(top + col),
@@ -296,14 +540,14 @@ pub(crate) fn predict(
                         round1,
                     );
                 }
-                col += 4;
+                col += 8;
             }
         }
         for col in col..width {
             let mut sum = 0;
             for (tap, &weight) in weights.iter().enumerate() {
                 if weight != 0 {
-                    sum += i32::from(weight) * intermediate[top + tap * width + col];
+                    sum += i32::from(weight) * i32::from(intermediate[top + tap * width + col]);
                 }
             }
             output[row * width + col] = (sum + (1 << (round1 - 1))) >> round1;
@@ -311,12 +555,12 @@ pub(crate) fn predict(
     }
     #[cfg(not(target_arch = "aarch64"))]
     let _ = use_neon;
-    Ok((output, post))
+    Ok(post)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
-unsafe fn horizontal_neon(source: *const u16, target: *mut i32, weights: &[i16; 8], round: u32) {
+unsafe fn horizontal_neon(source: *const u16, target: *mut i16, weights: &[i16; 8], round: u32) {
     use std::arch::aarch64::*;
     unsafe {
         let mut lo = vdupq_n_s32(0);
@@ -330,15 +574,16 @@ unsafe fn horizontal_neon(source: *const u16, target: *mut i32, weights: &[i16; 
         }
         let rounding = vdupq_n_s32(1 << (round - 1));
         let shift = vdupq_n_s32(-(round as i32));
-        vst1q_s32(target, vshlq_s32(vaddq_s32(lo, rounding), shift));
-        vst1q_s32(target.add(4), vshlq_s32(vaddq_s32(hi, rounding), shift));
+        let lo = vmovn_s32(vshlq_s32(vaddq_s32(lo, rounding), shift));
+        let hi = vmovn_s32(vshlq_s32(vaddq_s32(hi, rounding), shift));
+        vst1q_s16(target, vcombine_s16(lo, hi));
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 unsafe fn vertical_neon(
-    source: *const i32,
+    source: *const i16,
     stride: usize,
     target: *mut i32,
     weights: &[i16; 8],
@@ -346,14 +591,19 @@ unsafe fn vertical_neon(
 ) {
     use std::arch::aarch64::*;
     unsafe {
-        let mut sum = vdupq_n_s32(0);
+        let mut lo = vdupq_n_s32(0);
+        let mut hi = lo;
         for (tap, &weight) in weights.iter().enumerate() {
             if weight != 0 {
-                sum = vmlaq_n_s32(sum, vld1q_s32(source.add(tap * stride)), i32::from(weight));
+                let values = vld1q_s16(source.add(tap * stride));
+                lo = vmlal_n_s16(lo, vget_low_s16(values), weight);
+                hi = vmlal_n_s16(hi, vget_high_s16(values), weight);
             }
         }
-        let rounded = vaddq_s32(sum, vdupq_n_s32(1 << (round - 1)));
-        vst1q_s32(target, vshlq_s32(rounded, vdupq_n_s32(-(round as i32))));
+        let rounding = vdupq_n_s32(1 << (round - 1));
+        let shift = vdupq_n_s32(-(round as i32));
+        vst1q_s32(target, vshlq_s32(vaddq_s32(lo, rounding), shift));
+        vst1q_s32(target.add(4), vshlq_s32(vaddq_s32(hi, rounding), shift));
     }
 }
 
@@ -459,8 +709,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normative_horizontal_intermediates_fit_signed_sixteen_bits() {
+        for bit_depth in [8, 10, 12] {
+            let max = (1_i32 << bit_depth) - 1;
+            let round = if bit_depth == 12 { 5 } else { 3 };
+            for family in SUBPEL_FILTERS {
+                for weights in family {
+                    let positive: i32 = weights.iter().map(|&w| i32::from(w.max(0))).sum();
+                    let negative: i32 = weights.iter().map(|&w| i32::from(w.min(0))).sum();
+                    assert!(positive <= 184 && negative >= -56);
+                    for extreme in [positive, negative] {
+                        let value = (extreme * max + (1 << (round - 1))) >> round;
+                        assert!(i16::try_from(value).is_ok());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reusable_prediction_buffers_match_allocating_reference() {
+        let mut output = Vec::with_capacity(128 * 128);
+        let mut intermediate = PredictionScratch {
+            narrow: Vec::with_capacity(40000),
+            wide: Vec::with_capacity(40000),
+        };
+        let output_pointer = output.as_ptr();
+        let intermediate_pointer = intermediate.wide.as_ptr();
+        for bit_depth in [8, 10, 12] {
+            let plane = DecodedPlane {
+                width: 71,
+                height: 67,
+                stride: 79,
+                samples: (0..79 * 67)
+                    .map(|i| ((i * 173 + 29) & ((1 << bit_depth) - 1)) as u16)
+                    .collect(),
+            };
+            for use_neon in [false, true] {
+                for (width, height) in [(128, 128), (4, 4), (17, 11), (64, 32), (8, 8)] {
+                    for compound in [false, true] {
+                        for location in [
+                            Sampling {
+                                start: [8192, 8192],
+                                step: [1024; 2],
+                            },
+                            Sampling {
+                                start: [8704, 8384],
+                                step: [1024; 2],
+                            },
+                            Sampling {
+                                start: [-128, 65024],
+                                step: [2048, 768],
+                            },
+                        ] {
+                            output.fill(i32::MIN);
+                            intermediate.wide.fill(i32::MAX);
+                            let expected = predict_reference(
+                                &plane,
+                                width,
+                                height,
+                                bit_depth,
+                                location,
+                                [1, 2],
+                                compound,
+                            )
+                            .unwrap();
+                            let post = predict_into(
+                                &plane,
+                                width,
+                                height,
+                                bit_depth,
+                                location,
+                                [1, 2],
+                                compound,
+                                use_neon,
+                                &mut output,
+                                &mut intermediate,
+                            )
+                            .unwrap();
+                            assert_eq!((&output, post), (&expected.0, expected.1));
+                            assert_eq!(output.as_ptr(), output_pointer);
+                            assert_eq!(intermediate.wide.as_ptr(), intermediate_pointer);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cached_scalar_and_neon_interpolation_match_original() {
         let mut state = 511u32;
+        let mut scratch = PredictionScratch::default();
+        let mut output = Vec::new();
         for bit_depth in [8, 10, 12] {
             let plane = DecodedPlane {
                 width: 64,
@@ -500,6 +841,22 @@ mod tests {
                                         actual, expected,
                                         "depth={bit_depth} compound={compound} size={width}x{height} filter={filters:?} phase={phase} origin={origin} step={step:?}"
                                     );
+                                    for use_neon in [false, true] {
+                                        let post = predict_into_narrow(
+                                            &plane,
+                                            width,
+                                            height,
+                                            bit_depth,
+                                            location,
+                                            filters,
+                                            compound,
+                                            use_neon,
+                                            &mut output,
+                                            &mut scratch,
+                                        )
+                                        .unwrap();
+                                        assert_eq!((&output, post), (&expected.0, expected.1));
+                                    }
                                 }
                             }
                         }

@@ -206,6 +206,8 @@ pub(crate) fn predict(
     p: [i32; 6],
     compound: bool,
 ) -> Result<(Vec<i32>, u32), Error> {
+    #[cfg(test)]
+    let _measure = super::profile::measure(4);
     let [alpha, beta, gamma, delta] = shear(p).ok_or(Error::Invalid("invalid warped shear"))?;
     let [h, w] = size;
     let [y, x] = origin;

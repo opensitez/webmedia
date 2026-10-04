@@ -2,6 +2,7 @@
 //!
 //! Packet extraction is separate from PCM synthesis and device playback.
 
+pub mod mp4;
 pub mod opus;
 pub mod transform;
 pub mod vorbis;

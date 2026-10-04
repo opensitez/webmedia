@@ -69,10 +69,52 @@ pub(crate) struct DecodedCoefficients {
 }
 
 impl CoefficientState {
+    pub(crate) fn snapshot_cdfs(&self) -> Self {
+        #[cfg(test)]
+        if super::decoder::lifecycle_reference() {
+            return self.clone();
+        }
+        // Neighbor contexts belong to the tile, not the saved frame CDFs.
+        Self {
+            boundaries: Vec::new(),
+            skip: self.skip.clone(),
+            eob: self.eob.clone(),
+            base_eob: self.base_eob.clone(),
+            base: self.base.clone(),
+            eob_extra: self.eob_extra.clone(),
+            br: self.br.clone(),
+            dc_sign: self.dc_sign,
+            tx1: self.tx1.clone(),
+            tx2: self.tx2.clone(),
+            inter_tx1: self.inter_tx1.clone(),
+            inter_tx2: self.inter_tx2.clone(),
+            inter_tx3: self.inter_tx3.clone(),
+        }
+    }
+
     pub(crate) fn load_cdfs(&mut self, saved: &Self) {
-        let boundaries = std::mem::take(&mut self.boundaries);
-        *self = saved.clone();
-        self.boundaries = boundaries;
+        #[cfg(test)]
+        if super::decoder::lifecycle_reference() {
+            let boundaries = std::mem::take(&mut self.boundaries);
+            *self = saved.clone();
+            self.boundaries = boundaries;
+            self.reset_counts();
+            return;
+        }
+        self.skip.clone_from(&saved.skip);
+        for (target, source) in self.eob.iter_mut().zip(&saved.eob) {
+            target.clone_from(source);
+        }
+        self.base_eob.clone_from(&saved.base_eob);
+        self.base.clone_from(&saved.base);
+        self.eob_extra.clone_from(&saved.eob_extra);
+        self.br.clone_from(&saved.br);
+        self.dc_sign = saved.dc_sign;
+        self.tx1.clone_from(&saved.tx1);
+        self.tx2.clone_from(&saved.tx2);
+        self.inter_tx1.clone_from(&saved.inter_tx1);
+        self.inter_tx2.clone_from(&saved.inter_tx2);
+        self.inter_tx3.clone_from(&saved.inter_tx3);
         self.reset_counts();
     }
 
@@ -469,6 +511,39 @@ fn default_scan(w: usize, h: usize) -> Result<&'static [u16], Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_cdfs_exclude_boundaries_and_load_reuses_local_storage() {
+        let mut source = CoefficientState::new(128, &[(64, 64), (32, 32), (32, 32)]);
+        source.boundaries[0].above_level.fill(23);
+        source.skip[2] = 31;
+        source.base[4] = 19;
+        let saved = source.snapshot_cdfs();
+        assert!(saved.boundaries.is_empty());
+        let mut target = CoefficientState::new(64, &[(64, 64), (32, 32), (32, 32)]);
+        target.boundaries[0].above_level.fill(7);
+        let skip_storage = target.skip.as_ptr();
+        let base_storage = target.base.as_ptr();
+        let boundary_storage = target.boundaries[0].above_level.as_ptr();
+        target.load_cdfs(&saved);
+        assert_eq!(target.skip.as_ptr(), skip_storage);
+        assert_eq!(target.base.as_ptr(), base_storage);
+        assert_eq!(target.boundaries[0].above_level.as_ptr(), boundary_storage);
+        assert!(target.boundaries[0].above_level.iter().all(|&v| v == 7));
+        source.reset_counts();
+        assert_eq!(target.skip, source.skip);
+        assert_eq!(target.eob, source.eob);
+        assert_eq!(target.base_eob, source.base_eob);
+        assert_eq!(target.base, source.base);
+        assert_eq!(target.eob_extra, source.eob_extra);
+        assert_eq!(target.br, source.br);
+        assert_eq!(target.dc_sign, source.dc_sign);
+        assert_eq!(target.tx1, source.tx1);
+        assert_eq!(target.tx2, source.tx2);
+        assert_eq!(target.inter_tx1, source.inter_tx1);
+        assert_eq!(target.inter_tx2, source.inter_tx2);
+        assert_eq!(target.inter_tx3, source.inter_tx3);
+    }
     #[test]
     fn normative_inter_transform_symbol_order() {
         assert_eq!(&INTER_TX_SET1[12..], [3, 6, 7, 8]);

@@ -10,6 +10,7 @@ pub(super) struct Av1PacketDecoder {
     sequence: Option<SequenceHeader>,
     decoder: av1::Av1Decoder,
     pending: VecDeque<Obu>,
+    conversion: Option<YuvKeyFrame>,
 }
 
 fn invalid(message: &str) -> MediaDecodeError {
@@ -87,6 +88,7 @@ impl Av1PacketDecoder {
             sequence: None,
             decoder: av1::Av1Decoder::new(),
             pending: VecDeque::new(),
+            conversion: None,
         };
         for (index, obu) in obus(&private[4..])?.into_iter().enumerate() {
             match obu.kind {
@@ -162,7 +164,7 @@ impl Av1PacketDecoder {
                     if decoded.planes.len() != if sequence.monochrome { 1 } else { 3 } {
                         return Err(invalid("invalid AV1 decoded plane count"));
                     }
-                    let mut yuv = YuvKeyFrame::new(width, height);
+                    let yuv = conversion_buffer(&mut self.conversion, width, height);
                     if sequence.monochrome {
                         yuv.u.pixels.fill(128);
                         yuv.v.pixels.fill(128);
@@ -215,9 +217,30 @@ impl Av1PacketDecoder {
     }
 }
 
+fn conversion_buffer(buffer: &mut Option<YuvKeyFrame>, width: usize, height: usize) -> &mut YuvKeyFrame {
+    if buffer.as_ref().is_none_or(|frame| frame.width != width || frame.height != height) {
+        *buffer = Some(YuvKeyFrame::new(width, height));
+    }
+    buffer.as_mut().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversion_storage_is_reused_until_dimensions_change() {
+        let mut buffer = None;
+        let frame = conversion_buffer(&mut buffer, 65, 33);
+        frame.y.pixels.fill(17);
+        let pointers = (frame.y.pixels.as_ptr(), frame.u.pixels.as_ptr(), frame.v.pixels.as_ptr());
+        let frame = conversion_buffer(&mut buffer, 65, 33);
+        assert_eq!(pointers, (frame.y.pixels.as_ptr(), frame.u.pixels.as_ptr(), frame.v.pixels.as_ptr()));
+        assert!(frame.y.pixels.iter().all(|&sample| sample == 17));
+        let frame = conversion_buffer(&mut buffer, 128, 64);
+        assert_eq!((frame.width, frame.height), (128, 64));
+        assert!(frame.y.pixels.iter().all(|&sample| sample == 0));
+    }
 
     #[test]
     fn checked_plane_packing_preserves_all_values_and_odd_tails() {
