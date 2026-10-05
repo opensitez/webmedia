@@ -3,6 +3,16 @@
 use super::coefficients::tx_index;
 use super::syntax::Error;
 
+#[cfg(test)]
+thread_local! {
+    static FUSED_COLUMNS_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_fused_columns_candidate(enabled: bool) {
+    FUSED_COLUMNS_CANDIDATE.set(enabled);
+}
+
 const COS: [i64; 65] = [
     4096, 4095, 4091, 4085, 4076, 4065, 4052, 4036, 4017, 3996, 3973, 3948, 3920, 3889, 3857, 3822,
     3784, 3745, 3703, 3659, 3612, 3564, 3513, 3461, 3406, 3349, 3290, 3229, 3166, 3102, 3035, 2967,
@@ -647,6 +657,39 @@ fn initialized_scratch(storage: &mut [std::mem::MaybeUninit<i64>]) -> &mut [i64]
 }
 
 #[cfg(test)]
+fn prepare_fused_columns<'a, const NATIVE: bool, const SPARSE: bool>(
+    storage: &'a mut [std::mem::MaybeUninit<i64>],
+    coefficients: &[i32],
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    row_kind: usize,
+    row_shift: u8,
+) -> Result<&'a mut [i64], Error> {
+    let rectangular = w.ilog2().abs_diff(h.ilog2()) == 1;
+    let clamp = 1i64 << ((bit_depth + 6).max(16) - 1);
+    let mut row_storage = [0; 64];
+    let row = &mut row_storage[..w];
+    for y in 0..h {
+        let input = &coefficients[y * w..(y + 1) * w];
+        if SPARSE && input.iter().all(|&value| value == 0) {
+            validate_axis(w, row_kind)?;
+            for x in 0..w {
+                storage[x * h + y].write(0);
+            }
+        } else {
+            prepare_row::<NATIVE>(row, input, rectangular);
+            axis_dispatch::<SPARSE>(row, bit_depth + 8, row_kind)?;
+            for x in 0..w {
+                storage[x * h + y].write(round(row[x], row_shift).clamp(-clamp, clamp - 1));
+            }
+        }
+    }
+    // Every (x,y) is written above. On errors the uninitialized storage is never exposed.
+    Ok(unsafe { std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast(), w * h) })
+}
+
+#[cfg(test)]
 fn inverse_transform_fast<const NATIVE: bool, const SPARSE: bool>(
     w: usize,
     h: usize,
@@ -696,25 +739,42 @@ fn inverse_transform_fast_into<const NATIVE: bool, const SPARSE: bool>(
     }
     let mut residual_storage = [std::mem::MaybeUninit::uninit(); 4096];
     let mut columns_storage = [std::mem::MaybeUninit::uninit(); 4096];
-    let residual = initialized_scratch(&mut residual_storage[..w * h]);
-    let columns = initialized_scratch(&mut columns_storage[..w * h]);
-    let mut row_storage = [0; 64];
-    let row = &mut row_storage[..w];
-    let rectangular = w.ilog2().abs_diff(h.ilog2()) == 1;
-    let clamp = 1i64 << ((bit_depth + 6).max(16) - 1);
-    for y in 0..h {
-        let input = &coefficients[y * w..(y + 1) * w];
-        if SPARSE && input.iter().all(|&value| value == 0) {
-            validate_axis(w, row_kind)?;
-            continue;
-        }
-        prepare_row::<NATIVE>(row, input, rectangular);
-        axis_dispatch::<SPARSE>(row, bit_depth + 8, row_kind)?;
-        for x in 0..w {
-            residual[y * w + x] = round(row[x], row_shift).clamp(-clamp, clamp - 1);
-        }
-    }
-    transpose::<NATIVE>(columns, residual, w, h);
+    #[cfg(test)]
+    let fused = FUSED_COLUMNS_CANDIDATE.get() && (w >= 32 || h >= 32);
+    #[cfg(test)]
+    let columns = if fused {
+        prepare_fused_columns::<NATIVE, SPARSE>(
+            &mut columns_storage[..w * h],
+            coefficients,
+            w,
+            h,
+            bit_depth,
+            row_kind,
+            row_shift,
+        )?
+    } else {
+        prepare_transform_columns::<NATIVE, SPARSE>(
+            &mut residual_storage[..w * h],
+            &mut columns_storage[..w * h],
+            coefficients,
+            w,
+            h,
+            bit_depth,
+            row_kind,
+            row_shift,
+        )?
+    };
+    #[cfg(not(test))]
+    let columns = prepare_transform_columns::<NATIVE, SPARSE>(
+        &mut residual_storage[..w * h],
+        &mut columns_storage[..w * h],
+        coefficients,
+        w,
+        h,
+        bit_depth,
+        row_kind,
+        row_shift,
+    )?;
     #[cfg(test)]
     sparse_profile::columns((w, h, bit_depth, tx_type), columns);
     for column in columns.chunks_exact_mut(h) {
@@ -732,6 +792,39 @@ fn inverse_transform_fast_into<const NATIVE: bool, const SPARSE: bool>(
         }
     }
     Ok(())
+}
+
+#[inline(always)]
+fn prepare_transform_columns<'a, const NATIVE: bool, const SPARSE: bool>(
+    residual_storage: &mut [std::mem::MaybeUninit<i64>],
+    columns_storage: &'a mut [std::mem::MaybeUninit<i64>],
+    coefficients: &[i32],
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    row_kind: usize,
+    row_shift: u8,
+) -> Result<&'a mut [i64], Error> {
+    let residual = initialized_scratch(residual_storage);
+    let columns = initialized_scratch(columns_storage);
+    let mut row_storage = [0; 64];
+    let row = &mut row_storage[..w];
+    let rectangular = w.ilog2().abs_diff(h.ilog2()) == 1;
+    let clamp = 1i64 << ((bit_depth + 6).max(16) - 1);
+    for y in 0..h {
+        let input = &coefficients[y * w..(y + 1) * w];
+        if SPARSE && input.iter().all(|&value| value == 0) {
+            validate_axis(w, row_kind)?;
+            continue;
+        }
+        prepare_row::<NATIVE>(row, input, rectangular);
+        axis_dispatch::<SPARSE>(row, bit_depth + 8, row_kind)?;
+        for x in 0..w {
+            residual[y * w + x] = round(row[x], row_shift).clamp(-clamp, clamp - 1);
+        }
+    }
+    transpose::<NATIVE>(columns, residual, w, h);
+    Ok(columns)
 }
 
 #[cfg(test)]
@@ -960,6 +1053,13 @@ mod tests {
             totals[9]
         );
         assert!(totals[0] > 0);
+    }
+
+    #[test]
+    fn fused_columns_candidate_matches_reference_and_preserves_errors() {
+        set_fused_columns_candidate(true);
+        caller_output_matches_reference_and_preserves_errors();
+        set_fused_columns_candidate(false);
     }
 
     #[test]

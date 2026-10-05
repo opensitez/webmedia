@@ -391,13 +391,34 @@ impl<'a> InterFrameLayout<'a> {
         level.clamp(0, 63) as u8
     }
 
+    // Retain the uncounted API for reference parity checks.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn read_macroblocks(
         &mut self,
         state: &mut InterState,
         mb_width: usize,
         mb_height: usize,
     ) -> Result<Vec<InterMacroblock>, MediaDecodeError> {
+        self.read_macroblocks_impl::<false>(state, mb_width, mb_height).map(|(modes, _)| modes)
+    }
+
+    pub(super) fn read_macroblocks_counted(
+        &mut self,
+        state: &mut InterState,
+        mb_width: usize,
+        mb_height: usize,
+    ) -> Result<(Vec<InterMacroblock>, [usize; 4]), MediaDecodeError> {
+        self.read_macroblocks_impl::<true>(state, mb_width, mb_height)
+    }
+
+    fn read_macroblocks_impl<const COUNT: bool>(
+        &mut self,
+        state: &mut InterState,
+        mb_width: usize,
+        mb_height: usize,
+    ) -> Result<(Vec<InterMacroblock>, [usize; 4]), MediaDecodeError> {
         let mut result = Vec::with_capacity(mb_width * mb_height);
+        let mut zero_references = [0usize; 4];
         if state.segment_map.len() != mb_width * mb_height {
             Arc::make_mut(&mut state.segment_map).resize(mb_width * mb_height, 0);
         }
@@ -472,6 +493,9 @@ impl<'a> InterFrameLayout<'a> {
                 .map_err(|error| {
                     MediaDecodeError::InvalidData(format!("VP8 mode at ({x}, {y}): {error:?}"))
                 })?;
+                if COUNT && mb.mode == 7 && (1..=3).contains(&mb.reference) {
+                    zero_references[mb.reference as usize] += 1;
+                }
                 result.push(mb);
             }
         }
@@ -481,7 +505,7 @@ impl<'a> InterFrameLayout<'a> {
                 *segment = mode.segment;
             }
         }
-        Ok(result)
+        Ok((result, zero_references))
     }
 }
 
@@ -875,6 +899,56 @@ pub(super) fn test_interframe(state: &InterState, reference: Option<u8>, vertica
 }
 
 #[cfg(test)]
+pub(super) fn test_entropy_interframe(state: &InterState, refresh: bool, skip: bool) -> Vec<u8> {
+    let mut writer = TestBoolWriter::new();
+    writer.write(false, 128); // segmentation
+    writer.write(false, 128); // normal filter, level zero
+    writer.literal(0, 6);
+    writer.literal(0, 3);
+    writer.write(false, 128); // filter deltas
+    writer.literal(0, 2);
+    writer.literal(0, 7);
+    for _ in 0..5 { writer.write(false, 128); }
+    writer.write(false, 128); // golden and alternate stay unchanged
+    writer.write(false, 128);
+    writer.literal(0, 2);
+    writer.literal(0, 2);
+    writer.write(false, 128);
+    writer.write(false, 128);
+    writer.write(refresh, 128);
+    writer.write(true, 128); // refresh last
+    for (index, probability) in super::vp8_probs::COEFF_UPDATE_PROBS.into_iter().enumerate() {
+        writer.write(index == 0, probability);
+        if index == 0 { writer.literal(73, 8); }
+    }
+    writer.write(true, 128); // enable macroblock coefficient skip flags
+    for _ in 0..4 { writer.literal(128, 8); }
+    writer.write(true, 128);
+    for value in [11, 22, 33, 44] { writer.literal(value, 8); }
+    writer.write(true, 128);
+    for value in [55, 66, 77] { writer.literal(value, 8); }
+    for (component, probabilities) in MV_UPDATE_PROBS.into_iter().enumerate() {
+        for (index, probability) in probabilities.into_iter().enumerate() {
+            let update = component == 0 && index == 0;
+            writer.write(update, probability);
+            if update { writer.literal(0, 7); } // zero encodes probability one
+        }
+    }
+    for _ in 0..state.mb_width * state.mb_height {
+        writer.write(skip, 128);
+        writer.write(false, 128); // intra
+        writer.write(false, 11); // Y DC with this frame's updated probability
+        writer.write(false, 55); // chroma DC
+    }
+    let control = writer.finish();
+    let tag = ((control.len() as u32) << 5) | 0x11;
+    let mut frame = tag.to_le_bytes()[..3].to_vec();
+    frame.extend(control);
+    frame.extend([0, 0]);
+    frame
+}
+
+#[cfg(test)]
 pub(super) fn test_segmented_interframe(state: &InterState, enabled: bool,
     features: Option<(bool, [i16; 4], [i16; 4])>, map_update: bool) -> Vec<u8>
 {
@@ -987,6 +1061,62 @@ mod tests {
         }
     }
     use crate::video::webm::WebmVp8Stream;
+
+    #[test]
+    fn counted_macroblocks_preserve_legacy_state_errors_and_entropy_cursor() {
+        let probe = |initial: &InterState, packet: &[u8], counted: bool| {
+            let mut state = initial.clone();
+            let mut counts = [0usize; 4];
+            let mut trailing = Vec::new();
+            let result = match InterFrameLayout::parse(packet, &mut state) {
+                Err(error) => format!("parse:{error:?}"),
+                Ok(mut layout) => {
+                    let (width, height) = (state.mb_width, state.mb_height);
+                    let modes = if counted {
+                        layout.read_macroblocks_counted(&mut state, width, height)
+                            .map(|(modes, value)| { counts = value; modes })
+                    } else { layout.read_macroblocks(&mut state, width, height) };
+                    let result = match modes {
+                        Ok(modes) => {
+                            if !counted {
+                                for mode in &modes {
+                                    if mode.mode == 7 && (1..=3).contains(&mode.reference) {
+                                        counts[mode.reference as usize] += 1;
+                                    }
+                                }
+                            }
+                            format!("ok:{modes:?}")
+                        }
+                        Err(error) => format!("modes:{error:?}"),
+                    };
+                    for _ in 0..32 { trailing.push(format!("{:?}", layout.control.read_bit())); }
+                    result
+                }
+            };
+            (result, counts, state, trailing)
+        };
+        let mut cases = 0;
+        for bytes in [include_bytes!("../../tests/fixtures/vp8-segment-modes.ivf").as_slice(),
+            include_bytes!("../../tests/fixtures/vp8-reference-updates.ivf").as_slice()] {
+            let mut at = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize;
+            let size = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            at += 12;
+            let key = &bytes[at..at + size]; at += size;
+            let (_, state) = super::super::vp8_keyframe::decode_keyframe_with_state(key).unwrap();
+            let size = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            at += 12;
+            let inter = &bytes[at..at + size];
+            for cut in 0..=inter.len() {
+                assert_eq!(probe(&state, &inter[..cut], false), probe(&state, &inter[..cut], true),
+                    "interframe prefix {cut}");
+                cases += 1;
+            }
+            let full = probe(&state, inter, true);
+            assert!(full.0.starts_with("ok:"));
+        }
+        assert!(cases > 2000);
+        eprintln!("counted parser legacy parity: {cases} prefixes");
+    }
 
     #[test]
     fn split_neighbor_uses_bottom_right_vector_and_reference_bias() {

@@ -154,6 +154,9 @@ impl Decoder {
             ));
         }
         let current = &mut self.current;
+        #[cfg(test)]
+        let transform_timer =
+            super::entropy::profile::Timer::start(super::entropy::profile::Stage::Transform);
         for (channel, spectrum) in current.iter_mut().zip(&self.spectrum.channels) {
             channel.resize(size, 0.0);
             self.transforms[size_index].inverse(spectrum, channel)?;
@@ -161,6 +164,11 @@ impl Decoder {
                 *sample *= window;
             }
         }
+        #[cfg(test)]
+        drop(transform_timer);
+        #[cfg(test)]
+        let overlap_timer =
+            super::entropy::profile::Timer::start(super::entropy::profile::Stage::Overlap);
         let samples = if let Some(previous_size) = self.previous_size {
             let previous = &self.previous;
             let count = previous_size / 4 + size / 4;
@@ -193,6 +201,8 @@ impl Decoder {
         } else {
             None
         };
+        #[cfg(test)]
+        drop(overlap_timer);
         // Scratch can change on failure, but the committed overlap and timing
         // state change only after every output sample has been checked.
         std::mem::swap(&mut self.previous, &mut self.current);
@@ -744,6 +754,108 @@ mod tests {
         assert!(long[576..1472].iter().all(|&value| value == 1.0));
         assert_eq!(&long[1472..1600], &short[128..]);
         assert!(long[1600..].iter().all(|&value| value == 0.0));
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    #[ignore = "bounded actual-fixture stage profile; requires VORBIS_FIXTURE_WEBM and timing slot"]
+    fn actual_fixture_stage_profile_preserves_pcm() {
+        use super::super::entropy::profile;
+        use crate::video::webm::{WebmPacket, WebmStream};
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(std::env::var("VORBIS_FIXTURE_WEBM").unwrap()).unwrap();
+        let mut stream = WebmStream::new();
+        let mut buffer = [0u8; 4093];
+        let mut packets = Vec::new();
+        while packets.len() < 512 {
+            let length = file.read(&mut buffer).unwrap();
+            if length == 0 {
+                break;
+            }
+            for packet in stream.push_packets(&buffer[..length]).unwrap() {
+                if let WebmPacket::Audio(block) = packet {
+                    packets.extend(block.packets.into_iter().take(512 - packets.len()));
+                }
+            }
+        }
+        assert!(!packets.is_empty());
+        let headers = Headers::from_webm(&stream.audio_track().unwrap().codec_private).unwrap();
+        let mut decoder = Decoder::new(&headers, 1 << 20, 1 << 20).unwrap();
+        profile::begin(0);
+        let expected: Vec<_> = packets
+            .iter()
+            .map(|packet| decoder.decode(packet).unwrap().map(|audio| audio.samples))
+            .collect();
+        profile::finish();
+        // Inclusive stage times are not additive. Per-codeword clock calls are
+        // deliberately isolated from broad-stage measurements.
+        for mask in [0, profile::BROAD, profile::LEAVES] {
+            decoder.reset();
+            for packet in &packets {
+                std::hint::black_box(decoder.decode(packet).unwrap());
+            }
+            for round in 0..3 {
+                decoder.reset();
+                profile::begin(mask);
+                let started = std::time::Instant::now();
+                for (index, packet) in packets.iter().enumerate() {
+                    let audio = decoder.decode(packet).unwrap();
+                    match (audio, &expected[index]) {
+                        (None, None) => (),
+                        (Some(audio), Some(expected)) => {
+                            assert_eq!(audio.samples.len(), expected.len());
+                            assert!(
+                                audio
+                                    .samples
+                                    .iter()
+                                    .zip(expected)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                "packet {index}"
+                            );
+                            std::hint::black_box(audio);
+                        }
+                        _ => panic!("priming changed at packet {index}"),
+                    }
+                }
+                let elapsed = started.elapsed();
+                let stages = profile::finish();
+                eprintln!(
+                    "Vorbis mask={mask:#x} round={round} packets={} wall_us={} (includes PCM validation)",
+                    packets.len(),
+                    elapsed.as_micros()
+                );
+                for (stage, sample) in profile::STAGES.iter().zip(stages) {
+                    if sample.calls != 0 {
+                        eprintln!(
+                            "  {stage:?}: calls={} inclusive_us={:.3}",
+                            sample.calls,
+                            sample.nanoseconds as f64 / 1000.0
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_mdct_mixed_windows_overlap_and_reset_match_existing_oracles() {
+        crate::audio::transform::with_reduced_mdct(|| {
+            mixed_packet_windows_and_three_channel_residue_match_scalar_oracle();
+            rejected_headers_and_non_audio_packets_preserve_overlap_and_reset_reprimes();
+            reused_spectrum_clears_partial_packets_and_double_buffers_survive_reset();
+            synthesis_failure_keeps_committed_overlap_and_overwrites_dirty_scratch();
+        });
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    #[ignore = "original/reduced full Vorbis oracle/reset gates; requires fixtures and correctness slot"]
+    fn supplied_vorbis_reduced_mdct_full_stream_matches_oracle_and_reset_loops() {
+        supplied_vorbis_full_stream_matches_oracle_and_reset_loops();
+        crate::audio::transform::with_reduced_mdct(
+            supplied_vorbis_full_stream_matches_oracle_and_reset_loops,
+        );
     }
 
     #[cfg(feature = "video")]

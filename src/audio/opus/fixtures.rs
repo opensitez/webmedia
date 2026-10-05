@@ -19,6 +19,22 @@ fn binary(name: &str, args: &[&str]) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "original/reduced whole Spacewalk PCM gates; requires fixture, FFmpeg binaries and correctness slot"]
+fn spacewalk_reduced_mdct_whole_track_music_oracle() {
+    spacewalk_whole_track_music_oracle();
+    crate::audio::transform::with_reduced_mdct(spacewalk_whole_track_music_oracle);
+}
+
+#[test]
+#[ignore = "original/reduced whole Partyfire PCM gates; requires fixture, PCM oracle and correctness slot"]
+fn partyfire_reduced_mdct_whole_track_music_oracle() {
+    partyfire_packet_modes_prefixes_and_non_silent_oracle();
+    crate::audio::transform::with_reduced_mdct(
+        partyfire_packet_modes_prefixes_and_non_silent_oracle,
+    );
+}
+
+#[test]
 #[ignore = "requires actual Spacewalk fixture and FFmpeg/ffprobe binaries"]
 fn spacewalk_whole_track_music_oracle() {
     let path = std::env::var("OPUS_SPACEWALK_WEBM")

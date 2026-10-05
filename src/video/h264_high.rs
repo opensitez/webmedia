@@ -147,6 +147,8 @@ pub fn decode_cabac_i_yuv_2005(
     pps: &PictureParameters2005,
     previous_reference: Option<&Yuv420Picture>,
 ) -> Result<(Yuv420Picture, Vec<MemoryManagement>), AvcError> {
+    #[cfg(test)]
+    let _profile_picture = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Other);
     if sps.profile_idc != 100
         || sps.chroma_format_idc != 1
         || sps.bit_depth_luma != 8
@@ -196,6 +198,8 @@ pub fn decode_cabac_i_yuv_2005(
     let mb_count = mb_width * sps.frame_height_mbs as usize;
 
     for mb in 0..mb_count {
+        #[cfg(test)]
+        let _profile_mb = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::EntropyState);
         let mb_x = mb % mb_width;
         let mb_y = mb / mb_width;
         let left = (mb_x > 0).then(|| &states[mb - 1]);
@@ -293,6 +297,8 @@ pub fn decode_cabac_i_yuv_2005(
             } else {
                 [[0; 15]; 16]
             };
+            #[cfg(test)]
+            let _profile_reconstruct = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Reconstruction);
             let pixels = reconstruct_intra16x16_luma(
                 (kind - 1) % 4,
                 &dc,
@@ -315,6 +321,8 @@ pub fn decode_cabac_i_yuv_2005(
                     *block = decoder.luma8x8_coefficients(&mut luma8_contexts)?;
                 }
             }
+            #[cfg(test)]
+            let _profile_reconstruct = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Reconstruction);
             let pixels = reconstruct_intra8x8_luma(
                 &modes_8x8,
                 &blocks,
@@ -337,6 +345,8 @@ pub fn decode_cabac_i_yuv_2005(
                 left.map(|mb| mb.luma_coded_right),
                 above.map(|mb| mb.luma_coded_bottom),
             )?;
+            #[cfg(test)]
+            let _profile_reconstruct = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Reconstruction);
             let pixels = reconstruct_intra4x4_luma(
                 &modes_4x4,
                 &blocks,
@@ -387,6 +397,8 @@ pub fn decode_cabac_i_yuv_2005(
         let cr_qp = chroma_qp(qp, pps.second_chroma_qp_index_offset)?;
         let cb_corner = (cx0 > 0 && cy0 > 0).then(|| cb[(cy0 - 1) * chroma_width + cx0 - 1]);
         let cr_corner = (cx0 > 0 && cy0 > 0).then(|| cr[(cy0 - 1) * chroma_width + cx0 - 1]);
+        #[cfg(test)]
+        let profile_reconstruct = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Reconstruction);
         let cb_block = reconstruct_chroma(
             chroma_mode,
             &cb_dc,
@@ -408,6 +420,8 @@ pub fn decode_cabac_i_yuv_2005(
         write_block(&mut luma, width, x0, y0, &luma_block, 16);
         write_block(&mut cb, chroma_width, cx0, cy0, &cb_block, 8);
         write_block(&mut cr, chroma_width, cx0, cy0, &cr_block, 8);
+        #[cfg(test)]
+        drop(profile_reconstruct);
         states.push(IntraMb {
             kind,
             transform_8x8,
@@ -437,6 +451,8 @@ pub fn decode_cabac_i_yuv_2005(
         }
     }
     if !slice.deblocking_disabled {
+        #[cfg(test)]
+        let _profile_deblock = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Deblock);
         filter_intra_picture(
             &mut luma,
             &mut cb,

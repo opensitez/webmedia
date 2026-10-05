@@ -151,7 +151,37 @@ pub(super) fn filter_frame(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static PREVALIDATED_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn with_prevalidated_memory<T>(enabled: bool, action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { PREVALIDATED_MEMORY.with(|flag| flag.set(self.0)); }
+    }
+    let _restore = Restore(PREVALIDATED_MEMORY.with(|flag| flag.replace(enabled)));
+    action()
+}
+
 fn filter_edge(
+    plane: &mut Plane, x: usize, y: usize, count: usize, step: usize,
+    edge_limit: i32, interior_limit: i32, hev_limit: i32,
+    simple: bool, macroblock_edge: bool,
+) {
+    #[cfg(test)]
+    if PREVALIDATED_MEMORY.with(|flag| flag.get()) {
+        filter_edge_impl::<true>(plane, x, y, count, step, edge_limit, interior_limit,
+            hev_limit, simple, macroblock_edge);
+        return;
+    }
+    filter_edge_impl::<false>(plane, x, y, count, step, edge_limit, interior_limit,
+        hev_limit, simple, macroblock_edge);
+}
+
+fn filter_edge_impl<const RAW: bool>(
     plane: &mut Plane,
     x: usize,
     y: usize,
@@ -169,7 +199,7 @@ fn filter_edge(
             && x.checked_add(4).is_some_and(|end| end <= plane.width)
             && y.checked_add(count).is_some_and(|end| end <= plane.pixels.len() / plane.width)
         {
-            unsafe { filter_vertical_neon(plane, x, y, count, edge_limit, interior_limit,
+            unsafe { filter_vertical_neon::<RAW>(plane, x, y, count, edge_limit, interior_limit,
                 hev_limit, simple, macroblock_edge); }
             return;
         }
@@ -179,7 +209,7 @@ fn filter_edge(
             && y >= taps && y.checked_add(taps).is_some_and(|end| end <= plane.pixels.len() / plane.width)
         {
             // Horizontal columns are independent; preserve edge ordering between calls.
-            unsafe { filter_horizontal_neon(plane, x, y, count, edge_limit, interior_limit,
+            unsafe { filter_horizontal_neon::<RAW>(plane, x, y, count, edge_limit, interior_limit,
                 hev_limit, simple, macroblock_edge); }
             return;
         }
@@ -190,7 +220,7 @@ fn filter_edge(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn filter_horizontal_neon(plane: &mut Plane, x: usize, y: usize, count: usize,
+unsafe fn filter_horizontal_neon<const RAW: bool>(plane: &mut Plane, x: usize, y: usize, count: usize,
     edge_limit: i32, interior_limit: i32, hev_limit: i32, simple: bool, macroblock_edge: bool,
 ) {
     use std::arch::aarch64::*;
@@ -202,18 +232,18 @@ unsafe fn filter_horizontal_neon(plane: &mut Plane, x: usize, y: usize, count: u
         for i in 0..2 {
             let before = pos - (i + 1) * plane.width;
             let after = pos + i * plane.width;
-            p[i] = vmovl_u8(unsafe { vld1_u8(plane.pixels[before..before + 8].as_ptr()) });
-            q[i] = vmovl_u8(unsafe { vld1_u8(plane.pixels[after..after + 8].as_ptr()) });
+            p[i] = vmovl_u8(unsafe { load_eight::<RAW>(&plane.pixels, before) });
+            q[i] = vmovl_u8(unsafe { load_eight::<RAW>(&plane.pixels, after) });
         }
-        let result = unsafe { filter_eight_neon(p, q, edge_limit, interior_limit, hev_limit,
+        let result = unsafe { filter_eight_neon::<false>(p, q, edge_limit, interior_limit, hev_limit,
             simple, macroblock_edge, || {
                 let mut outer_p = [zero; 2];
                 let mut outer_q = [zero; 2];
                 for i in 0..2 {
                     let before = pos - (i + 3) * plane.width;
                     let after = pos + (i + 2) * plane.width;
-                    outer_p[i] = vmovl_u8(vld1_u8(plane.pixels[before..before + 8].as_ptr()));
-                    outer_q[i] = vmovl_u8(vld1_u8(plane.pixels[after..after + 8].as_ptr()));
+                    outer_p[i] = vmovl_u8(load_eight::<RAW>(&plane.pixels, before));
+                    outer_q[i] = vmovl_u8(load_eight::<RAW>(&plane.pixels, after));
                 }
                 (outer_p, outer_q)
             }) };
@@ -222,11 +252,34 @@ unsafe fn filter_horizontal_neon(plane: &mut Plane, x: usize, y: usize, count: u
             let before = pos - (i + 1) * plane.width;
             let after = pos + i * plane.width;
             unsafe {
-                vst1_u8(plane.pixels[before..before + 8].as_mut_ptr(), vmovn_u16(out_p[i]));
-                vst1_u8(plane.pixels[after..after + 8].as_mut_ptr(), vmovn_u16(out_q[i]));
+                store_eight::<RAW>(&mut plane.pixels, before, vmovn_u16(out_p[i]));
+                store_eight::<RAW>(&mut plane.pixels, after, vmovn_u16(out_q[i]));
             }
         }
     }
+}
+
+// RAW callers have checked the complete edge region in filter_edge_impl.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn load_eight<const RAW: bool>(pixels: &[u8], start: usize)
+    -> std::arch::aarch64::uint8x8_t
+{
+    let pointer = if RAW { unsafe { pixels.as_ptr().add(start) } }
+        else { pixels[start..start + 8].as_ptr() };
+    unsafe { std::arch::aarch64::vld1_u8(pointer) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn store_eight<const RAW: bool>(pixels: &mut [u8], start: usize,
+    value: std::arch::aarch64::uint8x8_t)
+{
+    let pointer = if RAW { unsafe { pixels.as_mut_ptr().add(start) } }
+        else { pixels[start..start + 8].as_mut_ptr() };
+    unsafe { std::arch::aarch64::vst1_u8(pointer, value); }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -262,7 +315,7 @@ unsafe fn transpose_eight_neon(rows: [std::arch::aarch64::uint8x8_t; 8])
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn filter_vertical_neon(plane: &mut Plane, x: usize, y: usize, count: usize,
+unsafe fn filter_vertical_neon<const RAW: bool>(plane: &mut Plane, x: usize, y: usize, count: usize,
     edge_limit: i32, interior_limit: i32, hev_limit: i32, simple: bool, macroblock_edge: bool,
 ) {
     use std::arch::aarch64::*;
@@ -271,14 +324,14 @@ unsafe fn filter_vertical_neon(plane: &mut Plane, x: usize, y: usize, count: usi
         let mut rows = [vdup_n_u8(0); 8];
         for (i, row) in rows.iter_mut().enumerate() {
             let start = pos + i * plane.width;
-            *row = unsafe { vld1_u8(plane.pixels[start..start + 8].as_ptr()) };
+            *row = unsafe { load_eight::<RAW>(&plane.pixels, start) };
         }
         // Transpose eight bounded row loads so each lane is an independent edge.
         let mut columns = unsafe { transpose_eight_neon(rows) };
         let zero = vdupq_n_u16(0);
         let p = [vmovl_u8(columns[3]), vmovl_u8(columns[2]), zero, zero];
         let q = [vmovl_u8(columns[4]), vmovl_u8(columns[5]), zero, zero];
-        let result = unsafe { filter_eight_neon(p, q, edge_limit, interior_limit, hev_limit,
+        let result = unsafe { filter_eight_neon::<false>(p, q, edge_limit, interior_limit, hev_limit,
             simple, macroblock_edge, || {
                 ([vmovl_u8(columns[1]), vmovl_u8(columns[0])],
                  [vmovl_u8(columns[6]), vmovl_u8(columns[7])])
@@ -291,7 +344,7 @@ unsafe fn filter_vertical_neon(plane: &mut Plane, x: usize, y: usize, count: usi
         let rows = unsafe { transpose_eight_neon(columns) };
         for (i, row) in rows.into_iter().enumerate() {
             let start = pos + i * plane.width;
-            unsafe { vst1_u8(plane.pixels[start..start + 8].as_mut_ptr(), row); }
+            unsafe { store_eight::<RAW>(&mut plane.pixels, start, row); }
         }
     }
 }
@@ -299,7 +352,7 @@ unsafe fn filter_vertical_neon(plane: &mut Plane, x: usize, y: usize, count: usi
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn filter_eight_neon(
+unsafe fn filter_eight_neon<const TEST_ZERO_ACROSS: bool>(
     mut p: [std::arch::aarch64::uint16x8_t; 4],
     mut q: [std::arch::aarch64::uint16x8_t; 4],
     edge_limit: i32, interior_limit: i32, hev_limit: i32, simple: bool, macroblock_edge: bool,
@@ -311,6 +364,10 @@ unsafe fn filter_eight_neon(
     let clipped = |value| vmovl_u8(vqmovun_s16(value));
     let across = vaddq_u16(vshlq_n_u16::<1>(vabdq_u16(p[0], q[0])),
         vshrq_n_u16::<1>(vabdq_u16(p[1], q[1])));
+    // Retain the proven no-op shortcut for tests only; paired whole-prefix
+    // measurements did not establish a reliable production performance gain.
+    #[cfg(test)]
+    if TEST_ZERO_ACROSS && vmaxvq_u16(across) == 0 { return None; }
     let mut mask = vcleq_u16(across, vdupq_n_u16(edge_limit as u16));
     if vmaxvq_u16(mask) == 0 { return None; }
     let nearest = vmaxq_u16(vabdq_u16(p[1], p[0]), vabdq_u16(q[1], q[0]));
@@ -464,6 +521,169 @@ fn write(plane: &mut Plane, index: usize, value: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prevalidated_memory_toggle_restores_after_nested_calls_and_panic() {
+        assert!(!PREVALIDATED_MEMORY.with(|flag| flag.get()));
+        with_prevalidated_memory(true, || {
+            assert!(PREVALIDATED_MEMORY.with(|flag| flag.get()));
+            with_prevalidated_memory(false, || {
+                assert!(!PREVALIDATED_MEMORY.with(|flag| flag.get()));
+            });
+            assert!(PREVALIDATED_MEMORY.with(|flag| flag.get()));
+            let result = std::panic::catch_unwind(|| {
+                with_prevalidated_memory(false, || panic!("test restoration"));
+            });
+            assert!(result.is_err());
+            assert!(PREVALIDATED_MEMORY.with(|flag| flag.get()));
+        });
+        assert!(!PREVALIDATED_MEMORY.with(|flag| flag.get()));
+    }
+
+    #[test]
+    fn zero_across_metric_preserves_all_samples_at_rounding_boundaries() {
+        for nearest in 0..65536u32 {
+            for difference in [-1, 1] {
+                let outer = (nearest >> 8) as i32;
+                let other = outer + difference;
+                if !(0..=255).contains(&other) { continue; }
+                for horizontal in [false, true] {
+                    let mut source = Plane::new(8, 8);
+                    for (index, pixel) in source.pixels.iter_mut().enumerate() {
+                        *pixel = (index * 73 + nearest as usize) as u8;
+                    }
+                    let (x, y, step) = if horizontal { (0, 4, 8) } else { (4, 0, 1) };
+                    for offset in 0..8 {
+                        let base = y * 8 + x + if horizontal { offset } else { offset * 8 };
+                        source.pixels[base - step] = nearest as u8;
+                        source.pixels[base] = nearest as u8;
+                        source.pixels[base - 2 * step] = outer as u8;
+                        source.pixels[base + step] = other as u8;
+                    }
+                    for simple in [false, true] {
+                        for macroblock in [false, true] {
+                            let mut expected = source.clone();
+                            filter_edge_scalar(&mut expected, x, y, 8, step, 193, 63, 3, simple, macroblock);
+                            assert_eq!(expected.pixels, source.pixels);
+                            let mut actual = source.clone();
+                            filter_edge(&mut actual, x, y, 8, step, 193, 63, 3, simple, macroblock);
+                            assert_eq!(actual.pixels, expected.pixels);
+                            #[cfg(target_arch = "aarch64")]
+                            unsafe {
+                                use std::arch::aarch64::*;
+                                let zero = vdupq_n_u16(0);
+                                let center = vdupq_n_u16(u16::from(nearest as u8));
+                                let p = [center, vdupq_n_u16(outer as u16), zero, zero];
+                                let q = [center, vdupq_n_u16(other as u16), zero, zero];
+                                assert!(filter_eight_neon::<true>(p, q, 193, 63, 3,
+                                    simple, macroblock, || ([zero; 2], [zero; 2])).is_none());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn zero_across_metric_does_not_load_outer_samples() {
+        use std::arch::aarch64::*;
+        unsafe {
+            for simple in [false, true] {
+                for macroblock in [false, true] {
+                    let zero = vdupq_n_u16(0);
+                    let p = [vdupq_n_u16(128), vdupq_n_u16(64), zero, zero];
+                    let q = [vdupq_n_u16(128), vdupq_n_u16(65), zero, zero];
+                    assert!(filter_eight_neon::<true>(p, q, 193, 63, 3, simple, macroblock,
+                        || panic!("zero adjustment must not load outer samples")).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prevalidated_memory_matches_scalar_at_exact_edge_bounds() {
+        let mut random = 71u32;
+        for horizontal in [false, true] {
+            for simple in [false, true] {
+                for macroblock in [false, true] {
+                    for count in [1, 7, 8, 9, 16, 17] {
+                        let taps = if simple { 2 } else { 4 };
+                        let (width, height, x, y, step) = if horizontal {
+                            (count + 6, taps * 2, 3, taps, count + 6)
+                        } else { (taps * 2, count + 6, taps, 3, 1) };
+                        for trial in 0..512 {
+                            let mut actual = Plane::new(width, height);
+                            for (index, pixel) in actual.pixels.iter_mut().enumerate() {
+                                random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                                let byte = (random >> 24) as u8;
+                                *pixel = match (trial + index % width) % 5 {
+                                    0 => byte, 1 => 120 + byte % 16,
+                                    2 => byte % 4, 3 => 252 + byte % 4, _ => 127,
+                                };
+                            }
+                            let mut expected = actual.clone();
+                            let strength = FilterStrength::new((trial % 64) as u8,
+                                (trial / 64) as u8, trial % 2 == 0);
+                            let limit = if macroblock { strength.macroblock }
+                                else { strength.subblock };
+                            filter_edge_scalar(&mut expected, x, y, count, step, limit,
+                                strength.interior, strength.hev, simple, macroblock);
+                            filter_edge_impl::<true>(&mut actual, x, y, count, step, limit,
+                                strength.interior, strength.hev, simple, macroblock);
+                            assert_eq!(actual.pixels, expected.pixels,
+                                "horizontal={horizontal} simple={simple} macroblock={macroblock} count={count} trial={trial}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual prevalidated filter memory ABBA timing"]
+    fn benchmark_prevalidated_memory() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        fn thread_cpu_ns() -> Option<u64> {
+            #[cfg(target_os = "macos")]
+            {
+                unsafe extern "C" { fn clock_gettime_nsec_np(clock: i32) -> u64; }
+                Some(unsafe { clock_gettime_nsec_np(16) })
+            }
+            #[cfg(not(target_os = "macos"))]
+            { None }
+        }
+        let mut source = Plane::new(31, 24);
+        for (index, pixel) in source.pixels.iter_mut().enumerate() {
+            *pixel = 120 + ((index * 13 + index / 31) % 16) as u8;
+        }
+        let mut plane = source.clone();
+        for horizontal in [false, true] {
+            for pass in 0..3 {
+                for raw in [false, true, true, false] {
+                    let started = Instant::now();
+                    let cpu_started = thread_cpu_ns();
+                    for iteration in 0..200_000 {
+                        plane.pixels.copy_from_slice(black_box(&source.pixels));
+                        let (x, y, step) = if horizontal { (3, 8, 31) } else { (8, 3, 1) };
+                        if raw {
+                            filter_edge_impl::<true>(black_box(&mut plane), x, y, 16, step,
+                                100, 32, 3, iteration % 3 == 0, iteration % 2 == 0);
+                        } else {
+                            filter_edge_impl::<false>(black_box(&mut plane), x, y, 16, step,
+                                100, 32, 3, iteration % 3 == 0, iteration % 2 == 0);
+                        }
+                        black_box(&plane.pixels);
+                    }
+                    let cpu_ns = cpu_started.zip(thread_cpu_ns()).map(|(start, end)| end - start);
+                    eprintln!("filter memory horizontal={horizontal} pass={pass} raw={raw} elapsed_ns={} cpu_ns={cpu_ns:?}",
+                        started.elapsed().as_nanos());
+                }
+            }
+        }
+    }
 
     #[test]
     fn horizontal_filter_matches_scalar_for_all_strengths() {

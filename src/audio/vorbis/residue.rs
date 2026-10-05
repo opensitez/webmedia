@@ -53,6 +53,8 @@ impl Residue {
         bins: usize,
         workspace: &'a mut Workspace,
     ) -> Result<&'a [Vec<f64>], MediaDecodeError> {
+        #[cfg(test)]
+        let _timer = super::entropy::profile::Timer::start(super::entropy::profile::Stage::Residue);
         if self.kind > 2
             || self.partition_size == 0
             || self.begin > self.end

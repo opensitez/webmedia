@@ -5,7 +5,7 @@ use super::vp8::BoolDecoder;
 use super::vp8_predict::Plane;
 use super::vp9_inter_probs::InterframeProbabilities;
 use super::vp9_adapt::NonCoefficientCounts;
-use super::subpel::{convolve_prepared_row, ConvolutionFilter};
+use super::subpel::{convolve_prepared_row, copy_replicated_block, ConvolutionFilter};
 
 const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 const MV_CLASS_TREE: [i8; 20] = [
@@ -325,6 +325,12 @@ pub(super) fn predict_block(
         }
         return Ok(());
     }
+    if step_x == 16 && step_y == 16 && start_x.rem_euclid(16) == 0 && start_y.rem_euclid(16) == 0 {
+        copy_replicated_block(&mut destination.pixels, destination.width, y * destination.width + x,
+            &reference.pixels, reference.width, visible_width, visible_height,
+            source_x, source_y, width, height);
+        return Ok(());
+    }
     // Unscaled, single-axis motion needs only one convolution, not a scratch plane.
     if step_x == 16 && step_y == 16 && source_x >= 3 && source_y >= 3
         && source_x as usize + width + 4 <= visible_width
@@ -623,6 +629,67 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_edges_match_visible_reference_and_preserve_guards() {
+        let mut reference = Plane::new(96, 80);
+        reference.pixels.fill(251);
+        let mut visible = Plane::new(80, 72);
+        for row in 0..72 {
+            for col in 0..80 {
+                let value = ((row * 73 + col * 19) ^ (col >> 2)) as u8;
+                reference.pixels[row * 96 + col] = value;
+                visible.pixels[row * 80 + col] = value;
+            }
+        }
+        for (width, height) in [(1, 1), (4, 8), (8, 4), (32, 16), (64, 64)] {
+            for sx in [-10000, -(width as i32), -1, 0, 8, 79, 80, 10000] {
+                for sy in [-10000, -(height as i32), -1, 0, 8, 71, 72, 10000] {
+                    for filter in 0..4 {
+                        let expected = scalar_prediction(&visible, width, height,
+                            sx * 16, sy * 16, 16, 16, filter);
+                        let mut actual = Plane::new(width + 2, height + 2);
+                        actual.pixels.fill(91);
+                        predict_block(&mut actual, &reference, 1, 1, width, height,
+                            sx * 16, sy * 16, 16, 16, filter, 80, 72).unwrap();
+                        for row in 0..height + 2 {
+                            for col in 0..width + 2 {
+                                let value = if (1..=height).contains(&row) && (1..=width).contains(&col) {
+                                    expected[(row - 1) * width + col - 1]
+                                } else { 91 };
+                                assert_eq!(actual.pixels[row * actual.width + col], value,
+                                    "size=({width},{height}) source=({sx},{sy}) filter={filter} pixel=({col},{row})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual integer-motion edge timing"]
+    fn benchmark_integer_motion_edges() {
+        use std::hint::black_box;
+        let mut reference = Plane::new(96, 80);
+        for (index, pixel) in reference.pixels.iter_mut().enumerate() {
+            *pixel = (index.wrapping_mul(73) ^ (index >> 3)) as u8;
+        }
+        for width in [8, 32, 64] {
+            let mut destination = Plane::new(width, width);
+            for trial in 0..5 {
+                let start = std::time::Instant::now();
+                for i in 0..20_000 {
+                    let (sx, sy) = [(-4, -3), (76, 60), (-80, 90), (8, 8)][i % 4];
+                    predict_block(black_box(&mut destination), black_box(&reference),
+                        0, 0, width, width, sx * 16, sy * 16, 16, 16,
+                        (i % 4) as u8, 80, 72).unwrap();
+                    black_box(&destination.pixels);
+                }
+                eprintln!("VP9 integer edges width={width} trial={trial} elapsed={:?}", start.elapsed());
             }
         }
     }

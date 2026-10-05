@@ -37,6 +37,10 @@ pub mod tf;
 #[path = "opus/fixtures.rs"]
 mod fixtures;
 
+#[cfg(test)]
+#[path = "opus/duration_draft.rs"]
+mod duration_draft;
+
 fn invalid(message: &str) -> MediaDecodeError {
     MediaDecodeError::InvalidData(message.into())
 }

@@ -29,6 +29,72 @@ pub struct Mp4AvcStream {
     waiting_for_idr: bool,
 }
 
+/// Access-unit input for container demuxers. Uses the same decode/reference/reorder
+/// machinery as incremental file input, without retaining container bytes.
+pub struct Mp4AvcPackets {
+    stream: Mp4AvcStream,
+}
+
+impl Mp4AvcPackets {
+    pub fn new(index: Mp4Index) -> Result<Self, MediaDecodeError> {
+        Self::with_start_sample(index, 0)
+    }
+
+    pub fn with_start_sample(index: Mp4Index, start: usize) -> Result<Self, MediaDecodeError> {
+        if index.timescale == 0 {
+            return Err(Mp4AvcStream::invalid("zero media timescale"));
+        }
+        if start != 0
+            && !index
+                .samples
+                .get(start)
+                .is_some_and(|sample| sample.keyframe)
+        {
+            return Err(Mp4AvcStream::invalid("AVC restart is not a keyframe"));
+        }
+        Ok(Self {
+            stream: Mp4AvcStream {
+                index: Some(index),
+                next_sample: start,
+                ..Mp4AvcStream::default()
+            },
+        })
+    }
+
+    pub fn push(
+        &mut self,
+        sample_number: usize,
+        data: &[u8],
+    ) -> Result<Vec<VideoFrame>, MediaDecodeError> {
+        if sample_number != self.stream.next_sample {
+            return Err(Mp4AvcStream::invalid("out-of-order AVC access unit"));
+        }
+        let sample = self
+            .stream
+            .index
+            .as_ref()
+            .unwrap()
+            .samples
+            .get(sample_number)
+            .ok_or_else(|| Mp4AvcStream::invalid("access unit beyond sample table"))?;
+        if data.len() != sample.size as usize || data.len() > MAX_BUFFER_BYTES {
+            return Err(Mp4AvcStream::invalid("access unit size mismatch"));
+        }
+        self.stream.base_offset = sample.offset;
+        self.stream.bytes.clear();
+        self.stream.bytes.extend_from_slice(data);
+        self.stream.push(&[])
+    }
+
+    pub fn metadata(&self) -> Option<MediaMetadata> {
+        self.stream.metadata()
+    }
+
+    pub fn finish(&self) -> Result<(), MediaDecodeError> {
+        self.stream.finish()
+    }
+}
+
 impl Mp4AvcStream {
     pub fn new() -> Self {
         Self::default()
@@ -447,6 +513,46 @@ mod tests {
         AvcConfig, parse_cabac_idr_i_slice, parse_cabac_inter_slice, parse_pps_2005, parse_sps,
         type0_pic_order_count,
     };
+
+    #[test]
+    #[ignore = "set WEBMEDIA_AAC_MP4 to an AVC MP4 fixture"]
+    fn access_units_match_incremental_file_decode() {
+        let bytes = std::fs::read(std::env::var("WEBMEDIA_AAC_MP4").unwrap()).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let mut packet_decoder = Mp4AvcPackets::new(index.clone()).unwrap();
+        assert!(packet_decoder.push(1, &[]).is_err());
+        let mut expected = Vec::new();
+        let mut stream = Mp4AvcStream::new();
+        'input: for chunk in bytes.chunks(65521) {
+            expected.extend(stream.push(chunk).unwrap());
+            loop {
+                if expected.len() >= 12 {
+                    break 'input;
+                }
+                let next = stream.push(&[]).unwrap();
+                if next.is_empty() {
+                    break;
+                }
+                expected.extend(next);
+            }
+        }
+        assert!(expected.len() >= 12);
+        let mut actual = Vec::new();
+        for (number, sample) in index.samples.iter().enumerate() {
+            let data =
+                &bytes[sample.offset as usize..sample.offset as usize + sample.size as usize];
+            actual.extend(packet_decoder.push(number, data).unwrap());
+            if actual.len() >= 12 {
+                break;
+            }
+        }
+        assert!(actual.len() >= 12);
+        for (a, b) in actual.iter().zip(&expected).take(12) {
+            assert_eq!(a.timestamp, b.timestamp);
+            assert_eq!((a.width, a.height), (b.width, b.height));
+            assert_eq!(a.rgba, b.rgba);
+        }
+    }
     use crate::video::h264_cabac::{
         CabacDecoder, ChromaDcContexts, CodedBlockContexts, InterMbContexts, IntraMbTypeContexts,
         IntraPredContexts, Luma4x4Contexts, Luma8x8Contexts, MbQpContexts, MotionVectorContexts,
@@ -949,6 +1055,67 @@ mod tests {
     }
 
     #[test]
+    fn row_state_candidate_preserves_fixture_errors_and_support_guards() {
+        let Ok(path) = std::env::var("WEBCORE_MP4_FULL_FIXTURE") else { return; };
+        let bytes = std::fs::read(path).unwrap();
+        let index = Mp4Index::parse_prefix(&bytes).unwrap();
+        let sps = &index.config.sequence_parameters[0];
+        let pps = parse_pps_2005(&index.config.picture_parameter_sets[0]).unwrap();
+        let mut references = Vec::new();
+        let mut checked = [false; 2];
+        for sample in index.samples.iter().take(16) {
+            let payload = &bytes[sample.offset as usize..sample.offset as usize + sample.size as usize];
+            let mut stream = NalStream::new(index.config.nal_length_size).unwrap();
+            let nals = stream.push(payload).unwrap();
+            stream.finish().unwrap();
+            let nal = nals.iter().find(|nal| matches!(nal[0] & 31, 1 | 5)).unwrap();
+            let kind = parse_slice_type(nal).unwrap() % 5;
+            if kind == 2 {
+                assert_eq!(nal[0] & 31, 5, "initial IDR fixture required");
+                references.clear();
+                references.push(decode_cabac_idr_yuv_2005(nal, sps, &pps).unwrap());
+                continue;
+            }
+            assert!(kind == 0 || kind == 1);
+            let slot = usize::from(kind == 1);
+            let decode = |data: &[u8], parameters: &crate::video::h264::SequenceParameters| {
+                if kind == 0 { decode_cabac_p_2005(data, parameters, &pps, &references) }
+                else { decode_cabac_b_2005(data, parameters, &pps, &references) }
+            };
+            if !checked[slot] {
+                for cut in [0, 1, 2] {
+                    let full = super::super::h264_inter::with_row_states(false, || decode(&nal[..cut], sps)).err().expect("truncated slice accepted");
+                    let rows = super::super::h264_inter::with_row_states(true, || decode(&nal[..cut], sps)).err().expect("truncated slice accepted");
+                    assert_eq!(full, rows, "kind={kind} truncated at {cut}");
+                }
+                for guard in 0..4 {
+                    let mut unsupported = sps.clone();
+                    match guard {
+                        0 => unsupported.frame_mbs_only = false,
+                        1 => unsupported.chroma_format_idc = 2,
+                        2 => unsupported.scaling_matrices_present = true,
+                        _ => unsupported.width -= 1,
+                    }
+                    let full = super::super::h264_inter::with_row_states(false, || decode(nal, &unsupported)).err().expect("unsupported format accepted");
+                    let rows = super::super::h264_inter::with_row_states(true, || decode(nal, &unsupported)).err().expect("unsupported format accepted");
+                    assert_eq!(full, rows, "kind={kind} support guard {guard}");
+                }
+                checked[slot] = true;
+            }
+            let full = super::super::h264_inter::with_row_states(false, || decode(nal, sps)).unwrap();
+            let rows = super::super::h264_inter::with_row_states(true, || decode(nal, sps)).unwrap();
+            assert_eq!(full.luma, rows.luma);
+            assert_eq!(full.cb, rows.cb);
+            assert_eq!(full.cr, rows.cr);
+            assert_eq!(full.motion, rows.motion);
+            assert_eq!(full.reference_pocs, rows.reference_pocs);
+            if nal[0] & 0x60 != 0 { references.push(full); }
+            if checked == [true; 2] { break; }
+        }
+        assert_eq!(checked, [true; 2], "fixture did not exercise P and B error paths");
+    }
+
+    #[test]
     #[ignore = "explicit native YUV decode benchmark; no RGBA conversion or pixel oracle"]
     fn benchmark_site_native_yuv_decode() {
         let path = std::env::var("WEBCORE_MP4_FULL_FIXTURE").expect("fixture required");
@@ -962,8 +1129,20 @@ mod tests {
             .unwrap_or(3);
         let compare_deblock = std::env::var_os("WEBMEDIA_H264_BENCH_DEBLOCK_AB").is_some();
         let three_modes = std::env::var_os("WEBMEDIA_H264_BENCH_DEBLOCK_THREE").is_some();
-        let compare_deblock = compare_deblock || three_modes;
-        let modes: &[usize] = if three_modes { &[0, 1, 2] } else if compare_deblock { &[0, 2] } else { &[2] };
+        let compare_transform = std::env::var_os("WEBMEDIA_H264_BENCH_DC_AB").is_some();
+        let compare_rows = std::env::var_os("WEBMEDIA_H264_BENCH_ROWS_AB").is_some();
+        assert!(!(compare_rows && compare_transform), "choose one candidate per A/B run");
+        let stage_profile = std::env::var_os("WEBMEDIA_H264_STAGE_PROFILE").is_some();
+        let compare_deblock = compare_deblock || three_modes || compare_transform || compare_rows;
+        let modes: &[usize] = if compare_transform || compare_rows {
+            &[0, 2]
+        } else if three_modes {
+            &[0, 1, 2]
+        } else if compare_deblock {
+            &[0, 2]
+        } else {
+            &[2]
+        };
         let bytes = std::fs::read(path).unwrap();
         let index = Mp4Index::parse_prefix(&bytes).unwrap();
         let sps = &index.config.sequence_parameters[0];
@@ -997,20 +1176,31 @@ mod tests {
             sps.width,
             sps.height
         );
+        if compare_rows {
+            let sizes = super::super::h264_inter::working_state_sizes();
+            let mb_count = sps.width_mbs as usize * sps.frame_height_mbs as usize;
+            let row_count = 2 * sps.width_mbs as usize;
+            eprintln!("state layout bytes P/B/Deblock={sizes:?}; full P/B={:?}; two-row P/B={:?}; retained full deblock={} bytes (reference motion unchanged)",
+                [sizes[0] * mb_count, sizes[1] * mb_count],
+                [sizes[0] * row_count, sizes[1] * row_count], sizes[2] * mb_count);
+        }
         for run in 0..repeats {
             let mut references: [Vec<Yuv420Picture>; 3] = std::array::from_fn(|_| Vec::new());
             let mut times = [[std::time::Duration::ZERO; 3]; 3];
             let mut counts = [[0usize; 3]; 3];
+            let mut stages = [super::super::h264_inter::profiling::Stats::default(); 3];
             for (sample_number, (nal, kind, marking)) in inputs.iter().enumerate() {
                 let idr = nal[0] & 31 == 5;
                 let mut decoded = [None, None, None];
                 // Independent DPBs keep halfpel-cache construction inside both timers.
                 // Alternating the first decoder avoids a systematic warm-cache advantage.
                 for turn in 0..modes.len() {
-                    let mode = modes[(turn + sample_number + run) % modes.len()];
+                    let run_order = if compare_rows { (run ^ (run >> 1)) % 2 } else { run };
+                    let mode = modes[(turn + sample_number + run_order) % modes.len()];
                     let timer = std::time::Instant::now();
-                    let (picture, marking) =
-                        super::super::h264_deblock::with_deblock_mode(mode as u8, || match kind {
+                    let decode = || super::super::h264_inter::with_row_states(compare_rows && mode == 2, ||
+                        super::super::h264_transform::with_dc_transform(!compare_transform || mode == 2, ||
+                        super::super::h264_deblock::with_deblock_mode(if compare_transform || compare_rows { 2 } else { mode as u8 }, || match kind {
                             0 => (
                                 decode_cabac_p_2005(nal, sps, &pps, &references[mode]).unwrap(),
                                 marking.clone(),
@@ -1026,7 +1216,19 @@ mod tests {
                             2 => decode_cabac_i_yuv_2005(nal, sps, &pps, references[mode].last())
                                 .unwrap(),
                             _ => panic!("unsupported slice type"),
-                        });
+                        })));
+                    let (picture, marking) = if stage_profile {
+                        let (result, stats) = super::super::h264_inter::profiling::with_profile(decode);
+                        for stage in 0..10 {
+                            stages[mode].ns[stage] += stats.ns[stage];
+                            stages[mode].calls[stage] += stats.calls[stage];
+                        }
+                        for size in 0..2 {
+                            stages[mode].transforms[size] += stats.transforms[size];
+                            stages[mode].dc_only[size] += stats.dc_only[size];
+                        }
+                        result
+                    } else { decode() };
                     let slot = match kind {
                         2 => 0,
                         0 => 1,
@@ -1098,12 +1300,21 @@ mod tests {
                 let total: std::time::Duration = times[mode].iter().sum();
                 eprintln!(
                     "run {run} deblock_mode={}: native {:.3} ms/frame {:.1} fps; I/P/B counts={:?} totals_ms={:?}",
-                    ["scalar", "horizontal", "both"][mode],
+                    if compare_rows {
+                        if mode == 2 { "row-candidate" } else { "full-state-baseline" }
+                    } else if compare_transform {
+                        if mode == 2 { "DC-candidate" } else { "DC-baseline" }
+                    } else { ["scalar", "horizontal", "both"][mode] },
                     total.as_secs_f64() * 1000.0 / count as f64,
                     count as f64 / total.as_secs_f64(),
                     counts[mode],
                     times[mode].map(|t| t.as_secs_f64() * 1000.0)
                 );
+                if compare_transform { eprintln!("run {run} mode={mode} DC transform candidate={}", mode == 2); }
+                if stage_profile {
+                    eprintln!("run {run} mode={mode} exclusive stage_ms={:?} calls={:?} labels=other/entropy_state/motion/halfpel/transform/reconstruction/deblock/state_init/state_lookup/state_write; transform4/8={:?} DC4/8={:?}",
+                        stages[mode].ns.map(|ns| ns as f64 / 1e6), stages[mode].calls, stages[mode].transforms, stages[mode].dc_only);
+                }
             }
             if compare_deblock {
                 eprintln!(
@@ -1158,10 +1369,16 @@ mod tests {
         decoder.index = Some(index.clone());
         decoder.next_sample = start;
         decoder.base_offset = start_offset as u64;
-        let mut frames = decoder.push(&bytes[start_offset..end_offset]).unwrap();
-        while decoder.next_sample <= last && decoder.has_buffered_samples() {
-            frames.extend(decoder.push(&[]).unwrap());
-        }
+        let frames = super::super::h264_transform::with_dc_transform(
+            std::env::var_os("WEBMEDIA_H264_ORACLE_DC_FAST").is_some(),
+            || {
+                let mut frames = decoder.push(&bytes[start_offset..end_offset]).unwrap();
+                while decoder.next_sample <= last && decoder.has_buffered_samples() {
+                    frames.extend(decoder.push(&[]).unwrap());
+                }
+                frames
+            },
+        );
         let mut compared = 0;
         let mut maximum_mae = 0.0f64;
         let mut compared_indices = std::collections::BTreeSet::new();
@@ -1204,6 +1421,7 @@ mod tests {
             eprintln!("frame {number} t={:.3} RGB MAE={:.3}", frame.timestamp, mae);
         }
         assert!(compared > 0, "supplied oracle compared no frames");
+        assert_eq!(compared, reference_frames, "oracle coverage is incomplete");
         assert_eq!(
             compared_indices.first(),
             Some(&first),

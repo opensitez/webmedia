@@ -819,9 +819,331 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "test-only fused transform candidate; requires AV1_STREAM_OBU and first32 AV1_STREAM_ORACLE"]
+    fn spacewalk_fused_columns_first32_binary_oracle() {
+        super::super::transform::set_fused_columns_candidate(true);
+        spacewalk_display_oracle(32);
+        super::super::transform::set_fused_columns_candidate(false);
+    }
+
+    #[test]
+    #[ignore = "test-only skip-generic prediction candidate; requires AV1_STREAM_OBU and first32 AV1_STREAM_ORACLE"]
+    fn spacewalk_skip_generic_first32_binary_oracle() {
+        super::super::intra::set_skip_generic_prediction_candidate(true);
+        spacewalk_display_oracle(32);
+        super::super::intra::set_skip_generic_prediction_candidate(false);
+    }
+
+    #[test]
+    #[ignore = "test-only reused coefficient storage; requires AV1_STREAM_OBU and first32 AV1_STREAM_ORACLE"]
+    fn spacewalk_reuse_coefficients_first32_binary_oracle() {
+        super::super::intra::set_reuse_coefficients_candidate(true);
+        spacewalk_display_oracle(32);
+        super::super::intra::set_reuse_coefficients_candidate(false);
+    }
+
+    #[test]
+    #[ignore = "test-only EOB-bounded dequantization; requires AV1_STREAM_OBU and first32 AV1_STREAM_ORACLE"]
+    fn spacewalk_eob_dequant_first32_binary_oracle() {
+        super::super::intra::set_eob_dequant_candidate(true);
+        spacewalk_display_oracle(32);
+        super::super::intra::set_eob_dequant_candidate(false);
+    }
+
+    #[test]
+    #[ignore = "exact original/fast inter reconstruction plus selected 16-21s/28s binary pixels; requires AV1_STREAM_OBU and AV1_LATER_ORACLE"]
+    fn spacewalk_inter_prediction_later_pixels() {
+        let targets = [480, 510, 540, 570, 600, 630, 840, 860];
+        let profile_phases = std::env::var_os("AV1_HEAVY_PHASE_PROFILE").is_some();
+        let skip_generic = std::env::var_os("AV1_SKIP_GENERIC_PREDICTION_CANDIDATE").is_some();
+        let reuse_coefficients = std::env::var_os("AV1_REUSE_COEFFICIENTS_CANDIDATE").is_some();
+        let eob_dequant = std::env::var_os("AV1_EOB_DEQUANT_CANDIDATE").is_some();
+        assert!(usize::from(skip_generic) + usize::from(reuse_coefficients) + usize::from(eob_dequant) <= 1);
+        let oracle = std::fs::read(std::env::var("AV1_LATER_ORACLE").unwrap()).unwrap();
+        assert_eq!(oracle.len(), targets.len() * 3_110_400);
+        let bytes = std::fs::read(std::env::var("AV1_STREAM_OBU").unwrap()).unwrap();
+        let mut stream = super::super::ObuStream::new();
+        let mut fast = Av1Decoder::new();
+        let mut reference = Av1Decoder::new();
+        let mut displayed = 0;
+        let mut checked = 0;
+        for obu in stream.push(&bytes).unwrap() {
+            super::super::intra::set_discarded_intra_reference(true);
+            super::super::reconstruction::set_lazy_edges_reference(true);
+            let expected = reference.decode_obu(&obu);
+            super::super::intra::set_discarded_intra_reference(false);
+            super::super::reconstruction::set_lazy_edges_reference(false);
+            let counting = [480, 600, 840].contains(&displayed) && obu.kind == 6
+                && obu.payload.first().is_some_and(|b| b & 128 == 0);
+            super::super::intra::reset_reconstruction_counts(counting);
+            super::super::profile::reset(counting && profile_phases);
+            super::super::intra::set_skip_generic_prediction_candidate(skip_generic);
+            super::super::intra::set_reuse_coefficients_candidate(reuse_coefficients);
+            super::super::intra::set_eob_dequant_candidate(eob_dequant);
+            let actual = fast.decode_obu(&obu);
+            super::super::intra::set_eob_dequant_candidate(false);
+            super::super::intra::set_reuse_coefficients_candidate(false);
+            super::super::intra::set_skip_generic_prediction_candidate(false);
+            if counting && profile_phases {
+                let stages = super::super::profile::stages().map(|n| n as f64 / 1_000_000.0);
+                let parts = super::super::profile::times().map(|n| n as f64 / 1_000_000.0);
+                eprintln!("HEAVY_PHASE display={displayed} diagnostic_wall_ms reconstruct={:.3} deblock={:.3} cdef={:.3} restoration={:.3} motion={:.3} coefficients={:.3} transform={:.3} base_intra={:.3} warp={:.3} reconstruct_other={:.3}",
+                    stages[0], stages[1], stages[2], stages[3], parts[0], parts[1], parts[2],
+                    parts[3], parts[4], stages[0] - parts.iter().sum::<f64>());
+            }
+            super::super::profile::reset(false);
+            let counts = super::super::intra::take_reconstruction_counts();
+            if counting {
+                eprintln!("HEAVY_COUNTS display={displayed} frame_type={:?} {counts:?}",
+                    actual.as_ref().ok().and_then(|f| f.as_ref()).map(|f| f.header.frame_type));
+            }
+            if reuse_coefficients || eob_dequant {
+                for (expected, actual) in reference.references.iter().zip(&fast.references) {
+                    match (expected, actual) {
+                        (Some(expected), Some(actual)) => {
+                            assert_eq!(actual.frame.planes, expected.frame.planes,
+                                "display {displayed}: reused coefficient reference planes");
+                            assert!(actual.cdfs.coefficient_state_matches(&expected.cdfs),
+                                "display {displayed}: saved coefficient contexts");
+                        }
+                        (None, None) => {}
+                        _ => panic!("reused coefficient reference presence changed"),
+                    }
+                }
+            }
+            match (expected, actual) {
+                (Ok(Some(expected)), Ok(Some(actual))) => {
+                    assert_eq!(actual.planes, expected.planes, "display {displayed}");
+                    if targets.get(checked) == Some(&displayed) {
+                        let mut offset = checked * 3_110_400;
+                        for plane in &actual.planes {
+                            for &sample in &plane.samples {
+                                assert_eq!(sample, u16::from(oracle[offset]),
+                                    "display {displayed} byte {offset}");
+                                offset += 1;
+                            }
+                        }
+                        assert_eq!(offset, (checked + 1) * 3_110_400);
+                        eprintln!("exact later inter reconstruction display={displayed}");
+                        checked += 1;
+                        if checked == targets.len() { return; }
+                    }
+                    displayed += 1;
+                }
+                (Ok(None), Ok(None)) => {
+                    for (expected, actual) in reference.references.iter().zip(&fast.references) {
+                        match (expected, actual) {
+                            (Some(expected), Some(actual)) => assert_eq!(actual.frame.planes,
+                                expected.frame.planes, "hidden reference before display {displayed}"),
+                            (None, None) => {}
+                            _ => panic!("reference presence changed"),
+                        }
+                    }
+                }
+                (Err(expected), Err(actual)) => panic!("display {displayed} blocked: {expected:?}/{actual:?}"),
+                _ => panic!("display {displayed} output presence changed"),
+            }
+        }
+        panic!("selected later display frames missing");
+    }
+
+    #[test]
+    #[ignore = "malformed inter-tile original/fast error and atomic reference parity; requires AV1_STREAM_OBU"]
+    fn spacewalk_inter_prediction_malformed_parity() {
+        let skip_generic = std::env::var_os("AV1_SKIP_GENERIC_PREDICTION_CANDIDATE").is_some();
+        let reuse_coefficients = std::env::var_os("AV1_REUSE_COEFFICIENTS_CANDIDATE").is_some();
+        let eob_dequant = std::env::var_os("AV1_EOB_DEQUANT_CANDIDATE").is_some();
+        assert!(usize::from(skip_generic) + usize::from(reuse_coefficients) + usize::from(eob_dequant) <= 1);
+        let selected_display = std::env::var("AV1_MALFORMED_DISPLAY").ok()
+            .map(|s| s.parse::<usize>().unwrap());
+        let bytes = std::fs::read(std::env::var("AV1_STREAM_OBU").unwrap()).unwrap();
+        let mut stream = super::super::ObuStream::new();
+        let mut base = Av1Decoder::new();
+        let mut displayed = 0;
+        for obu in stream.push(&bytes).unwrap() {
+            if obu.kind == 6 && obu.payload.first().is_some_and(|b| b & 128 == 0)
+                && base.sequence.is_some()
+            {
+                let refs = base.references.each_ref().map(|r| r.as_ref().map(|r| &r.frame.header));
+                let h = IntraFrameHeader::parse_with_refs(&obu.payload,
+                    base.sequence.as_ref().unwrap(), obu.temporal_id, obu.spatial_id, &refs).unwrap();
+                if selected_display.map_or(h.frame_type == 1, |selected| displayed == selected) {
+                    for point in [0, 1, h.header_bytes, h.header_bytes + 1,
+                        obu.payload.len() / 2, obu.payload.len() - 1] {
+                        for truncate in [false, true] {
+                            let mut mutated = obu.clone();
+                            if truncate { mutated.payload.truncate(point); }
+                            else { mutated.payload[point] ^= 0x80; }
+                            let mut original = base.clone();
+                            let mut optimized = base.clone();
+                            super::super::intra::set_discarded_intra_reference(true);
+                            super::super::reconstruction::set_lazy_edges_reference(true);
+                            let expected = original.decode_obu(&mutated);
+                            super::super::intra::set_discarded_intra_reference(false);
+                            super::super::reconstruction::set_lazy_edges_reference(false);
+                            super::super::intra::set_skip_generic_prediction_candidate(skip_generic);
+                            super::super::intra::set_reuse_coefficients_candidate(reuse_coefficients);
+                            super::super::intra::set_eob_dequant_candidate(eob_dequant);
+                            let actual = optimized.decode_obu(&mutated);
+                            super::super::intra::set_eob_dequant_candidate(false);
+                            super::super::intra::set_reuse_coefficients_candidate(false);
+                            super::super::intra::set_skip_generic_prediction_candidate(false);
+                            match (expected, actual) {
+                                (Err(expected), Err(actual)) => {
+                                    assert_eq!(actual, expected);
+                                    for decoder in [&original, &optimized] {
+                                        for (before, after) in base.references.iter().zip(&decoder.references) {
+                                            match (before, after) {
+                                                (Some(before), Some(after)) => assert!(Arc::ptr_eq(before, after)),
+                                                (None, None) => {}
+                                                _ => panic!("failed inter frame changed reference presence"),
+                                            }
+                                        }
+                                    }
+                                }
+                                (Ok(Some(expected)), Ok(Some(actual))) => assert_eq!(actual.planes, expected.planes),
+                                (Ok(None), Ok(None)) => {}
+                                _ => panic!("mutated inter-frame result changed"),
+                            }
+                            for (expected, actual) in original.references.iter().zip(&optimized.references) {
+                                match (expected, actual) {
+                                    (Some(expected), Some(actual)) => {
+                                        assert_eq!(actual.frame.planes, expected.frame.planes);
+                                        assert!(actual.cdfs.coefficient_state_matches(&expected.cdfs));
+                                    }
+                                    (None, None) => {}
+                                    _ => panic!("mutated inter-frame references changed"),
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            if base.decode_obu(&obu).unwrap().is_some() { displayed += 1; }
+        }
+        panic!("missing first inter frame");
+    }
+
+    #[test]
+    #[ignore = "same-state whole decode_obu later-frame ABBA CPU/wall; requires AV1_STREAM_OBU, exclusive timing slot"]
+    fn spacewalk_discarded_intra_later_abba() {
+        use std::time::Instant;
+        #[cfg(target_os = "macos")]
+        fn cpu_clock() -> u64 {
+            unsafe extern "C" { fn clock_gettime_nsec_np(clock_id: i32) -> u64; }
+            unsafe { clock_gettime_nsec_np(16) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        fn cpu_clock() -> u64 { 0 }
+        let repeats = std::env::var("AV1_BENCH_REPEATS").ok()
+            .map_or(12, |v| v.parse::<usize>().unwrap());
+        assert!(repeats >= 4 && repeats % 2 == 0);
+        let lazy_edges_ab = std::env::var_os("AV1_BENCH_LAZY_EDGES_AB").is_some();
+        let skip_generic_ab = std::env::var_os("AV1_BENCH_SKIP_GENERIC_AB").is_some();
+        let reuse_coefficients_ab = std::env::var_os("AV1_BENCH_REUSE_COEFFICIENTS_AB").is_some();
+        let eob_dequant_ab = std::env::var_os("AV1_BENCH_EOB_DEQUANT_AB").is_some();
+        assert!(usize::from(lazy_edges_ab) + usize::from(skip_generic_ab)
+            + usize::from(reuse_coefficients_ab) + usize::from(eob_dequant_ab) <= 1);
+        let mut targets = if lazy_edges_ab || skip_generic_ab || reuse_coefficients_ab || eob_dequant_ab { vec![480, 600, 840] }
+            else { vec![480, 510, 540, 570, 600, 630, 840, 860] };
+        let bytes = std::fs::read(std::env::var("AV1_STREAM_OBU").unwrap()).unwrap();
+        let mut stream = super::super::ObuStream::new();
+        let mut base = Av1Decoder::new();
+        let mut displayed = 0;
+        super::super::profile::reset(false);
+        for obu in stream.push(&bytes).unwrap() {
+            if obu.kind == 6 && obu.payload.first().is_some_and(|b| b & 128 == 0)
+                && displayed >= targets[0]
+            {
+                let requested = targets.remove(0);
+                let refs = base.references.each_ref().map(|r| r.as_ref().map(|r| &r.frame.header));
+                let h = IntraFrameHeader::parse_with_refs(&obu.payload,
+                    base.sequence.as_ref().unwrap(), obu.temporal_id, obu.spatial_id, &refs).unwrap();
+                let mut cpu: [Vec<f64>; 2] = Default::default();
+                let mut wall: [Vec<f64>; 2] = Default::default();
+                let mut expected_output: Option<Option<Vec<DecodedPlane>>> = None;
+                let mut expected_state: Option<Av1Decoder> = None;
+                for trial in 0..4 + repeats * 2 {
+                    let reference = [true, false, false, true][trial % 4];
+                    super::super::intra::set_discarded_intra_reference(reference && !lazy_edges_ab && !skip_generic_ab && !reuse_coefficients_ab && !eob_dequant_ab);
+                    super::super::reconstruction::set_lazy_edges_reference(reference && lazy_edges_ab);
+                    super::super::intra::set_skip_generic_prediction_candidate(!reference && skip_generic_ab);
+                    super::super::intra::set_reuse_coefficients_candidate(!reference && reuse_coefficients_ab);
+                    super::super::intra::set_eob_dequant_candidate(!reference && eob_dequant_ab);
+                    let mut decoder = base.clone();
+                    let wall_start = Instant::now();
+                    let cpu_start = cpu_clock();
+                    let decoded = decoder.decode_obu(std::hint::black_box(&obu)).unwrap();
+                    let cpu_elapsed = (cpu_clock() - cpu_start) as f64 / 1_000_000.0;
+                    let wall_elapsed = wall_start.elapsed().as_secs_f64() * 1000.0;
+                    if let Some(expected) = &expected_output {
+                        assert_eq!(decoded.as_ref().map(|f| &f.planes), expected.as_ref(),
+                            "display {displayed} output planes");
+                    } else {
+                        expected_output = Some(decoded.as_ref().map(|f| f.planes.clone()));
+                        expected_state = Some(decoder.clone());
+                    }
+                    for (expected, actual) in expected_state.as_ref().unwrap().references.iter()
+                        .zip(&decoder.references)
+                    {
+                        match (expected, actual) {
+                            (Some(expected), Some(actual)) => {
+                                assert_eq!(actual.frame.planes, expected.frame.planes,
+                                    "display {displayed} reference planes");
+                                assert!(actual.cdfs.coefficient_state_matches(&expected.cdfs),
+                                    "display {displayed} saved coefficient contexts");
+                            }
+                            (None, None) => {}
+                            _ => panic!("ABBA reference presence changed"),
+                        }
+                    }
+                    if trial >= 4 {
+                        cpu[usize::from(reference)].push(cpu_elapsed);
+                        wall[usize::from(reference)].push(wall_elapsed);
+                    }
+                    std::hint::black_box(decoded);
+                    std::hint::black_box(decoder);
+                }
+                super::super::intra::set_discarded_intra_reference(false);
+                super::super::reconstruction::set_lazy_edges_reference(false);
+                super::super::intra::set_skip_generic_prediction_candidate(false);
+                super::super::intra::set_reuse_coefficients_candidate(false);
+                super::super::intra::set_eob_dequant_candidate(false);
+                for mode in 0..2 {
+                    cpu[mode].sort_by(f64::total_cmp);
+                    wall[mode].sort_by(f64::total_cmp);
+                    eprintln!("WHOLE_ABBA requested={requested} display={displayed} hint={} show={} reference={} repeats={repeats} thread_cpu={} cpu_ms={:.3} wall_ms={:.3}",
+                        h.order_hint, h.show_frame, mode == 1, cfg!(target_os = "macos"),
+                        cpu[mode][repeats / 2], wall[mode][repeats / 2]);
+                }
+            }
+            super::super::intra::set_discarded_intra_reference(false);
+            super::super::reconstruction::set_lazy_edges_reference(false);
+            super::super::intra::set_skip_generic_prediction_candidate(false);
+            super::super::intra::set_reuse_coefficients_candidate(false);
+            super::super::intra::set_eob_dequant_candidate(false);
+            if base.decode_obu(&obu).unwrap().is_some() { displayed += 1; }
+            if targets.is_empty() { return; }
+        }
+        panic!("later ABBA targets missing");
+    }
+
+    #[test]
     #[ignore = "controlled repeated-frame stage benchmark; requires AV1_STREAM_OBU"]
     fn spacewalk_repeated_stage_benchmark() {
         use std::time::Instant;
+        #[cfg(target_os = "macos")]
+        fn cpu_clock() -> u64 {
+            unsafe extern "C" {
+                fn clock_gettime_nsec_np(clock_id: i32) -> u64;
+            }
+            unsafe { clock_gettime_nsec_np(16) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        fn cpu_clock() -> u64 { 0 }
+        let thread_cpu = cfg!(target_os = "macos")
+            && std::env::var_os("AV1_BENCH_THREAD_CPU").is_some();
         let repeats = std::env::var("AV1_BENCH_REPEATS")
             .ok()
             .map_or(12, |v| v.parse::<usize>().unwrap());
@@ -832,7 +1154,11 @@ mod tests {
         let buffers_ab = std::env::var_os("AV1_BENCH_CDEF_BUFFERS_AB").is_some();
         let restoration_ab = std::env::var_os("AV1_BENCH_RESTORATION_AB").is_some();
         let scratch_ab = std::env::var_os("AV1_BENCH_INTER_SCRATCH_AB").is_some();
-        let ab = cdef_ab || deblock_ab || motion_ab || buffers_ab || restoration_ab || scratch_ab;
+        let coefficients_ab = std::env::var_os("AV1_BENCH_COEFFICIENTS_AB").is_some();
+        let fused_columns_ab = std::env::var_os("AV1_BENCH_FUSED_COLUMNS_AB").is_some();
+        let discarded_intra_ab = std::env::var_os("AV1_BENCH_DISCARDED_INTRA_AB").is_some();
+        let ab = cdef_ab || deblock_ab || motion_ab || buffers_ab || restoration_ab || scratch_ab
+            || coefficients_ab || fused_columns_ab || discarded_intra_ab;
         let profile = std::env::var_os("AV1_BENCH_PROFILE").is_some();
         let first_display = std::env::var("AV1_BENCH_START_DISPLAY")
             .ok()
@@ -875,6 +1201,13 @@ mod tests {
                     let trials = if ab { repeats * 2 + 4 } else { repeats + 2 };
                     for repeat in 0..trials {
                         let reference = ab && [true, false, false, true][repeat % 4];
+                        super::super::intra::set_discarded_intra_reference(reference && discarded_intra_ab);
+                        super::super::transform::set_fused_columns_candidate(
+                            !reference && fused_columns_ab,
+                        );
+                        super::super::coefficients::set_allocation_reference(
+                            reference && coefficients_ab,
+                        );
                         super::super::intra::set_inter_scratch_reference(reference && scratch_ab);
                         super::super::filters::set_cdef_reference(reference && cdef_ab);
                         super::super::filters::set_deblock_reference(reference && deblock_ab);
@@ -910,16 +1243,26 @@ mod tests {
                         super::super::profile::reset(profile);
                         let start = Instant::now();
                         let mut last = start;
+                        let cpu_start = if thread_cpu { cpu_clock() } else { 0 };
+                        let mut cpu_last = cpu_start;
                         let mut durations = [0.0; 5];
                         let mut stage = 0;
                         tile.run_with_observer(|_, _| {
                             let now = Instant::now();
                             durations[stage] = now.duration_since(last).as_secs_f64() * 1000.0;
+                            if thread_cpu {
+                                let cpu_now = cpu_clock();
+                                durations[stage] = (cpu_now - cpu_last) as f64 / 1_000_000.0;
+                                cpu_last = cpu_now;
+                            }
                             last = now;
                             stage += 1;
                         })
                         .unwrap();
                         durations[4] = start.elapsed().as_secs_f64() * 1000.0;
+                        if thread_cpu {
+                            durations[4] = (cpu_clock() - cpu_start) as f64 / 1_000_000.0;
+                        }
                         assert_eq!(stage, 4);
                         if let Some(expected) = &expected {
                             assert!(tile.planes == *expected, "repeated frame changed samples");
@@ -946,6 +1289,9 @@ mod tests {
                     super::super::filters::set_cdef_snapshot_reference(false);
                     super::super::restoration::set_restoration_reference(false);
                     super::super::intra::set_inter_scratch_reference(false);
+                    super::super::coefficients::set_allocation_reference(false);
+                    super::super::transform::set_fused_columns_candidate(false);
+                    super::super::intra::set_discarded_intra_reference(false);
                     super::super::profile::reset(false);
                     if profile {
                         let medians = details.map(|mut values| {

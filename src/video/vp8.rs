@@ -528,6 +528,21 @@ mod tests {
     }
 
     #[test]
+    fn display_scale_hints_do_not_change_reconstruction_dimensions() {
+        let frame = [0x30, 0, 0, 0x9d, 1, 0x2a, 0x80, 0x02, 0x68, 0x01, 0];
+        let expected = FrameHeader::parse(&frame).unwrap();
+        // RFC 6386 section 9.1 keeps reconstruction at the encoded resolution.
+        for horizontal in 0..4 {
+            for vertical in 0..4 {
+                let mut scaled = frame;
+                scaled[7] |= horizontal << 6;
+                scaled[9] |= vertical << 6;
+                assert_eq!(FrameHeader::parse(&scaled).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn parses_keyframe_dimensions_and_rejects_bad_marker() {
         let frame = [0x30, 0, 0, 0x9d, 1, 0x2a, 0x80, 0x02, 0x68, 0x01, 0];
         let header = FrameHeader::parse(&frame).unwrap();

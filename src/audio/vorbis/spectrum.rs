@@ -58,6 +58,9 @@ impl Setup {
         block_sizes: [usize; 2],
         workspace: &mut Workspace,
     ) -> Result<Option<PacketHeader>, MediaDecodeError> {
+        #[cfg(test)]
+        let _timer =
+            super::entropy::profile::Timer::start(super::entropy::profile::Stage::Spectrum);
         if block_sizes
             .iter()
             .any(|&size| !(64..=8192).contains(&size) || !size.is_power_of_two())

@@ -29,6 +29,216 @@ mod tests {
     use super::*;
 
     #[test]
+    fn eob_dequant_matches_full_signed_math_and_64_padding() {
+        let values = [0, 1, -1, 1024, -1024, 0xfffff, -0xfffff,
+            1 << 24, -(1 << 24), i32::MIN, i32::MAX];
+        for (tx, (w, h)) in super::super::coefficients::TX_DIMENSIONS.into_iter().enumerate() {
+            let denom = match tx { 3 | 9 | 10 | 17 | 18 => 2, 4 | 11 | 12 => 4, _ => 1 };
+            for class in 0..3 {
+                let scan = super::super::coefficients::coefficient_scan(class, w.min(32), h.min(32)).unwrap();
+                for eob in [0, 1, 2, scan.len() / 8, scan.len() / 2, scan.len()] {
+                    let prefix = &scan[..eob];
+                    let mut original = vec![0; w * h];
+                    for (i, &position) in prefix.iter().enumerate() {
+                        let position = usize::from(position);
+                        original[(position / w.min(32)) * w + position % w.min(32)] = values[i % values.len()];
+                    }
+                    for depth in [8, 10, 12] {
+                        let bound = 1i64 << (7 + depth);
+                        for (dc, ac) in [(0, 1), (3, 7), (u16::MAX, u16::MAX)] {
+                            let mut full = original.clone();
+                            let mut bounded = original.clone();
+                            dequantize_full(&mut full, dc, ac, denom, bound);
+                            dequantize_eob(&mut bounded, w, prefix, dc, ac, denom, bound);
+                            assert_eq!(bounded, full, "{w}x{h} class={class} eob={eob}");
+                            for (i, (&input, &actual)) in original.iter().zip(&bounded).enumerate() {
+                                let quant = if i == 0 { dc } else { ac };
+                                let magnitude = u128::from(input.unsigned_abs()) * u128::from(quant);
+                                let magnitude = (magnitude % (1 << 24)) / denom as u128;
+                                let signed = if input < 0 { -(magnitude as i64) } else { magnitude as i64 };
+                                assert_eq!(actual, signed.clamp(-bound, bound - 1) as i32);
+                                if i % w >= 32 || i / w >= 32 { assert_eq!(actual, 0); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn filter_intra_fixed_edges(
+        candidate: bool,
+        w: usize,
+        h: usize,
+        depth: u8,
+        filter_mode: usize,
+        above: Option<&[u16]>,
+        left: Option<&[u16]>,
+        corner: Option<u16>,
+    ) -> Result<Vec<u16>, Error> {
+        set_skip_generic_prediction_candidate(candidate);
+        let initial = initial_intra_prediction(
+            true, IntraMode::Dc, w, h, depth, above, left, corner,
+        );
+        set_skip_generic_prediction_candidate(false);
+        let initial = initial?;
+        assert_eq!(initial.len(), if candidate { 0 } else { w * h });
+        let mid = 1u16 << (depth - 1);
+        let corner = corner.unwrap_or_else(|| {
+            above.map(|a| a[0]).or_else(|| left.map(|l| l[0])).unwrap_or(mid)
+        });
+        let top = above.map_or_else(
+            || std::borrow::Cow::Owned(vec![left.map_or(mid - 1, |l| l[0]); w + h]),
+            std::borrow::Cow::Borrowed,
+        );
+        let side = left.map_or_else(
+            || std::borrow::Cow::Owned(vec![above.map_or(mid + 1, |a| a[0]); w + h]),
+            std::borrow::Cow::Borrowed,
+        );
+        super::super::prediction::recursive(w, h, filter_mode, depth, &top, &side, corner)
+    }
+
+    #[test]
+    fn skip_generic_filter_intra_fixed_edges_parity() {
+        for depth in [8, 10, 12] {
+            let max = (1u16 << depth) - 1;
+            for (w, h) in super::super::coefficients::TX_DIMENSIONS {
+                if w > 32 || h > 32 {
+                    continue;
+                }
+                for pattern in 0..3 {
+                    let above: Vec<_> = (0..w + h).map(|i| match pattern {
+                        0 => max / 3,
+                        1 => ((i * 73 + 29) as u16) & max,
+                        _ => if i % 2 == 0 { max } else { 0 },
+                    }).collect();
+                    let left: Vec<_> = (0..w + h).map(|i| match pattern {
+                        0 => max / 3,
+                        1 => ((i * 91 + 17) as u16) & max,
+                        _ => if i % 2 == 0 { 0 } else { max },
+                    }).collect();
+                    for availability in 0..4 {
+                        let top = (availability & 1 != 0).then_some(above.as_slice());
+                        let side = (availability & 2 != 0).then_some(left.as_slice());
+                        let corner = (availability == 3).then_some(max / 3);
+                        for filter_mode in 0..5 {
+                            let reference = filter_intra_fixed_edges(
+                                false, w, h, depth, filter_mode, top, side, corner,
+                            ).unwrap();
+                            let candidate = filter_intra_fixed_edges(
+                                true, w, h, depth, filter_mode, top, side, corner,
+                            ).unwrap();
+                            assert_eq!(candidate, reference,
+                                "{w}x{h} depth={depth} mode={filter_mode} edges={availability} pattern={pattern}");
+                            assert!(candidate.iter().all(|&sample| sample <= max));
+                            if pattern == 0 && availability == 3 {
+                                assert!(candidate.iter().all(|&sample| sample == max / 3));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn skip_generic_filter_intra_invalid_edges_parity() {
+        let valid = [17u16; 16];
+        let mut extended_invalid = valid;
+        extended_invalid[15] = 256;
+        for (w, h, depth, mode, above, left, corner) in [
+            (3, 4, 8, 0, None, None, None),
+            (4, 4, 9, 0, None, None, None),
+            (64, 64, 8, 0, None, None, None),
+            (4, 4, 8, 5, None, None, None),
+            (8, 8, 8, 0, Some(&valid[..7]), None, None),
+            (8, 8, 8, 0, None, Some(&valid[..7]), None),
+            (8, 8, 8, 0, Some(&extended_invalid[..]), None, None),
+            (8, 8, 8, 0, None, Some(&extended_invalid[..]), None),
+            (8, 8, 8, 0, Some(&valid[..]), Some(&valid[..]), Some(256)),
+        ] {
+            let reference = filter_intra_fixed_edges(false, w, h, depth, mode, above, left, corner);
+            assert!(reference.is_err());
+            assert_eq!(
+                filter_intra_fixed_edges(true, w, h, depth, mode, above, left, corner),
+                reference,
+            );
+        }
+    }
+
+    #[test]
+    fn discarded_dc_validation_matches_allocating_predictor() {
+        let mut plane = DecodedPlane {
+            width: 128,
+            height: 128,
+            stride: 128,
+            samples: vec![33; 128 * 128],
+        };
+        for depth in [8, 10, 12] {
+            for (w, h) in super::super::coefficients::TX_DIMENSIONS {
+                for (ax, ay) in [(0, 0), (0, 4), (4, 0), (4, 4), (124, 124)] {
+                    for extension in [false, true] {
+                        for corrupt in [None, Some(0), Some(3 * 128 + 3), Some(127 * 128 + 127)] {
+                            plane.samples.fill(33);
+                            if let Some(index) = corrupt {
+                                plane.samples[index] = u16::MAX;
+                            }
+                            let above = (ay > 0).then(|| {
+                                (0..w + h)
+                                    .map(|i| {
+                                        plane.samples[(ay - 1) * plane.stride
+                                            + (ax + i).min(
+                                                (ax + if extension { 2 * w } else { w } - 1)
+                                                    .min(plane.width - 1),
+                                            )]
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
+                            let left = (ax > 0).then(|| {
+                                (0..w + h)
+                                    .map(|i| {
+                                        plane.samples[(ay + i).min(
+                                            (ay + if extension { 2 * h } else { h } - 1)
+                                                .min(plane.height - 1),
+                                        ) * plane.stride
+                                            + ax
+                                            - 1]
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
+                            let corner = (ax > 0 && ay > 0)
+                                .then(|| plane.samples[(ay - 1) * plane.stride + ax - 1]);
+                            let expected = predict_intra(
+                                IntraMode::Dc,
+                                w,
+                                h,
+                                depth,
+                                above.as_deref(),
+                                left.as_deref(),
+                                corner,
+                            )
+                            .map(|_| ());
+                            assert_eq!(
+                                validate_discarded_inter_prediction(
+                                    &plane, ax, ay, w, h, depth, extension, extension
+                                ),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for (w, h, depth) in [(3, 4, 8), (4, 64, 8), (4, 4, 9)] {
+            let expected = predict_intra(IntraMode::Dc, w, h, depth, None, None, None).map(|_| ());
+            assert_eq!(
+                validate_discarded_inter_prediction(&plane, 0, 0, w, h, depth, false, false),
+                expected
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires AV1_PREFIX_OBU and AV1_PREFIX_ORACLE binary fixtures"]
     fn spacewalk_prefix_binary_oracle() {
         let bytes = std::fs::read(std::env::var("AV1_PREFIX_OBU").unwrap()).unwrap();
@@ -200,17 +410,209 @@ struct Cell {
     tx_height: u8,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ReconstructionCounts {
+    pub intra_modes: [usize; 14],
+    pub transform_sizes: [usize; 19],
+    pub inter_transforms: usize,
+    pub skipped_transforms: usize,
+    pub filtered_intra: usize,
+    pub coefficient_blocks: usize,
+    pub zero_blocks: usize,
+    pub dc_only_blocks: usize,
+    pub nonzero_coefficients: usize,
+    pub coefficient_slots: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECONSTRUCTION_COUNTS: std::cell::RefCell<Option<ReconstructionCounts>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_reconstruction_counts(enabled: bool) {
+    RECONSTRUCTION_COUNTS
+        .with(|counts| *counts.borrow_mut() = enabled.then(ReconstructionCounts::default));
+}
+
+#[cfg(test)]
+pub(crate) fn take_reconstruction_counts() -> ReconstructionCounts {
+    RECONSTRUCTION_COUNTS.with(|counts| counts.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
+fn count_reconstruction_input(
+    mode: usize,
+    w: usize,
+    h: usize,
+    inter: bool,
+    skip: bool,
+    filtered: bool,
+) {
+    RECONSTRUCTION_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            if inter {
+                counts.inter_transforms += 1;
+            } else if let Some(count) = counts.intra_modes.get_mut(mode) {
+                *count += 1;
+            }
+            if let Ok(index) = tx_index(w, h) {
+                counts.transform_sizes[index] += 1;
+            }
+            counts.skipped_transforms += usize::from(skip);
+            counts.filtered_intra += usize::from(filtered);
+        }
+    });
+}
+
+#[cfg(test)]
+fn count_coefficient_input(values: &[i32]) {
+    RECONSTRUCTION_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            let nonzero = values.iter().filter(|&&v| v != 0).count();
+            counts.coefficient_blocks += 1;
+            counts.zero_blocks += usize::from(nonzero == 0);
+            counts.dc_only_blocks += usize::from(nonzero == 1 && values[0] != 0);
+            counts.nonzero_coefficients += nonzero;
+            counts.coefficient_slots += values.len();
+        }
+    });
+}
+
 #[derive(Default)]
 struct InterScratch {
     predictions: [Vec<i32>; 2],
     intermediate: super::motion::PredictionScratch,
     blended: Vec<u16>,
+    transform_prediction: Vec<u16>,
     residual: Vec<i32>,
+    #[cfg(test)]
+    quant_coefficients: Vec<i32>,
+    #[cfg(test)]
+    padded_coefficients: Vec<i32>,
 }
 
 #[cfg(test)]
 thread_local! {
     static INTER_SCRATCH_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DISCARDED_INTRA_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SKIP_GENERIC_PREDICTION_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REUSE_COEFFICIENTS_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EOB_DEQUANT_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_eob_dequant_candidate(enabled: bool) {
+    EOB_DEQUANT_CANDIDATE.set(enabled);
+}
+
+#[inline(always)]
+fn dequantized_value(coefficient: i32, quant: u16, denom: i64, bound: i64) -> i32 {
+    let product = i64::from(coefficient) * i64::from(quant);
+    let dequant = ((product.abs() & 0xffffff) / denom) * product.signum();
+    dequant.clamp(-bound, bound - 1) as i32
+}
+
+#[inline(always)]
+fn dequantize_full(coefficients: &mut [i32], dc: u16, ac: u16, denom: i64, bound: i64) {
+    for (i, coefficient) in coefficients.iter_mut().enumerate() {
+        *coefficient = dequantized_value(*coefficient, if i == 0 { dc } else { ac }, denom, bound);
+    }
+}
+
+#[cfg(test)]
+fn dequantize_eob(
+    coefficients: &mut [i32], w: usize, scan_prefix: &[u16],
+    dc: u16, ac: u16, denom: i64, bound: i64,
+) {
+    for &position in scan_prefix {
+        let position = usize::from(position);
+        let index = if w <= 32 { position } else { (position >> 5) * w + (position & 31) };
+        coefficients[index] = dequantized_value(
+            coefficients[index], if index == 0 { dc } else { ac }, denom, bound,
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_reuse_coefficients_candidate(enabled: bool) {
+    REUSE_COEFFICIENTS_CANDIDATE.set(enabled);
+}
+
+#[cfg(test)]
+pub(crate) fn set_skip_generic_prediction_candidate(enabled: bool) {
+    SKIP_GENERIC_PREDICTION_CANDIDATE.set(enabled);
+}
+
+#[inline(always)]
+fn initial_intra_prediction(
+    replacement_mode: bool,
+    mode: IntraMode,
+    w: usize,
+    h: usize,
+    depth: u8,
+    above: Option<&[u16]>,
+    left: Option<&[u16]>,
+    corner: Option<u16>,
+) -> Result<Vec<u16>, Error> {
+    #[cfg(test)]
+    let skip_generic = replacement_mode && SKIP_GENERIC_PREDICTION_CANDIDATE.get();
+    #[cfg(not(test))]
+    let skip_generic = { let _ = replacement_mode; false };
+    if skip_generic {
+        super::reconstruction::validate_intra_inputs(mode, w, h, depth, above, left, corner)?;
+        Ok(Vec::new())
+    } else {
+        predict_intra(mode, w, h, depth, above, left, corner)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_discarded_intra_reference(reference: bool) {
+    DISCARDED_INTRA_REFERENCE.set(reference);
+}
+
+fn validate_discarded_inter_prediction(
+    p: &DecodedPlane,
+    ax: usize,
+    ay: usize,
+    w: usize,
+    h: usize,
+    depth: u8,
+    above_right: bool,
+    below_left: bool,
+) -> Result<(), Error> {
+    if ![8, 10, 12].contains(&depth)
+        || ![4, 8, 16, 32, 64].contains(&w)
+        || ![4, 8, 16, 32, 64].contains(&h)
+        || w > h * 4
+        || h > w * 4
+    {
+        return Err(Error::Invalid("intra block dimensions or bit depth"));
+    }
+    let max = (1u16 << depth) - 1;
+    // The discarded DC predictor validated extended edges and the corner, not only
+    // its consumed width/height. Preserve those checks without constructing vectors.
+    let above_invalid = ay > 0
+        && (0..w + h).any(|i| {
+            p.samples[(ay - 1) * p.stride
+                + (ax + i).min((ax + if above_right { 2 * w } else { w } - 1).min(p.width - 1))]
+                > max
+        });
+    let left_invalid = ax > 0
+        && (0..w + h).any(|i| {
+            p.samples[(ay + i).min((ay + if below_left { 2 * h } else { h } - 1).min(p.height - 1))
+                * p.stride
+                + ax
+                - 1]
+                > max
+        });
+    let corner_invalid = ax > 0 && ay > 0 && p.samples[(ay - 1) * p.stride + ax - 1] > max;
+    if above_invalid || left_invalid || corner_invalid {
+        return Err(Error::Invalid("intra boundary samples"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -289,6 +691,11 @@ pub(crate) struct FrameCdfs {
 }
 
 impl FrameCdfs {
+    #[cfg(test)]
+    pub(crate) fn coefficient_state_matches(&self, other: &Self) -> bool {
+        self.coefficients == other.coefficients
+    }
+
     pub(crate) fn reset_counts(&mut self) {
         fn reset(values: &mut [u16], n: usize) {
             for row in values.chunks_exact_mut(n) {
@@ -1299,6 +1706,15 @@ impl<'a> IntraTile<'a> {
                     continue;
                 }
                 let mode = if plane == 0 { y_mode } else { uv_mode };
+                #[cfg(test)]
+                count_reconstruction_input(
+                    mode,
+                    ptw,
+                    pth,
+                    is_inter,
+                    skip,
+                    plane == 0 && filter_mode.is_some(),
+                );
                 let mode_kind = match mode {
                     0 | 13 => IntraMode::Dc,
                     1 => IntraMode::Vertical,
@@ -1314,136 +1730,207 @@ impl<'a> IntraTile<'a> {
                 };
                 let above_right = ay > 0 && decoded(ax / 4 + ptw / 4, ay / 4 - 1);
                 let below_left = ax > 0 && decoded(ax / 4 - 1, ay / 4 + pth / 4);
-                let above = if ay > 0 {
-                    Some(
-                        (0..ptw + pth)
-                            .map(|i| {
-                                p.samples[(ay - 1) * p.stride
-                                    + (ax + i).min(
-                                        (ax + if above_right { 2 * ptw } else { ptw } - 1)
-                                            .min(p.width - 1),
-                                    )]
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    None
-                };
-                let left = if ax > 0 {
-                    Some(
-                        (0..ptw + pth)
-                            .map(|i| {
-                                p.samples[(ay + i).min(
-                                    (ay + if below_left { 2 * pth } else { pth } - 1)
-                                        .min(p.height - 1),
-                                ) * p.stride
-                                    + ax
-                                    - 1]
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    None
-                };
-                let corner = if ax > 0 && ay > 0 {
-                    Some(p.samples[(ay - 1) * p.stride + ax - 1])
-                } else {
-                    None
-                };
-                let mut prediction = predict_intra(
-                    mode_kind,
-                    ptw,
-                    pth,
-                    self.s.bit_depth,
-                    above.as_deref(),
-                    left.as_deref(),
-                    corner,
-                )?;
-                let mid = 1u16 << (self.s.bit_depth - 1);
-                let corner_value = corner.unwrap_or_else(|| {
-                    above
-                        .as_ref()
-                        .map(|a| a[0])
-                        .or_else(|| left.as_ref().map(|a| a[0]))
-                        .unwrap_or(mid)
-                });
-                let top = above
-                    .clone()
-                    .unwrap_or_else(|| vec![left.as_ref().map_or(mid - 1, |l| l[0]); ptw + pth]);
-                let side = left
-                    .clone()
-                    .unwrap_or_else(|| vec![above.as_ref().map_or(mid + 1, |a| a[0]); ptw + pth]);
-                if plane == 0 && filter_mode.is_some() {
-                    prediction = super::prediction::recursive(
-                        ptw,
-                        pth,
-                        filter_mode.unwrap(),
-                        self.s.bit_depth,
-                        &top,
-                        &side,
-                        corner_value,
-                    )?;
-                } else if (1..=8).contains(&mode) {
-                    let smooth_neighbor = [
-                        above.as_ref().and_then(|_| {
-                            if ay > 0 {
-                                self.cells.get((y.saturating_sub(1)) * self.cols + x)
-                            } else {
-                                None
-                            }
-                        }),
-                        if x > 0 {
-                            self.cells.get(y * self.cols + x - 1)
-                        } else {
-                            None
-                        },
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .any(|c| (9..=11).contains(&if plane == 0 { c.y_mode } else { c.uv_mode }));
-                    prediction = super::prediction::directional(
+                let fast_inter = inter_prediction.is_some()
+                    && mode_kind == IntraMode::Dc
+                    && filter_mode.is_none()
+                    && uv_mode != 13;
+                #[cfg(test)]
+                let fast_inter = fast_inter && !DISCARDED_INTRA_REFERENCE.get();
+                let mut prediction = if fast_inter {
+                    validate_discarded_inter_prediction(
+                        p,
+                        ax,
+                        ay,
                         ptw,
                         pth,
                         self.s.bit_depth,
-                        mode,
-                        if plane == 0 { y_angle } else { uv_angle },
-                        Some(top.as_slice()).filter(|_| ay > 0),
-                        Some(side.as_slice()).filter(|_| ax > 0),
-                        corner_value,
-                        self.s.enable_intra_edge_filter,
-                        smooth_neighbor,
-                        p.width - ax,
-                        p.height - ay,
+                        above_right,
+                        below_left,
                     )?;
-                } else if (9..=11).contains(&mode) {
-                    prediction = super::prediction::smooth(ptw, pth, mode, &top, &side)?;
-                }
-                if plane > 0 && uv_mode == 13 {
-                    let (bx, by, stride, _, luma, max) = cfl_window
-                        .as_ref()
-                        .ok_or(Error::Invalid("missing CFL luma window"))?;
-                    predict_cfl(
-                        &mut prediction,
-                        ptw,
-                        pth,
-                        self.s.bit_depth,
-                        luma,
-                        *stride,
-                        max[0],
-                        max[1],
-                        ax - (bx >> sx),
-                        ay - (by >> sy),
-                        self.s.subsampling_x,
-                        self.s.subsampling_y,
-                        cfl_alpha[plane - 1],
-                    )?;
-                }
-                if let Some(p) = &inter_prediction {
+                    let mut prediction = std::mem::take(&mut inter_scratch.transform_prediction);
+                    prediction.resize(ptw * pth, 0);
+                    let source = inter_prediction.as_ref().unwrap();
                     for row in 0..pth {
-                        prediction[row * ptw..(row + 1) * ptw]
-                            .copy_from_slice(&p[(dy + row) * pw + dx..(dy + row) * pw + dx + ptw]);
+                        prediction[row * ptw..(row + 1) * ptw].copy_from_slice(
+                            &source[(dy + row) * pw + dx..(dy + row) * pw + dx + ptw],
+                        );
                     }
-                }
+                    prediction
+                } else {
+                    let above = if ay > 0 {
+                        Some(
+                            (0..ptw + pth)
+                                .map(|i| {
+                                    p.samples[(ay - 1) * p.stride
+                                        + (ax + i).min(
+                                            (ax + if above_right { 2 * ptw } else { ptw } - 1)
+                                                .min(p.width - 1),
+                                        )]
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        None
+                    };
+                    let left = if ax > 0 {
+                        Some(
+                            (0..ptw + pth)
+                                .map(|i| {
+                                    p.samples[(ay + i).min(
+                                        (ay + if below_left { 2 * pth } else { pth } - 1)
+                                            .min(p.height - 1),
+                                    ) * p.stride
+                                        + ax
+                                        - 1]
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        None
+                    };
+                    let corner = if ax > 0 && ay > 0 {
+                        Some(p.samples[(ay - 1) * p.stride + ax - 1])
+                    } else {
+                        None
+                    };
+                    let replacement_mode =
+                        (plane == 0 && filter_mode.is_some()) || (1..=11).contains(&mode);
+                    let mut prediction = initial_intra_prediction(
+                        replacement_mode,
+                        mode_kind,
+                        ptw,
+                        pth,
+                        self.s.bit_depth,
+                        above.as_deref(),
+                        left.as_deref(),
+                        corner,
+                    )?;
+                    let need_extended = replacement_mode;
+                    #[cfg(test)]
+                    let need_extended =
+                        need_extended || super::reconstruction::lazy_edges_reference();
+                    if need_extended {
+                        let mid = 1u16 << (self.s.bit_depth - 1);
+                        let corner_value = corner.unwrap_or_else(|| {
+                            above
+                                .as_ref()
+                                .map(|a| a[0])
+                                .or_else(|| left.as_ref().map(|a| a[0]))
+                                .unwrap_or(mid)
+                        });
+                        #[cfg(not(test))]
+                        let reference = false;
+                        #[cfg(test)]
+                        let reference = super::reconstruction::lazy_edges_reference();
+                        let top = above.as_deref().map_or_else(
+                            || {
+                                std::borrow::Cow::Owned(vec![
+                                    left.as_ref().map_or(mid - 1, |l| l[0]);
+                                    ptw + pth
+                                ])
+                            },
+                            |a| {
+                                if reference {
+                                    std::borrow::Cow::Owned(a.to_vec())
+                                } else {
+                                    std::borrow::Cow::Borrowed(a)
+                                }
+                            },
+                        );
+                        let side = left.as_deref().map_or_else(
+                            || {
+                                std::borrow::Cow::Owned(vec![
+                                    above
+                                        .as_ref()
+                                        .map_or(mid + 1, |a| a[0]);
+                                    ptw + pth
+                                ])
+                            },
+                            |a| {
+                                if reference {
+                                    std::borrow::Cow::Owned(a.to_vec())
+                                } else {
+                                    std::borrow::Cow::Borrowed(a)
+                                }
+                            },
+                        );
+                        if plane == 0 && filter_mode.is_some() {
+                            prediction = super::prediction::recursive(
+                                ptw,
+                                pth,
+                                filter_mode.unwrap(),
+                                self.s.bit_depth,
+                                &top,
+                                &side,
+                                corner_value,
+                            )?;
+                        } else if (1..=8).contains(&mode) {
+                            let smooth_neighbor = [
+                                above.as_ref().and_then(|_| {
+                                    if ay > 0 {
+                                        self.cells.get((y.saturating_sub(1)) * self.cols + x)
+                                    } else {
+                                        None
+                                    }
+                                }),
+                                if x > 0 {
+                                    self.cells.get(y * self.cols + x - 1)
+                                } else {
+                                    None
+                                },
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .any(|c| {
+                                (9..=11).contains(&if plane == 0 { c.y_mode } else { c.uv_mode })
+                            });
+                            prediction = super::prediction::directional(
+                                ptw,
+                                pth,
+                                self.s.bit_depth,
+                                mode,
+                                if plane == 0 { y_angle } else { uv_angle },
+                                Some(top.as_ref()).filter(|_| ay > 0),
+                                Some(side.as_ref()).filter(|_| ax > 0),
+                                corner_value,
+                                self.s.enable_intra_edge_filter,
+                                smooth_neighbor,
+                                p.width - ax,
+                                p.height - ay,
+                            )?;
+                        } else if (9..=11).contains(&mode) {
+                            prediction = super::prediction::smooth(ptw, pth, mode, &top, &side)?;
+                        }
+                    }
+                    if plane > 0 && uv_mode == 13 {
+                        let (bx, by, stride, _, luma, max) = cfl_window
+                            .as_ref()
+                            .ok_or(Error::Invalid("missing CFL luma window"))?;
+                        predict_cfl(
+                            &mut prediction,
+                            ptw,
+                            pth,
+                            self.s.bit_depth,
+                            luma,
+                            *stride,
+                            max[0],
+                            max[1],
+                            ax - (bx >> sx),
+                            ay - (by >> sy),
+                            self.s.subsampling_x,
+                            self.s.subsampling_y,
+                            cfl_alpha[plane - 1],
+                        )?;
+                    }
+                    if let Some(p) = &inter_prediction {
+                        for row in 0..pth {
+                            prediction[row * ptw..(row + 1) * ptw].copy_from_slice(
+                                &p[(dy + row) * pw + dx..(dy + row) * pw + dx + ptw],
+                            );
+                        }
+                    }
+                    prediction
+                };
                 if !skip {
                     let inherited = if !is_inter {
                         None
@@ -1454,7 +1941,23 @@ impl<'a> IntraTile<'a> {
                         let ly = (ay << sy).max(y * 4) / 4;
                         Some(self.tx_types[ly * self.cols + lx])
                     };
-                    let decoded = self.coefficients.read(
+                    #[cfg(test)]
+                    let reused = if REUSE_COEFFICIENTS_CANDIDATE.get() {
+                        Some(self.coefficients.read_into(
+                            &mut self.decoder, plane, ax, ay, ptw, pth, pw, ph,
+                            if plane == 0 {
+                                filter_mode.map_or(mode, |m| [0, 1, 2, 6, 0][m])
+                            } else { mode },
+                            self.h.coded_lossless, self.h.reduced_tx_set,
+                            self.h.base_q_idx, inherited,
+                            &mut inter_scratch.quant_coefficients,
+                            &mut inter_scratch.padded_coefficients,
+                        )?)
+                    } else { None };
+                    #[cfg(not(test))]
+                    let reused = None;
+                    let decoded = if let Some(decoded) = reused { decoded } else {
+                        self.coefficients.read(
                         &mut self.decoder,
                         plane,
                         ax,
@@ -1472,7 +1975,8 @@ impl<'a> IntraTile<'a> {
                         self.h.reduced_tx_set,
                         self.h.base_q_idx,
                         inherited,
-                    )?;
+                    )?
+                    };
                     if plane == 0 {
                         for row in ay / 4..((ay + pth) / 4).min(self.rows) {
                             for col in ax / 4..((ax + ptw) / 4).min(self.cols) {
@@ -1481,6 +1985,8 @@ impl<'a> IntraTile<'a> {
                         }
                     }
                     let mut coefficients = decoded.values;
+                    #[cfg(test)]
+                    count_coefficient_input(&coefficients);
                     if coefficients.iter().any(|&v| v != 0) {
                         let dc_delta = self.h.quantizer_deltas[if plane == 0 {
                             0
@@ -1506,11 +2012,17 @@ impl<'a> IntraTile<'a> {
                             _ => 1,
                         };
                         let bound = 1i64 << (7 + self.s.bit_depth);
-                        for (i, coefficient) in coefficients.iter_mut().enumerate() {
-                            let quant = if i == 0 { dc_quant } else { ac_quant };
-                            let product = i64::from(*coefficient) * i64::from(quant);
-                            let dequant = ((product.abs() & 0xffffff) / denom) * product.signum();
-                            *coefficient = dequant.clamp(-bound, bound - 1) as i32;
+                        #[cfg(test)]
+                        let bounded = EOB_DEQUANT_CANDIDATE.get();
+                        #[cfg(not(test))]
+                        let bounded = false;
+                        #[cfg(test)]
+                        if bounded {
+                            dequantize_eob(&mut coefficients, ptw, decoded.scan_prefix,
+                                dc_quant, ac_quant, denom, bound);
+                        }
+                        if !bounded {
+                            dequantize_full(&mut coefficients, dc_quant, ac_quant, denom, bound);
                         }
                         #[cfg(test)]
                         if INTER_SCRATCH_REFERENCE.with(|flag| flag.get()) {
@@ -1538,6 +2050,14 @@ impl<'a> IntraTile<'a> {
                         }
                         add_residual(&mut prediction, &inter_scratch.residual, self.s.bit_depth)?;
                     }
+                    #[cfg(test)]
+                    if REUSE_COEFFICIENTS_CANDIDATE.get() {
+                        if ptw <= 32 && pth <= 32 {
+                            inter_scratch.quant_coefficients = coefficients;
+                        } else {
+                            inter_scratch.padded_coefficients = coefficients;
+                        }
+                    }
                 }
                 if plane == 0 {
                     if let Some((bx, by, stride, height, samples, max)) = &mut cfl_window {
@@ -1563,6 +2083,9 @@ impl<'a> IntraTile<'a> {
                         self.decoded[plane][row * (p.width / 4) + col] = true;
                         self.filter_tx[plane][row * (p.width / 4) + col] = (ptw as u8, pth as u8);
                     }
+                }
+                if fast_inter {
+                    inter_scratch.transform_prediction = prediction;
                 }
             }
             if let Some(prediction) = inter_prediction {

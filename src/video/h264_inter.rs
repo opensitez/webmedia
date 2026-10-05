@@ -50,6 +50,192 @@ enum InterLumaResidual {
     EightByEight([[i32; 64]; 4]),
 }
 
+trait StateSnapshot {
+    fn deblock_snapshot(&self) -> DeblockMb;
+}
+
+fn normalize_snapshot(mut mb: DeblockMb, list0: &[usize], list1: &[usize]) -> DeblockMb {
+    for cell in &mut mb.motion {
+        cell.l0 = cell.l0.map(|(r, mv)| (list0[r as usize] as u8, mv));
+        cell.l1 = cell.l1.map(|(r, mv)| (list1[r as usize] as u8, mv));
+    }
+    mb
+}
+
+impl StateSnapshot for InterMbState {
+    fn deblock_snapshot(&self) -> DeblockMb {
+        DeblockMb {
+            qp: self.qp,
+            intra: self.intra16 || self.intra_nxn,
+            transform8x8: self.transform8x8,
+            coded_luma: self.coded_luma4,
+            motion: std::array::from_fn(|cell| MotionCell {
+                l0: Some((self.refs4[cell], self.motion4[cell])),
+                l1: None,
+            }),
+        }
+    }
+}
+
+trait WorkingStatesOps<T>: Sized {
+    fn for_picture(count: usize, width: usize, deblock: bool) -> Self;
+    fn begin_row(&mut self, row: usize);
+    fn commit(&mut self, index: usize, state: T);
+    fn take_snapshots(&mut self) -> Option<Vec<DeblockMb>>;
+}
+
+#[cfg(not(test))]
+type WorkingStates<T> = Vec<Option<T>>;
+
+impl<T: Clone> WorkingStatesOps<T> for Vec<Option<T>> {
+    #[inline]
+    fn for_picture(count: usize, _width: usize, _deblock: bool) -> Self { vec![None; count] }
+    #[inline]
+    fn begin_row(&mut self, _row: usize) {}
+    #[inline]
+    fn commit(&mut self, index: usize, state: T) { self[index] = Some(state); }
+    #[inline]
+    fn take_snapshots(&mut self) -> Option<Vec<DeblockMb>> { None }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ROW_STATES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn with_row_states<T>(enabled: bool, action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { ROW_STATES.with(|flag| flag.set(self.0)); }
+    }
+    let _restore = Restore(ROW_STATES.with(|flag| flag.replace(enabled)));
+    action()
+}
+
+#[cfg(test)]
+struct WorkingStates<T> {
+    values: Vec<Option<T>>,
+    width: usize,
+    rows: bool,
+    snapshots: Option<Vec<DeblockMb>>,
+}
+
+#[cfg(test)]
+impl<T> WorkingStates<T> {
+    fn slot(&self, index: usize) -> usize {
+        if self.rows { (index / self.width % 2) * self.width + index % self.width }
+        else { index }
+    }
+    fn iter(&self) -> std::slice::Iter<'_, Option<T>> { self.values.iter() }
+}
+
+#[cfg(test)]
+impl<T> std::ops::Index<usize> for WorkingStates<T> {
+    type Output = Option<T>;
+    fn index(&self, index: usize) -> &Self::Output {
+        let _profile = profiling::scope(profiling::Stage::StateLookup);
+        &self.values[self.slot(index)]
+    }
+}
+
+#[cfg(test)]
+impl<T: Clone + StateSnapshot> WorkingStatesOps<T> for WorkingStates<T> {
+    fn for_picture(count: usize, width: usize, deblock: bool) -> Self {
+        let _profile = profiling::scope(profiling::Stage::StateInit);
+        let rows = ROW_STATES.with(|flag| flag.get());
+        Self {
+            values: vec![None; if rows { width * 2 } else { count }],
+            width,
+            rows,
+            snapshots: (rows && deblock).then(|| Vec::with_capacity(count)),
+        }
+    }
+    fn begin_row(&mut self, row: usize) {
+        if self.rows {
+            let _profile = profiling::scope(profiling::Stage::StateInit);
+            let start = (row % 2) * self.width;
+            self.values[start..start + self.width].fill(None);
+        }
+    }
+    fn commit(&mut self, index: usize, state: T) {
+        let _profile = profiling::scope(profiling::Stage::StateWrite);
+        if let Some(snapshots) = self.snapshots.as_mut() {
+            assert_eq!(snapshots.len(), index);
+            // Keep slice-local references until the entire slice succeeds.
+            snapshots.push(state.deblock_snapshot());
+        }
+        let slot = self.slot(index);
+        self.values[slot] = Some(state);
+    }
+    fn take_snapshots(&mut self) -> Option<Vec<DeblockMb>> { self.snapshots.take() }
+}
+
+#[cfg(test)]
+pub(super) mod profiling {
+    use std::{cell::RefCell, time::Instant};
+
+    #[derive(Clone, Copy)]
+    pub enum Stage { Other, EntropyState, Motion, HalfPel, Transform, Reconstruction, Deblock, StateInit, StateLookup, StateWrite }
+
+    #[derive(Default, Clone, Copy, Debug)]
+    pub struct Stats {
+        pub ns: [u64; 10],
+        pub calls: [u64; 10],
+        pub transforms: [u64; 2],
+        pub dc_only: [u64; 2],
+    }
+
+    std::thread_local! {
+        static STATS: RefCell<Option<Stats>> = const { RefCell::new(None) };
+    }
+
+    pub struct Guard(Option<(Stage, Instant, u64)>);
+
+    pub fn scope(stage: Stage) -> Guard {
+        Guard(STATS.with(|stats| stats.borrow().as_ref().map(|stats| {
+            (stage, Instant::now(), stats.ns.iter().sum())
+        })))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some((stage, start, accounted)) = self.0 {
+                let elapsed = start.elapsed().as_nanos() as u64;
+                STATS.with(|stats| {
+                    if let Some(stats) = stats.borrow_mut().as_mut() {
+                        let children = stats.ns.iter().sum::<u64>().saturating_sub(accounted);
+                        stats.ns[stage as usize] += elapsed.saturating_sub(children);
+                        stats.calls[stage as usize] += 1;
+                    }
+                });
+            }
+        }
+    }
+
+    pub fn transform<const N: usize>(coefficients: &[i32; N]) {
+        STATS.with(|stats| {
+            if let Some(stats) = stats.borrow_mut().as_mut() {
+                let size = usize::from(N == 64);
+                stats.transforms[size] += 1;
+                stats.dc_only[size] += u64::from(coefficients[1..].iter().all(|&value| value == 0));
+            }
+        });
+    }
+
+    pub fn with_profile<T>(action: impl FnOnce() -> T) -> (T, Stats) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) { STATS.with(|stats| *stats.borrow_mut() = None); }
+        }
+        STATS.with(|stats| { assert!(stats.borrow().is_none()); *stats.borrow_mut() = Some(Stats::default()); });
+        let _reset = Reset;
+        let result = action();
+        let stats = STATS.with(|stats| stats.borrow().unwrap());
+        (result, stats)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PSubPartitions {
     modes: [u8; 4],
@@ -547,6 +733,8 @@ pub fn decode_cabac_p_2005(
     pps: &PictureParameters2005,
     references: &[Yuv420Picture],
 ) -> Result<Yuv420Picture, AvcError> {
+    #[cfg(test)]
+    let _profile_picture = profiling::scope(profiling::Stage::Other);
     let reference = references
         .last()
         .ok_or(AvcError::Unsupported("P reference picture"))?;
@@ -627,7 +815,8 @@ pub fn decode_cabac_p_2005(
         ],
         luma_half: std::sync::OnceLock::new(),
     };
-    let mut states: Vec<Option<InterMbState>> = vec![None; width_mbs * height_mbs];
+    let mb_count = width_mbs * height_mbs;
+    let mut states = WorkingStates::<InterMbState>::for_picture(mb_count, width_mbs, !slice.deblocking_disabled);
     let mut decoder = CabacDecoder::new(&slice.rbsp[slice.data_byte_offset..])?;
     let mut inter = InterMbContexts::new(slice.slice_qp, slice.cabac_init_idc, false)?;
     let mut vectors = MotionVectorContexts::new(slice.slice_qp, slice.cabac_init_idc)?;
@@ -651,7 +840,10 @@ pub fn decode_cabac_p_2005(
         && slice.frame_num == 9
         && matches!(slice.pic_order_cnt_lsb, 2 | 40);
     for y in 0..height_mbs {
+        states.begin_row(y);
         for x in 0..width_mbs {
+            #[cfg(test)]
+            let _profile_mb = profiling::scope(profiling::Stage::EntropyState);
             let index = y * width_mbs + x;
             let left = (x > 0).then(|| states[index - 1].as_ref()).flatten();
             let above = (y > 0)
@@ -878,7 +1070,7 @@ pub fn decode_cabac_p_2005(
                                 .then(|| picture.cr[(cy0 - 1) * chroma_width + cx0 - 1]),
                         )?;
                         write_inter_block(&mut picture, x, y, &InterMacroblock { luma, cb, cr });
-                        states[index] = Some(InterMbState {
+                        states.commit(index, InterMbState {
                             qp,
                             skipped: false,
                             intra16: false,
@@ -909,7 +1101,7 @@ pub fn decode_cabac_p_2005(
                             }),
                         });
                         let ended = decoder.terminate()?;
-                        if ended != (index + 1 == states.len()) {
+                        if ended != (index + 1 == mb_count) {
                             if std::env::var_os("WEBMEDIA_TRACE_P").is_some() {
                                 eprintln!(
                                     "P slice ended={ended} at MB {index}, bits={}",
@@ -1007,7 +1199,7 @@ pub fn decode_cabac_p_2005(
                             .then(|| picture.cr[(cy0 - 1) * chroma_width + cx0 - 1]),
                     )?;
                     write_inter_block(&mut picture, x, y, &InterMacroblock { luma, cb, cr });
-                    states[index] = Some(InterMbState {
+                    states.commit(index, InterMbState {
                         qp,
                         skipped: false,
                         intra16: true,
@@ -1040,7 +1232,7 @@ pub fn decode_cabac_p_2005(
                         }),
                     });
                     let ended = decoder.terminate()?;
-                    if ended != (index + 1 == states.len()) {
+                    if ended != (index + 1 == mb_count) {
                         if std::env::var_os("WEBMEDIA_TRACE_P").is_some() {
                             eprintln!(
                                 "P slice ended={ended} at MB {index}, bits={}",
@@ -1441,6 +1633,8 @@ pub fn decode_cabac_p_2005(
                     kind,
                 )
             };
+            #[cfg(test)]
+            let profile_motion = profiling::scope(profiling::Stage::Motion);
             let predict = |region: usize| {
                 let ref_index = ref_indices[region] as usize;
                 let source = list0
@@ -1477,6 +1671,10 @@ pub fn decode_cabac_p_2005(
                     _ => unreachable!(),
                 }
             };
+            #[cfg(test)]
+            drop(profile_motion);
+            #[cfg(test)]
+            let profile_reconstruct = profiling::scope(profiling::Stage::Reconstruction);
             add_luma_residual(&mut block, &luma_residual, qp)?;
             if coded.chroma != 0 {
                 add_chroma_residual(
@@ -1495,6 +1693,8 @@ pub fn decode_cabac_p_2005(
                 )?;
             }
             write_inter_block(&mut picture, x, y, &block);
+            #[cfg(test)]
+            drop(profile_reconstruct);
             let (luma_ac_right, luma_ac_bottom) = match &luma_residual {
                 InterLumaResidual::None => ([false; 4], [false; 4]),
                 InterLumaResidual::FourByFour(levels) => (
@@ -1506,7 +1706,7 @@ pub fn decode_cabac_p_2005(
                     [2, 2, 3, 3].map(|region| coded.luma & (1 << region) != 0),
                 ),
             };
-            states[index] = Some(InterMbState {
+            states.commit(index, InterMbState {
                 qp,
                 skipped,
                 intra16: false,
@@ -1546,7 +1746,7 @@ pub fn decode_cabac_p_2005(
                 l1: None,
             });
             let ended = decoder.terminate()?;
-            if ended != (index + 1 == states.len()) {
+            if ended != (index + 1 == mb_count) {
                 if std::env::var_os("WEBMEDIA_TRACE_P").is_some() {
                     eprintln!(
                         "P slice ended={ended} at MB {index}, bits={}",
@@ -1560,22 +1760,16 @@ pub fn decode_cabac_p_2005(
         }
     }
     if !slice.deblocking_disabled {
-        let macroblocks: Vec<_> = states
-            .iter()
-            .map(|state| {
-                let state = state.as_ref().expect("decoded P macroblock");
-                DeblockMb {
-                    qp: state.qp,
-                    intra: state.intra16 || state.intra_nxn,
-                    transform8x8: state.transform8x8,
-                    coded_luma: state.coded_luma4,
-                    motion: std::array::from_fn(|cell| MotionCell {
-                        l0: Some((list0[state.refs4[cell] as usize] as u8, state.motion4[cell])),
-                        l1: None,
-                    }),
-                }
-            })
-            .collect();
+        #[cfg(test)]
+        let _profile_deblock = profiling::scope(profiling::Stage::Deblock);
+        let macroblocks = if let Some(mut snapshots) = states.take_snapshots() {
+            for mb in &mut snapshots { *mb = normalize_snapshot(*mb, &list0, &[]); }
+            snapshots
+        } else {
+            states.iter().map(|state| normalize_snapshot(
+                state.as_ref().expect("decoded P macroblock").deblock_snapshot(), &list0, &[],
+            )).collect()
+        };
         filter_inter_picture(
             &mut picture.luma,
             &mut picture.cb,
@@ -1615,6 +1809,27 @@ struct BMbState {
     chroma_dc: [bool; 2],
     chroma_right: [[bool; 2]; 2],
     chroma_bottom: [[bool; 2]; 2],
+}
+
+impl StateSnapshot for BMbState {
+    fn deblock_snapshot(&self) -> DeblockMb {
+        DeblockMb {
+            qp: self.qp,
+            intra: self.intra16 || self.intra_nxn,
+            transform8x8: self.transform8x8,
+            coded_luma: self.coded_luma4,
+            motion: self.motion4,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn working_state_sizes() -> [usize; 3] {
+    [
+        std::mem::size_of::<Option<InterMbState>>(),
+        std::mem::size_of::<Option<BMbState>>(),
+        std::mem::size_of::<DeblockMb>(),
+    ]
 }
 
 fn b_motion_neighbor(
@@ -1676,6 +1891,8 @@ pub fn decode_cabac_b_2005(
     pps: &PictureParameters2005,
     references: &[Yuv420Picture],
 ) -> Result<Yuv420Picture, AvcError> {
+    #[cfg(test)]
+    let _profile_picture = profiling::scope(profiling::Stage::Other);
     if sps.profile_idc != 100
         || sps.chroma_format_idc != 1
         || sps.bit_depth_luma != 8
@@ -1761,7 +1978,8 @@ pub fn decode_cabac_b_2005(
         ],
         luma_half: std::sync::OnceLock::new(),
     };
-    let mut states: Vec<Option<BMbState>> = vec![None; width_mbs * height_mbs];
+    let mb_count = width_mbs * height_mbs;
+    let mut states = WorkingStates::<BMbState>::for_picture(mb_count, width_mbs, !slice.deblocking_disabled);
     let mut decoder = CabacDecoder::new(&slice.rbsp[slice.data_byte_offset..])?;
     let mut inter = InterMbContexts::new(slice.slice_qp, slice.cabac_init_idc, true)?;
     let mut vectors = MotionVectorContexts::new(slice.slice_qp, slice.cabac_init_idc)?;
@@ -1787,9 +2005,12 @@ pub fn decode_cabac_b_2005(
             .and_then(|value| value.parse::<i32>().ok())
             .is_none_or(|target| target == poc);
     for y in 0..height_mbs {
+        states.begin_row(y);
         let mut type_row = String::new();
         for x in 0..width_mbs {
             let index = y * width_mbs + x;
+            #[cfg(test)]
+            let _profile_mb = profiling::scope(profiling::Stage::EntropyState);
             let mb_start_bits = if trace_b { decoder.consumed_bits() } else { 0 };
             let left = (x > 0).then(|| states[index - 1].as_ref()).flatten();
             let above = (y > 0)
@@ -1974,7 +2195,7 @@ pub fn decode_cabac_b_2005(
                     (cx0 > 0 && cy0 > 0).then(|| picture.cr[(cy0 - 1) * chroma_width + cx0 - 1]),
                 )?;
                 write_inter_block(&mut picture, x, y, &InterMacroblock { luma, cb, cr });
-                states[index] = Some(BMbState {
+                states.commit(index, BMbState {
                     qp,
                     skipped: false,
                     direct: false,
@@ -2003,7 +2224,7 @@ pub fn decode_cabac_b_2005(
                     }),
                 });
                 let ended = decoder.terminate()?;
-                if ended != (index + 1 == states.len()) {
+                if ended != (index + 1 == mb_count) {
                     if trace_b {
                         eprintln!(
                             "B intra-nxn termination at {index}: ended={ended} bits={}",
@@ -2098,7 +2319,7 @@ pub fn decode_cabac_b_2005(
                     (cx0 > 0 && cy0 > 0).then(|| picture.cr[(cy0 - 1) * chroma_width + cx0 - 1]),
                 )?;
                 write_inter_block(&mut picture, x, y, &InterMacroblock { luma, cb, cr });
-                states[index] = Some(BMbState {
+                states.commit(index, BMbState {
                     qp,
                     skipped: false,
                     direct: false,
@@ -2127,7 +2348,7 @@ pub fn decode_cabac_b_2005(
                     }),
                 });
                 let ended = decoder.terminate()?;
-                if ended != (index + 1 == states.len()) {
+                if ended != (index + 1 == mb_count) {
                     if trace_b {
                         eprintln!("B intra termination at {index}: ended={ended}");
                     }
@@ -2642,6 +2863,8 @@ pub fn decode_cabac_b_2005(
                     )?;
                 }
             }
+            #[cfg(test)]
+            let profile_motion = profiling::scope(profiling::Stage::Motion);
             let mut block = if let Some(cells) = sub_motion4 {
                 predict_b_subpartition_block(
                     &cells,
@@ -2764,6 +2987,10 @@ pub fn decode_cabac_b_2005(
                 }
                 assemble_inter_regions(&predicted)
             };
+            #[cfg(test)]
+            drop(profile_motion);
+            #[cfg(test)]
+            let profile_reconstruct = profiling::scope(profiling::Stage::Reconstruction);
             add_luma_residual(&mut block, &luma_residual, qp)?;
             if coded.chroma != 0 {
                 add_chroma_residual(
@@ -2782,6 +3009,8 @@ pub fn decode_cabac_b_2005(
                 )?;
             }
             write_inter_block(&mut picture, x, y, &block);
+            #[cfg(test)]
+            drop(profile_reconstruct);
             let motion4 = decoded_motion4
                 .unwrap_or_else(|| std::array::from_fn(|cell| motion[cell / 8 * 2 + cell % 4 / 2]));
             picture.motion[index] = [0, 3, 12, 15].map(|cell| motion4[cell]);
@@ -2796,7 +3025,7 @@ pub fn decode_cabac_b_2005(
                     [2, 2, 3, 3].map(|region| coded.luma & (1 << region) != 0),
                 ),
             };
-            states[index] = Some(BMbState {
+            states.commit(index, BMbState {
                 qp,
                 skipped,
                 direct: kind == 0,
@@ -2831,7 +3060,7 @@ pub fn decode_cabac_b_2005(
                 );
             }
             let ended = decoder.terminate()?;
-            if ended != (index + 1 == states.len()) {
+            if ended != (index + 1 == mb_count) {
                 if trace_b {
                     eprintln!(
                         "B inter termination at {index}: kind={kind} skipped={skipped} ended={ended} bits={}/{}",
@@ -2849,22 +3078,16 @@ pub fn decode_cabac_b_2005(
         }
     }
     if !slice.deblocking_disabled {
-        let macroblocks: Vec<_> = states
-            .iter()
-            .map(|state| {
-                let state = state.as_ref().expect("decoded B macroblock");
-                DeblockMb {
-                    qp: state.qp,
-                    intra: state.intra16 || state.intra_nxn,
-                    transform8x8: state.transform8x8,
-                    coded_luma: state.coded_luma4,
-                    motion: state.motion4.map(|cell| MotionCell {
-                        l0: cell.l0.map(|(r, mv)| (list0[r as usize] as u8, mv)),
-                        l1: cell.l1.map(|(r, mv)| (list1[r as usize] as u8, mv)),
-                    }),
-                }
-            })
-            .collect();
+        #[cfg(test)]
+        let _profile_deblock = profiling::scope(profiling::Stage::Deblock);
+        let macroblocks = if let Some(mut snapshots) = states.take_snapshots() {
+            for mb in &mut snapshots { *mb = normalize_snapshot(*mb, &list0, &list1); }
+            snapshots
+        } else {
+            states.iter().map(|state| normalize_snapshot(
+                state.as_ref().expect("decoded B macroblock").deblock_snapshot(), &list0, &list1,
+            )).collect()
+        };
         filter_inter_picture(
             &mut picture.luma,
             &mut picture.cb,
@@ -3382,6 +3605,8 @@ unsafe fn diagonal_row_neon(raw: &[i16], width: usize, index: usize, output: &mu
 
 impl HalfPelPlanes {
     fn new(reference: &Yuv420Picture) -> Self {
+        #[cfg(test)]
+        let _profile_halfpel = profiling::scope(profiling::Stage::HalfPel);
         let width = reference.width;
         let height = reference.height;
         let plane = &reference.luma;
@@ -4261,6 +4486,79 @@ fn predict_inter_8x8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct RowTestState(usize);
+
+    impl StateSnapshot for RowTestState {
+        fn deblock_snapshot(&self) -> DeblockMb {
+            DeblockMb {
+                qp: self.0 as i32,
+                intra: self.0 % 2 == 0,
+                transform8x8: self.0 % 3 == 0,
+                coded_luma: self.0 as u16,
+                motion: [MotionCell { l0: Some((1, [self.0 as i32, -4])), l1: None }; 16],
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_states_preserve_neighbor_availability_and_all_snapshots() {
+        for width in [1, 2, 3, 120] {
+            for height in [1, 2, 3, 5] {
+                let count = width * height;
+                let mut full = with_row_states(false, || WorkingStates::<RowTestState>::for_picture(count, width, true));
+                let mut rows = with_row_states(true, || WorkingStates::<RowTestState>::for_picture(count, width, true));
+                assert_eq!(rows.values.len(), width * 2);
+                for y in 0..height {
+                    full.begin_row(y);
+                    rows.begin_row(y);
+                    for x in 0..width {
+                        let index = y * width + x;
+                        assert!(rows[index].is_none(), "stale current row at ({x},{y})");
+                        let neighbors = [
+                            (x > 0).then(|| index - 1),
+                            (y > 0).then(|| index - width),
+                            (y > 0 && x + 1 < width).then(|| index - width + 1),
+                            (y > 0 && x > 0).then(|| index - width - 1),
+                        ];
+                        for neighbor in neighbors {
+                            assert_eq!(neighbor.and_then(|i| full[i]), neighbor.and_then(|i| rows[i]));
+                        }
+                        full.commit(index, RowTestState(index));
+                        rows.commit(index, RowTestState(index));
+                    }
+                }
+                let snapshots = rows.take_snapshots().unwrap();
+                assert_eq!(snapshots.len(), count);
+                for (index, snapshot) in snapshots.iter().enumerate() {
+                    assert_eq!(snapshot.qp, index as i32);
+                    assert_eq!(snapshot.coded_luma, index as u16);
+                    assert_eq!(snapshot.motion, full[index].unwrap().deblock_snapshot().motion);
+                    assert_eq!(normalize_snapshot(*snapshot, &[9, 4], &[]).motion[0].l0,
+                        Some((4, [index as i32, -4])));
+                }
+                assert!(full.take_snapshots().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_states_disabled_deblock_and_control_restore() {
+        with_row_states(true, || {
+            let mut rows = WorkingStates::<RowTestState>::for_picture(12, 3, false);
+            for y in 0..4 {
+                rows.begin_row(y);
+                for x in 0..3 { rows.commit(y * 3 + x, RowTestState(y * 3 + x)); }
+            }
+            assert!(rows.take_snapshots().is_none());
+            assert!(ROW_STATES.with(|flag| flag.get()));
+            let error = std::panic::catch_unwind(|| with_row_states(false, || panic!("test unwind")));
+            assert!(error.is_err());
+            assert!(ROW_STATES.with(|flag| flag.get()));
+        });
+        assert!(!ROW_STATES.with(|flag| flag.get()));
+    }
 
     fn blend_cache_references() -> Vec<Yuv420Picture> {
         (0..2)

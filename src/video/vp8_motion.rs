@@ -2,7 +2,7 @@
 
 use super::vp8_inter::MotionVector;
 use super::vp8_predict::Plane;
-use super::subpel::{convolve_prepared_row, ConvolutionFilter};
+use super::subpel::{convolve_prepared_row, copy_replicated_block, ConvolutionFilter};
 #[cfg(test)]
 use super::subpel::convolve_row_scalar;
 
@@ -77,6 +77,12 @@ pub(super) fn predict_block(
             destination.pixels[destination_start..destination_start + width]
                 .copy_from_slice(&reference.pixels[source_start..source_start + width]);
         }
+        return;
+    }
+    if hfrac == 0 && vfrac == 0 {
+        copy_replicated_block(&mut destination.pixels, destination.width, y * destination.width + x,
+            &reference.pixels, reference.width, visible_width, visible_height,
+            origin_x, origin_y, width, height);
         return;
     }
     let hfilter = &filters[hfrac];
@@ -184,6 +190,44 @@ pub(super) fn chroma_vector(luma: &[MotionVector; 16], row: usize, col: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_edges_respect_padded_visible_extents_and_guards() {
+        let mut reference = Plane::new(32, 32);
+        for (index, pixel) in reference.pixels.iter_mut().enumerate() {
+            *pixel = (index.wrapping_mul(73) ^ (index >> 3)) as u8;
+        }
+        for (visible_width, visible_height) in [(1, 1), (17, 19), (27, 25)] {
+            for size in [4, 8, 16] {
+                for chroma in [false, true] {
+                    for bilinear in [false, true] {
+                        for source_x in [-4000, -32, -1, 0, 1, 31, 4000] {
+                            for source_y in [-4000, -32, -1, 0, 1, 31, 4000] {
+                                let mut actual = Plane::new(24, 24);
+                                actual.pixels.fill(91);
+                                let mut expected = actual.clone();
+                                let unit = if chroma { 8 } else { 4 };
+                                let mv = MotionVector {
+                                    col: ((source_x - 2) * unit) as i16,
+                                    row: ((source_y - 3) * unit) as i16,
+                                };
+                                for row in 0..size {
+                                    for col in 0..size {
+                                        let sx = (source_x + col as i32).clamp(0, visible_width as i32 - 1) as usize;
+                                        let sy = (source_y + row as i32).clamp(0, visible_height as i32 - 1) as usize;
+                                        expected.pixels[(3 + row) * 24 + 2 + col] = reference.pixels[sy * 32 + sx];
+                                    }
+                                }
+                                predict_block(&mut actual, &reference, 2, 3, size, size,
+                                    mv, chroma, bilinear, visible_width, visible_height);
+                                assert_eq!(actual.pixels, expected.pixels);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn cached_filter_taps_match_coefficients() {

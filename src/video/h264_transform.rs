@@ -2,6 +2,21 @@
 
 use super::h264::AvcError;
 
+#[cfg(test)]
+std::thread_local! {
+    static DC_TRANSFORM: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+pub(super) fn with_dc_transform<T>(enabled: bool, action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { DC_TRANSFORM.with(|flag| flag.set(self.0)); }
+    }
+    let _restore = Restore(DC_TRANSFORM.with(|flag| flag.replace(enabled)));
+    action()
+}
+
 // Table 8-12, frame macroblocks. Entries are row-major positions.
 const FRAME_ZIGZAG: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
@@ -171,8 +186,32 @@ pub fn inverse_8x8_residual(
     qp: i32,
     weights: &[u8; 64],
 ) -> Result<[i32; 64], AvcError> {
+    #[cfg(test)]
+    let _profile = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Transform);
+    #[cfg(test)]
+    super::h264_inter::profiling::transform(coefficients);
+    #[cfg(test)]
+    if !DC_TRANSFORM.with(|flag| flag.get()) {
+        return inverse_8x8_residual_impl::<false>(coefficients, qp, weights);
+    }
+    inverse_8x8_residual_impl::<true>(coefficients, qp, weights)
+}
+
+fn inverse_8x8_residual_impl<const DC_FAST: bool>(
+    coefficients: &[i32; 64], qp: i32, weights: &[u8; 64],
+) -> Result<[i32; 64], AvcError> {
     if !(0..=51).contains(&qp) {
         return Err(AvcError::InvalidData("8x8 residual QP out of range"));
+    }
+    if DC_FAST && coefficients[1..].iter().all(|&coefficient| coefficient == 0) {
+        let product = i64::from(coefficients[0]) * i64::from(weights[0])
+            * i64::from(NORM_ADJUST_8X8[(qp % 6) as usize][0]);
+        let scaled = if qp >= 36 { product << (qp / 6 - 6) }
+            else { (product + (1_i64 << (5 - qp / 6))) >> (6 - qp / 6) };
+        if !(-32768..=32767).contains(&scaled) {
+            return Err(AvcError::InvalidData("scaled 8x8 coefficient out of range"));
+        }
+        return Ok([((scaled + 32) >> 6) as i32; 64]);
     }
     let mut scaled = [0i64; 64];
     for (index, &coefficient) in coefficients.iter().enumerate() {
@@ -229,8 +268,31 @@ pub fn inverse_4x4_residual(
     qp: i32,
     dc_is_pre_scaled: bool,
 ) -> Result<[i32; 16], AvcError> {
+    #[cfg(test)]
+    let _profile = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Transform);
+    #[cfg(test)]
+    super::h264_inter::profiling::transform(coefficients);
+    #[cfg(test)]
+    if !DC_TRANSFORM.with(|flag| flag.get()) {
+        return inverse_4x4_residual_impl::<false>(coefficients, qp, dc_is_pre_scaled);
+    }
+    inverse_4x4_residual_impl::<true>(coefficients, qp, dc_is_pre_scaled)
+}
+
+fn inverse_4x4_residual_impl<const DC_FAST: bool>(
+    coefficients: &[i32; 16], qp: i32, dc_is_pre_scaled: bool,
+) -> Result<[i32; 16], AvcError> {
     if !(0..=51).contains(&qp) {
         return Err(AvcError::InvalidData("4x4 residual QP out of range"));
+    }
+    if DC_FAST && coefficients[1..].iter().all(|&coefficient| coefficient == 0) {
+        let scaled = if dc_is_pre_scaled { i64::from(coefficients[0]) } else {
+            (i64::from(coefficients[0]) * i64::from(LEVEL_SCALE[(qp % 6) as usize][0])) << (qp / 6)
+        };
+        if !(-32768..=32767).contains(&scaled) {
+            return Err(AvcError::InvalidData("scaled 4x4 coefficient out of range"));
+        }
+        return Ok([((scaled + 32) >> 6) as i32; 16]);
     }
     let mut scaled = [0i32; 16];
     for (index, &coefficient) in coefficients.iter().enumerate() {
@@ -381,6 +443,93 @@ mod tests {
     fn coefficient_ranges_are_checked() {
         assert!(inverse_4x4_residual(&[0; 16], 52, false).is_err());
         assert!(inverse_4x4_residual(&[1_000_000; 16], 51, false).is_err());
+    }
+
+    #[test]
+    fn dc_shortcuts_match_full_transforms_and_rejections() {
+        let dc_values = [-1_000_000, -32768, -4096, -1024, -33, -1, 0, 1, 32, 1024, 4096, 32767, 1_000_000];
+        for qp in -1..=52 {
+            for dc in dc_values {
+                let mut coefficients4 = [0; 16];
+                coefficients4[0] = dc;
+                for pre_scaled in [false, true] {
+                    assert_eq!(
+                        inverse_4x4_residual_impl::<true>(&coefficients4, qp, pre_scaled),
+                        inverse_4x4_residual_impl::<false>(&coefficients4, qp, pre_scaled),
+                        "4x4 qp={qp} DC={dc} pre_scaled={pre_scaled}"
+                    );
+                }
+                let mut coefficients8 = [0; 64];
+                coefficients8[0] = dc;
+                for weight in [0, 1, 16, 255] {
+                    let weights = [weight; 64];
+                    assert_eq!(
+                        inverse_8x8_residual_impl::<true>(&coefficients8, qp, &weights),
+                        inverse_8x8_residual_impl::<false>(&coefficients8, qp, &weights),
+                        "8x8 qp={qp} DC={dc} weight={weight}"
+                    );
+                }
+            }
+        }
+        for qp in 0..=51 {
+            for position in 1..64 {
+                let mut coefficients = [0; 64];
+                coefficients[0] = -31;
+                coefficients[position] = if position % 2 == 0 { 1 } else { -1 };
+                let weights = std::array::from_fn(|index| 1 + (index % 31) as u8);
+                assert_eq!(
+                    inverse_8x8_residual_impl::<true>(&coefficients, qp, &weights),
+                    inverse_8x8_residual_impl::<false>(&coefficients, qp, &weights)
+                );
+                if position < 16 {
+                    let coefficients4 = coefficients[..16].try_into().unwrap();
+                    for pre_scaled in [false, true] {
+                        assert_eq!(
+                            inverse_4x4_residual_impl::<true>(&coefficients4, qp, pre_scaled),
+                            inverse_4x4_residual_impl::<false>(&coefficients4, qp, pre_scaled)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dc_shortcuts_preserve_signed_rounding_and_scaling_boundaries() {
+        // Pre-scaled DC bypasses QP scaling, so cover every admitted value
+        // plus both adjacent rejected values at one valid QP.
+        for dc in -32769..=32768 {
+            let mut coefficients = [0; 16];
+            coefficients[0] = dc;
+            assert_eq!(
+                inverse_4x4_residual_impl::<true>(&coefficients, 0, true),
+                inverse_4x4_residual_impl::<false>(&coefficients, 0, true)
+            );
+        }
+        for qp in 0..=51 {
+            for dc in [-2147483648, -32769, -32768, -32767, 32766, 32767, 32768, 2147483647] {
+                let mut coefficients = [0; 16];
+                coefficients[0] = dc;
+                for pre_scaled in [false, true] {
+                    assert_eq!(
+                        inverse_4x4_residual_impl::<true>(&coefficients, qp, pre_scaled),
+                        inverse_4x4_residual_impl::<false>(&coefficients, qp, pre_scaled)
+                    );
+                }
+            }
+            for weight in 0..=255 {
+                let weights = [weight; 64];
+                for dc in (-65..=65).chain([i32::MIN, -32769, -32768, 32767, 32768, i32::MAX]) {
+                    let mut coefficients = [0; 64];
+                    coefficients[0] = dc;
+                    assert_eq!(
+                        inverse_8x8_residual_impl::<true>(&coefficients, qp, &weights),
+                        inverse_8x8_residual_impl::<false>(&coefficients, qp, &weights),
+                        "8x8 qp={qp} DC={dc} weight={weight}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod h264_inter;
 pub mod h264_intra;
 pub mod h264_transform;
 pub mod mp4;
+pub mod mp4_demux;
 pub mod mp4_avc;
 pub mod mp4_video;
 #[cfg(feature = "audio-symphonia")]

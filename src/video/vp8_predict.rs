@@ -259,6 +259,79 @@ fn predict_horizontal_up(left: &[u8; 4], row: usize, col: usize) -> u8 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn small_prediction_does_not_read_unreconstructed_macroblocks() {
+        for mb_y in [0, 16] {
+            for mb_x in [0, 16] {
+                for by in 0..4 {
+                    for bx in 0..4 {
+                        let (x, y) = (mb_x + bx * 4, mb_y + by * 4);
+                        for mode in 0..10 {
+                            let mut expected = None;
+                            for future in 0..3 {
+                                let mut plane = Plane::new(48, 48);
+                                for (index, pixel) in plane.pixels.iter_mut().enumerate() {
+                                    let (row, col) = (index / 48, index % 48);
+                                    let decoded = row < mb_y || (row < mb_y + 16
+                                        && (col < mb_x || (col < mb_x + 16
+                                            && (row < y || (row < y + 4 && col < x)))));
+                                    *pixel = if decoded {
+                                        ((index * 73 + row * 19) % 256) as u8
+                                    } else {
+                                        match future {
+                                            0 => 0, 1 => ((index * 29 + row * 13) % 256) as u8,
+                                            _ => 255,
+                                        }
+                                    };
+                                }
+                                let before = plane.pixels.clone();
+                                plane.predict_small(x, y, mode, mb_x, mb_y);
+                                let output: [u8; 16] = std::array::from_fn(|index| {
+                                    plane.pixels[(y + index / 4) * 48 + x + index % 4]
+                                });
+                                if let Some(reference) = expected {
+                                    assert_eq!(output, reference,
+                                        "mb=({mb_x},{mb_y}) block=({bx},{by}) mode={mode} future={future}");
+                                } else { expected = Some(output); }
+                                for (index, (&actual, &original)) in
+                                    plane.pixels.iter().zip(&before).enumerate()
+                                {
+                                    let (row, col) = (index / 48, index % 48);
+                                    if !(y..y + 4).contains(&row) || !(x..x + 4).contains(&col) {
+                                        assert_eq!(actual, original, "write outside predicted block");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn lazy_large_prediction(plane: &mut Plane, x: usize, y: usize, size: usize, mode: u8) {
+        match mode {
+            1 => {
+                let mut above = [0; 16];
+                for (col, value) in above[..size].iter_mut().enumerate() {
+                    *value = plane.top(x + col, y);
+                }
+                for row in 0..size {
+                    let start = (y + row) * plane.width + x;
+                    plane.pixels[start..start + size].copy_from_slice(&above[..size]);
+                }
+            }
+            2 => {
+                for row in 0..size {
+                    let value = plane.left(x, y + row);
+                    let start = (y + row) * plane.width + x;
+                    plane.pixels[start..start + size].fill(value);
+                }
+            }
+            _ => plane.predict_large(x, y, size, mode),
+        }
+    }
+
     fn scalar_large_prediction(plane: &mut Plane, x: usize, y: usize, size: usize, mode: u8) {
         let above: Vec<_> = (0..size).map(|col| plane.top(x + col, y)).collect();
         let left: Vec<_> = (0..size).map(|row| plane.left(x, y + row)).collect();
@@ -300,12 +373,45 @@ mod tests {
                         }
                         for mode in 0..4 {
                             let mut actual = original.clone();
+                            let mut lazy = original.clone();
                             let mut expected = original.clone();
                             actual.predict_large(x, y, size, mode);
+                            lazy_large_prediction(&mut lazy, x, y, size, mode);
                             scalar_large_prediction(&mut expected, x, y, size, mode);
                             assert_eq!(actual.pixels, expected.pixels,
                                 "size={size} x={x} y={y} mode={mode} pattern={pattern}");
+                            assert_eq!(lazy.pixels, expected.pixels,
+                                "lazy size={size} x={x} y={y} mode={mode} pattern={pattern}");
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual retained/lazy large-predictor ABBA timing"]
+    fn benchmark_lazy_large_prediction() {
+        fn run<const LAZY: bool>(size: usize, mode: u8) -> u128 {
+            let mut plane = Plane::new(32, 32);
+            for (index, pixel) in plane.pixels.iter_mut().enumerate() {
+                *pixel = ((index * 37 + 19) & 255) as u8;
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..200_000 {
+                let mode = std::hint::black_box(mode);
+                if LAZY { lazy_large_prediction(&mut plane, 8, 8, size, mode); }
+                else { plane.predict_large(8, 8, size, mode); }
+                std::hint::black_box(&plane.pixels);
+            }
+            start.elapsed().as_nanos()
+        }
+        for size in [8, 16] {
+            for mode in 0..4 {
+                for pass in 0..2 {
+                    for lazy in [false, true, true, false] {
+                        let ns = if lazy { run::<true>(size, mode) } else { run::<false>(size, mode) };
+                        eprintln!("vp8 large prediction size={size} mode={mode} pass={pass} lazy={lazy} wall_ns={ns}");
                     }
                 }
             }

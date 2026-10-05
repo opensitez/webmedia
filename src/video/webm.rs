@@ -94,9 +94,10 @@ pub struct WebmStream {
     group_discard_padding: Option<i64>,
 }
 
+/// VP8-only streaming decoder. Each push decodes at most one coded frame;
+/// drain buffered samples with empty pushes before supplying more input.
 pub struct WebmVp8Decoder {
-    stream: WebmVideoStream,
-    decoder: Vp8Decoder,
+    decoder: WebmVideoDecoder,
 }
 
 pub struct WebmVideoDecoder {
@@ -250,37 +251,30 @@ impl StreamingVideoDecoder for WebmVideoDecoder {
 impl WebmVp8Decoder {
     pub fn new() -> Self {
         Self {
-            stream: WebmVideoStream::for_codec(WebmVideoCodec::Vp8),
-            decoder: Vp8Decoder::new(),
+            decoder: WebmVideoDecoder {
+                stream: WebmVideoStream::for_codec(WebmVideoCodec::Vp8),
+                codec: None,
+                pending: Default::default(),
+            },
         }
     }
 }
 
 impl StreamingVideoDecoder for WebmVp8Decoder {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<VideoFrame>, MediaDecodeError> {
-        let packets = self.stream.push(bytes)?;
-        let mut frames = Vec::with_capacity(packets.len());
-        for packet in packets {
-            let header = FrameHeader::parse(&packet.data)?;
-            let decoded = self.decoder.decode(&packet.data)?;
-            if header.show_frame {
-                frames.push(VideoFrame {
-                    width: decoded.width as u32,
-                    height: decoded.height as u32,
-                    rgba: std::sync::Arc::new(decoded.rgba()),
-                    timestamp: packet.timestamp,
-                });
-            }
-        }
-        Ok(frames)
+        self.decoder.push(bytes)
     }
 
     fn metadata(&self) -> Option<MediaMetadata> {
-        self.stream.metadata()
+        self.decoder.metadata()
     }
 
     fn finish(&self) -> Result<(), MediaDecodeError> {
-        self.stream.finish()
+        self.decoder.finish()
+    }
+
+    fn has_buffered_samples(&self) -> bool {
+        self.decoder.has_buffered_samples()
     }
 }
 
@@ -1071,10 +1065,52 @@ mod tests {
     }
 
     #[test]
+    fn vp8_specialized_decoder_keeps_codec_selection_restricted() {
+        let bytes = include_bytes!("../../tests/fixtures/vp9-lossless.webm");
+        let mut decoder = WebmVp8Decoder::new();
+        assert!(decoder.push(bytes).unwrap().is_empty());
+        assert!(!decoder.has_buffered_samples());
+        assert!(decoder.metadata().is_none());
+        assert!(matches!(decoder.finish(), Err(MediaDecodeError::Unsupported)));
+    }
+
+    #[test]
+    fn vp8_specialized_decoder_bounds_large_pushes_and_requires_drain() {
+        let bytes = include_bytes!("../../tests/fixtures/vp8-motion.webm");
+        let mut stream = WebmVp8Stream::new();
+        let expected = stream.push(bytes).unwrap().into_iter()
+            .filter(|packet| FrameHeader::parse(&packet.data).unwrap().show_frame).count();
+        assert!(expected > 1);
+        let mut decoder = WebmVp8Decoder::new();
+        let first = decoder.push(bytes).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(decoder.has_buffered_samples());
+        assert!(decoder.finish().is_err());
+        let mut count = first.len();
+        let mut last_timestamp = first[0].timestamp;
+        while decoder.has_buffered_samples() {
+            let batch = decoder.push(&[]).unwrap();
+            assert!(batch.len() <= 1);
+            for frame in batch {
+                assert!(frame.timestamp >= last_timestamp);
+                assert_eq!(frame.rgba.len(), frame.width as usize * frame.height as usize * 4);
+                last_timestamp = frame.timestamp;
+                count += 1;
+            }
+        }
+        assert_eq!(count, expected);
+        decoder.finish().unwrap();
+        assert!(decoder.push(&[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn vp8_hidden_reference_stream_is_independent_of_input_chunk_boundaries() {
         let bytes = include_bytes!("../../tests/fixtures/vp8-altref.webm");
         let mut complete = WebmVp8Decoder::new();
-        let expected = complete.push(bytes).unwrap();
+        let mut expected = complete.push(bytes).unwrap();
+        while complete.has_buffered_samples() {
+            expected.extend(complete.push(&[]).unwrap());
+        }
         complete.finish().unwrap();
         assert_eq!(expected.len(), 120);
         let metadata = complete.metadata().unwrap();
@@ -1105,6 +1141,7 @@ mod tests {
                 let mut emitted_before_end = false;
                 for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
                     let frames = decoder.push(chunk).unwrap();
+                    assert!(frames.len() <= 1);
                     if !frames.is_empty() && (index + 1) * chunk_size < bytes.len() {
                         emitted_before_end = true;
                     }
@@ -1940,6 +1977,9 @@ mod tests {
         let mut frames = Vec::new();
         for chunk in bytes.chunks(1024) {
             frames.extend(decoder.push(chunk).unwrap());
+            while frames.len() < 4 && decoder.has_buffered_samples() {
+                frames.extend(decoder.push(&[]).unwrap());
+            }
             if frames.len() >= 4 {
                 break;
             }
@@ -2064,14 +2104,20 @@ mod tests {
             for packet in stream.push(chunk).unwrap() {
                 expected += usize::from(FrameHeader::parse(&packet.data).unwrap().show_frame);
             }
-            for frame in decoder.push(chunk).unwrap() {
-                assert!(last_timestamp.is_none_or(|previous| frame.timestamp >= previous));
-                assert_eq!(
-                    frame.rgba.len(),
-                    frame.width as usize * frame.height as usize * 4
-                );
-                last_timestamp = Some(frame.timestamp);
-                count += 1;
+            let mut batch = decoder.push(chunk).unwrap();
+            loop {
+                assert!(batch.len() <= 1);
+                for frame in batch {
+                    assert!(last_timestamp.is_none_or(|previous| frame.timestamp >= previous));
+                    assert_eq!(
+                        frame.rgba.len(),
+                        frame.width as usize * frame.height as usize * 4
+                    );
+                    last_timestamp = Some(frame.timestamp);
+                    count += 1;
+                }
+                if !decoder.has_buffered_samples() { break; }
+                batch = decoder.push(&[]).unwrap();
             }
         }
         stream.finish().unwrap();
@@ -2087,6 +2133,68 @@ mod tests {
                 start.elapsed().as_secs_f64()
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires WEBMEDIA_WEBM_SAMPLE and the ffmpeg binary pixel oracle"]
+    fn supplied_vp8_stream_matches_binary_pixel_oracle() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        struct Oracle(std::process::Child);
+        impl Drop for Oracle {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let path = std::env::var("WEBMEDIA_WEBM_SAMPLE")
+            .expect("set WEBMEDIA_WEBM_SAMPLE to a VP8 WebM fixture");
+        let bytes = std::fs::read(&path).unwrap();
+        let mut oracle = Oracle(Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-threads", "1", "-i", &path,
+                "-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p",
+                "-f", "rawvideo", "pipe:1"])
+            .stdout(Stdio::piped())
+            .spawn().expect("start ffmpeg binary pixel oracle"));
+        let mut output = oracle.0.stdout.take().unwrap();
+        let mut stream = WebmVp8Stream::new();
+        let mut decoder = super::super::vp8_decoder::Vp8Decoder::new();
+        let mut row = Vec::new();
+        let mut visible = 0usize;
+        let mut samples = 0usize;
+        for chunk in bytes.chunks(16384) {
+            for packet in stream.push(chunk).unwrap() {
+                let header = FrameHeader::parse(&packet.data).unwrap();
+                let frame = decoder.decode(&packet.data).unwrap();
+                if !header.show_frame { continue; }
+                for (name, plane, width, height) in [
+                    ("Y", &frame.y, frame.width, frame.height),
+                    ("U", &frame.u, frame.width.div_ceil(2), frame.height.div_ceil(2)),
+                    ("V", &frame.v, frame.width.div_ceil(2), frame.height.div_ceil(2)),
+                ] {
+                    row.resize(width, 0);
+                    for y in 0..height {
+                        output.read_exact(&mut row).expect("oracle ended before decoded frame");
+                        let actual = &plane.pixels[y * plane.width..y * plane.width + width];
+                        if let Some(x) = actual.iter().zip(&row).position(|(a, b)| a != b) {
+                            panic!("VP8 frame {visible} plane {name} ({x},{y}): decoded {} oracle {}",
+                                actual[x], row[x]);
+                        }
+                        samples += width;
+                    }
+                }
+                visible += 1;
+            }
+        }
+        stream.finish().unwrap();
+        assert!(visible > 1);
+        assert_eq!(output.read(&mut [0]).unwrap(), 0, "oracle has extra visible frames");
+        assert!(oracle.0.wait().unwrap().success(), "ffmpeg binary oracle failed");
+        eprintln!("VP8 binary oracle: {visible} visible frames, {samples} exact YUV samples");
     }
 
     fn element(id: &[u8], value: &[u8]) -> Vec<u8> {

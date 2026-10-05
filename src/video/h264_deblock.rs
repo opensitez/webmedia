@@ -1151,4 +1151,38 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn motion_comparison_matches_option_pair_reference() {
+        let reference_differs = |a: MotionCell, b: MotionCell| {
+            let matches = |a: (u8, [i32; 2]), b: (u8, [i32; 2])| {
+                a.0 == b.0 && (a.1[0] - b.1[0]).abs() < 4 && (a.1[1] - b.1[1]).abs() < 4
+            };
+            match ((a.l0, a.l1), (b.l0, b.l1)) {
+                ((None, None), (None, None)) => false,
+                ((Some(a), None) | (None, Some(a)), (Some(b), None) | (None, Some(b))) => !matches(a, b),
+                ((Some(a0), Some(a1)), (Some(b0), Some(b1))) => {
+                    !((matches(a0, b0) && matches(a1, b1)) || (matches(a0, b1) && matches(a1, b0)))
+                }
+                _ => true,
+            }
+        };
+        let mut cells = vec![MotionCell::default()];
+        for reference in 0..3 {
+            for x in [-8, -4, -3, 0, 3, 4, 8] {
+                for y in [-4, 0, 4] {
+                    let a = Some((reference, [x, y]));
+                    cells.push(MotionCell { l0: a, l1: None });
+                    cells.push(MotionCell { l0: None, l1: a });
+                    cells.push(MotionCell { l0: a, l1: a });
+                    cells.push(MotionCell { l0: a, l1: Some(((reference + 1) % 3, [-x, -y])) });
+                }
+            }
+        }
+        for &a in &cells {
+            for &b in &cells {
+                assert_eq!(motion_differs(a, b), reference_differs(a, b), "{a:?} vs {b:?}");
+            }
+        }
+    }
 }

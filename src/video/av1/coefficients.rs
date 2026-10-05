@@ -4,6 +4,17 @@
 use super::entropy::SymbolDecoder;
 use super::syntax::Error;
 use super::tables;
+use std::sync::OnceLock;
+
+#[cfg(test)]
+thread_local! {
+    static ALLOCATION_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_allocation_reference(enabled: bool) {
+    ALLOCATION_REFERENCE.set(enabled);
+}
 
 pub(crate) const TX_DIMENSIONS: [(usize, usize); 19] = [
     (4, 4),
@@ -39,6 +50,7 @@ pub(crate) fn tx_index(w: usize, h: usize) -> Result<usize, Error> {
 }
 
 #[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct Boundary {
     above_level: Vec<u8>,
     left_level: Vec<u8>,
@@ -47,6 +59,7 @@ struct Boundary {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) struct CoefficientState {
     boundaries: Vec<Boundary>,
     skip: Vec<u16>,
@@ -66,6 +79,8 @@ pub(crate) struct CoefficientState {
 pub(crate) struct DecodedCoefficients {
     pub values: Vec<i32>,
     pub tx_type: usize,
+    #[cfg(test)]
+    pub scan_prefix: &'static [u16],
 }
 
 impl CoefficientState {
@@ -225,6 +240,52 @@ impl CoefficientState {
         base_q: u8,
         inter_luma_type: Option<usize>,
     ) -> Result<DecodedCoefficients, Error> {
+        self.read_impl::<false>(decoder, plane, x, y, w, h, block_w, block_h, mode,
+            lossless, reduced_tx_set, base_q, inter_luma_type, &mut Vec::new(), &mut Vec::new())
+    }
+
+    #[cfg(test)]
+    // Recycle returned values into quant_storage for <=32 axes, output_storage otherwise.
+    pub(crate) fn read_into(
+        &mut self,
+        decoder: &mut SymbolDecoder<'_>,
+        plane: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        block_w: usize,
+        block_h: usize,
+        mode: usize,
+        lossless: bool,
+        reduced_tx_set: bool,
+        base_q: u8,
+        inter_luma_type: Option<usize>,
+        quant_storage: &mut Vec<i32>,
+        output_storage: &mut Vec<i32>,
+    ) -> Result<DecodedCoefficients, Error> {
+        self.read_impl::<true>(decoder, plane, x, y, w, h, block_w, block_h, mode,
+            lossless, reduced_tx_set, base_q, inter_luma_type, quant_storage, output_storage)
+    }
+
+    fn read_impl<const REUSE: bool>(
+        &mut self,
+        decoder: &mut SymbolDecoder<'_>,
+        plane: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        block_w: usize,
+        block_h: usize,
+        mode: usize,
+        lossless: bool,
+        reduced_tx_set: bool,
+        base_q: u8,
+        inter_luma_type: Option<usize>,
+        quant_storage: &mut Vec<i32>,
+        output_storage: &mut Vec<i32>,
+    ) -> Result<DecodedCoefficients, Error> {
         #[cfg(test)]
         let _measure = super::profile::measure(1);
         let tx = tx_index(w, h)?;
@@ -276,8 +337,11 @@ impl CoefficientState {
         if decoder.read_symbol(&mut self.skip[start..start + 3])? != 0 {
             self.update(plane, x, y, w, h, 0, 0);
             return Ok(DecodedCoefficients {
-                values: vec![0; w * h],
+                values: zeroed_coefficients::<REUSE>(
+                    if w <= 32 && h <= 32 { quant_storage } else { output_storage }, w * h),
                 tx_type: 0,
+                #[cfg(test)]
+                scan_prefix: &[],
             });
         }
         let mut tx_type = 0;
@@ -348,19 +412,17 @@ impl CoefficientState {
         }
         let aw = w.min(32);
         let ah = h.min(32);
-        let scan: Vec<u16> = if class == 2 {
-            (0..aw * ah).map(|i| i as u16).collect()
-        } else if class == 1 {
-            (0..aw * ah)
-                .map(|i| ((i % ah) * aw + i / ah) as u16)
-                .collect()
-        } else {
-            default_scan(aw, ah)?.to_vec()
-        };
+        let scan = coefficient_scan(class, aw, ah)?;
+        #[cfg(test)]
+        let active_scan = scan;
+        #[cfg(test)]
+        let reference_scan = ALLOCATION_REFERENCE.get().then(|| scan.to_vec());
+        #[cfg(test)]
+        let scan = reference_scan.as_deref().unwrap_or(scan);
         if eob > scan.len() {
             return Err(Error::Invalid("coefficient end-of-block range"));
         }
-        let mut quant = vec![0i32; aw * ah];
+        let mut quant = zeroed_coefficients::<REUSE>(quant_storage, aw * ah);
         for c in (0..eob).rev() {
             let pos = usize::from(scan[c]);
             let row = pos / aw;
@@ -477,14 +539,65 @@ impl CoefficientState {
             quant[pos] = if negative { -magnitude } else { magnitude };
         }
         self.update(plane, x, y, w, h, sum.min(63) as u8, dc_category);
-        let mut output = vec![0; w * h];
+        let reuse_quant = w == aw && h == ah;
+        #[cfg(test)]
+        let reuse_quant = reuse_quant && !ALLOCATION_REFERENCE.get();
+        if reuse_quant {
+            return Ok(DecodedCoefficients {
+                values: quant,
+                tx_type,
+                #[cfg(test)]
+                scan_prefix: &active_scan[..eob],
+            });
+        }
+        let mut output = zeroed_coefficients::<REUSE>(output_storage, w * h);
         for row in 0..ah {
             output[row * w..row * w + aw].copy_from_slice(&quant[row * aw..(row + 1) * aw]);
+        }
+        if REUSE {
+            *quant_storage = quant;
         }
         Ok(DecodedCoefficients {
             values: output,
             tx_type,
+            #[cfg(test)]
+            scan_prefix: &active_scan[..eob],
         })
+    }
+}
+
+#[inline(always)]
+fn zeroed_coefficients<const REUSE: bool>(storage: &mut Vec<i32>, length: usize) -> Vec<i32> {
+    if REUSE {
+        let mut values = std::mem::take(storage);
+        values.resize(length, 0);
+        values.fill(0);
+        values
+    } else {
+        vec![0; length]
+    }
+}
+
+pub(crate) fn coefficient_scan(class: usize, w: usize, h: usize) -> Result<&'static [u16], Error> {
+    static ROW: [u16; 1024] = {
+        let mut scan = [0; 1024];
+        let mut i = 0;
+        while i < scan.len() {
+            scan[i] = i as u16;
+            i += 1;
+        }
+        scan
+    };
+    // Each legal column scan is initialized once; default scans already live in tables.
+    static COLUMN: [OnceLock<Vec<u16>>; 16] = [const { OnceLock::new() }; 16];
+    match class {
+        2 => Ok(&ROW[..w * h]),
+        1 => {
+            let index = (w.ilog2() as usize - 2) * 4 + h.ilog2() as usize - 2;
+            Ok(COLUMN[index]
+                .get_or_init(|| (0..w * h).map(|i| ((i % h) * w + i / h) as u16).collect()))
+        }
+        _ => default_scan(w, h),
     }
 }
 
@@ -511,6 +624,268 @@ fn default_scan(w: usize, h: usize) -> Result<&'static [u16], Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_coefficients_preserve_clear_layout_errors_cursor_and_all_contexts() {
+        let mut random = 0x6512_98abu32;
+        let mut expected_state = CoefficientState::new(64, &[(64, 64); 3]);
+        let mut actual_state = expected_state.clone();
+        let mut quant = vec![i32::MAX; 4096];
+        let mut padded = vec![i32::MIN; 4096];
+        let mut successes = 0;
+        let mut failures = 0;
+        let mut zero_results = 0;
+        let mut padded_nonzero_results = 0;
+        for trial in 0..12 {
+            for (w, h) in TX_DIMENSIONS {
+                for plane in 0..3 {
+                    let length = [8192, 8192, 8192, 2, 4, 17][trial % 6];
+                    let mut tile = vec![0; length];
+                    if trial % 6 != 0 {
+                        for byte in &mut tile {
+                            random ^= random << 13;
+                            random ^= random >> 17;
+                            random ^= random << 5;
+                            *byte = random as u8;
+                        }
+                    }
+                    let mut expected_decoder = SymbolDecoder::new(&tile, true).unwrap();
+                    let mut actual_decoder = SymbolDecoder::new(&tile, true).unwrap();
+                    quant.fill(i32::MAX);
+                    padded.fill(i32::MIN);
+                    let inherited = (trial % 2 != 0).then_some(trial % 16);
+                    let expected = expected_state.read(
+                        &mut expected_decoder, plane, 0, 0, w, h, 64, 64,
+                        trial % 14, false, trial % 3 == 0, 128, inherited,
+                    );
+                    let actual = actual_state.read_into(
+                        &mut actual_decoder, plane, 0, 0, w, h, 64, 64,
+                        trial % 14, false, trial % 3 == 0, 128, inherited,
+                        &mut quant, &mut padded,
+                    );
+                    match (expected, actual) {
+                        (Ok(expected), Ok(actual)) => {
+                            successes += 1;
+                            assert_eq!(actual.tx_type, expected.tx_type);
+                            assert_eq!(actual.scan_prefix, expected.scan_prefix);
+                            assert_eq!(actual.values, expected.values,
+                                "{w}x{h} plane={plane} trial={trial}");
+                            let zero = actual.values.iter().all(|&value| value == 0);
+                            let mut active = vec![false; w * h];
+                            for &position in actual.scan_prefix {
+                                let position = usize::from(position);
+                                active[(position / w.min(32)) * w + position % w.min(32)] = true;
+                            }
+                            for (index, &value) in actual.values.iter().enumerate() {
+                                if !active[index] { assert_eq!(value, 0); }
+                            }
+                            zero_results += usize::from(zero);
+                            if w > 32 || h > 32 {
+                                padded_nonzero_results += usize::from(!zero);
+                                for y in 0..h {
+                                    for x in 0..w {
+                                        if x >= 32 || y >= 32 {
+                                            assert_eq!(actual.values[y * w + x], 0);
+                                        }
+                                    }
+                                }
+                                padded = actual.values;
+                            } else {
+                                quant = actual.values;
+                            }
+                        }
+                        (Err(expected), Err(actual)) => {
+                            failures += 1;
+                            assert_eq!(actual, expected);
+                        }
+                        _ => panic!("reused coefficients changed success/error boundary"),
+                    }
+                    assert_eq!(actual_state, expected_state,
+                        "{w}x{h} plane={plane} trial={trial}: complete CDF/boundary state");
+                    for _ in 0..4 {
+                        assert_eq!(actual_decoder.read_literal(8), expected_decoder.read_literal(8));
+                    }
+                }
+            }
+        }
+        assert!(successes > 0 && failures > 0);
+        assert!(zero_results > 0 && padded_nonzero_results > 0);
+    }
+
+    #[test]
+    fn reused_coefficients_keep_storage_and_clear_grown_shrunk_prefixes() {
+        let mut storage = Vec::with_capacity(4096);
+        let pointer = storage.as_ptr();
+        for length in [1024, 16, 4096, 64, 256, 0, 32] {
+            let mut values = zeroed_coefficients::<true>(&mut storage, length);
+            assert_eq!(values.as_ptr(), pointer);
+            assert_eq!(values.len(), length);
+            assert!(values.iter().all(|&value| value == 0));
+            values.fill(-197);
+            storage = values;
+        }
+    }
+
+    #[test]
+    fn cached_scans_match_original_for_every_transform_and_class() {
+        for (w, h) in TX_DIMENSIONS {
+            let (w, h) = (w.min(32), h.min(32));
+            for class in 0..3 {
+                let original: Vec<u16> = match class {
+                    2 => (0..w * h).map(|i| i as u16).collect(),
+                    1 => (0..w * h).map(|i| ((i % h) * w + i / h) as u16).collect(),
+                    _ => default_scan(w, h).unwrap().to_vec(),
+                };
+                let scan = coefficient_scan(class, w, h).unwrap();
+                assert_eq!(scan, original);
+                assert_eq!(
+                    scan.as_ptr(),
+                    coefficient_scan(class, w, h).unwrap().as_ptr()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_fast_path_preserves_coefficients_and_entropy_cursor() {
+        let mut random = 0x1834_5678u32;
+        for (w, h) in TX_DIMENSIONS {
+            for trial in 0..16 {
+                let mut tile = vec![0; 8192];
+                if trial != 0 {
+                    for byte in &mut tile {
+                        random ^= random << 13;
+                        random ^= random >> 17;
+                        random ^= random << 5;
+                        *byte = random as u8;
+                    }
+                }
+                let mut expected_state = CoefficientState::new(64, &[(64, 64); 3]);
+                let mut actual_state = expected_state.clone();
+                let mut expected_decoder = SymbolDecoder::new(&tile, true).unwrap();
+                let mut actual_decoder = SymbolDecoder::new(&tile, true).unwrap();
+                set_allocation_reference(true);
+                let expected = expected_state.read(
+                    &mut expected_decoder,
+                    0,
+                    0,
+                    0,
+                    w,
+                    h,
+                    w,
+                    h,
+                    0,
+                    false,
+                    false,
+                    128,
+                    Some(0),
+                );
+                set_allocation_reference(false);
+                let actual = actual_state.read(
+                    &mut actual_decoder,
+                    0,
+                    0,
+                    0,
+                    w,
+                    h,
+                    w,
+                    h,
+                    0,
+                    false,
+                    false,
+                    128,
+                    Some(0),
+                );
+                match (expected, actual) {
+                    (Ok(expected), Ok(actual)) => {
+                        assert_eq!(expected.tx_type, actual.tx_type);
+                        assert_eq!(expected.values, actual.values);
+                        assert_eq!(
+                            expected_decoder.read_literal(8),
+                            actual_decoder.read_literal(8)
+                        );
+                        assert_eq!(expected_state.base, actual_state.base);
+                        assert_eq!(expected_state.br, actual_state.br);
+                        assert_eq!(expected_state.dc_sign, actual_state.dc_sign);
+                    }
+                    (Err(expected), Err(actual)) => assert_eq!(expected, actual),
+                    _ => panic!("coefficient allocation path changed decode result"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated coefficient allocation ABBA benchmark, not whole-frame throughput"]
+    fn coefficient_allocation_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        #[cfg(target_os = "macos")]
+        fn cpu_time() -> u64 {
+            unsafe extern "C" {
+                fn clock_gettime_nsec_np(clock_id: i32) -> u64;
+            }
+            unsafe { clock_gettime_nsec_np(16) }
+        }
+        let tile = vec![0; 8192];
+        for (w, h) in [(4, 4), (8, 8), (16, 16), (32, 32), (64, 64)] {
+            let mut timings: [Vec<f64>; 2] = Default::default();
+            let mut expected = None;
+            for trial in 0..20 {
+                let reference = [true, false, false, true][trial % 4];
+                set_allocation_reference(reference);
+                let mut state = CoefficientState::new(64, &[(64, 64); 3]);
+                let mut checksum = 0i64;
+                let start = Instant::now();
+                #[cfg(target_os = "macos")]
+                let cpu_start = cpu_time();
+                for _ in 0..20_000 {
+                    let mut decoder = SymbolDecoder::new(black_box(&tile), false).unwrap();
+                    let result = state
+                        .read(
+                            &mut decoder,
+                            0,
+                            0,
+                            0,
+                            w,
+                            h,
+                            w,
+                            h,
+                            0,
+                            false,
+                            false,
+                            0,
+                            Some(0),
+                        )
+                        .unwrap();
+                    assert!(result.values.iter().any(|&v| v != 0));
+                    checksum += i64::from(black_box(result.values[0]));
+                    black_box(result);
+                }
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                #[cfg(target_os = "macos")]
+                let elapsed = {
+                    black_box(elapsed);
+                    (cpu_time() - cpu_start) as f64 / 1_000_000.0
+                };
+                assert_eq!(*expected.get_or_insert(checksum), checksum);
+                if trial >= 4 {
+                    timings[usize::from(reference)].push(elapsed);
+                }
+            }
+            set_allocation_reference(false);
+            let median = timings.map(|mut values| {
+                values.sort_by(f64::total_cmp);
+                values[values.len() / 2]
+            });
+            eprintln!(
+                "COEFFICIENT_ALLOC {w}x{h} blocks=20000 thread_cpu={} original_ms={:.3} cached_ms={:.3}",
+                cfg!(target_os = "macos"),
+                median[1],
+                median[0]
+            );
+        }
+    }
 
     #[test]
     fn saved_cdfs_exclude_boundaries_and_load_reuses_local_storage() {

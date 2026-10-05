@@ -8,6 +8,8 @@ use super::h264::{AvcConfig, AvcError};
 
 const MAX_MOOV_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SAMPLES: usize = 1_000_000;
+// Generous access-unit bound also caps the compressed audio worker queue.
+const MAX_AAC_SAMPLE_BYTES: u32 = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mp4Error {
@@ -107,7 +109,37 @@ impl Mp4AudioIndex {
             }
             let esds = child(&entry.data[28..], b"esds")?;
             let audio_specific_config = aac_decoder_config(esds.data)?.to_vec();
-            let (samples, duration_ticks) = parse_samples(stbl.data)?;
+            let (mut samples, duration_ticks) = parse_samples(stbl.data)?;
+            if samples.iter().any(|sample| sample.size > MAX_AAC_SAMPLE_BYTES) {
+                return Err(Mp4Error::TooLarge);
+            }
+            let (media_start, edit_duration) = audio_edit(track.data)?;
+            for sample in &mut samples {
+                sample.presentation_time = sample
+                    .presentation_time
+                    .checked_sub(media_start)
+                    .ok_or(Mp4Error::TooLarge)?;
+            }
+            let duration_ticks = if let Some(duration) = edit_duration {
+                let header = child(moov.data, b"mvhd")?;
+                let movie_timescale = u32_at(
+                    header.data,
+                    if header.data.first() == Some(&1) {
+                        20
+                    } else {
+                        12
+                    },
+                )?;
+                if movie_timescale == 0 {
+                    return Err(Mp4Error::Invalid("zero movie timescale"));
+                }
+                u64::try_from(
+                    u128::from(duration) * u128::from(timescale) / u128::from(movie_timescale),
+                )
+                .map_err(|_| Mp4Error::TooLarge)?
+            } else {
+                duration_ticks.saturating_sub(media_start as u64)
+            };
             return Ok(Some(Self {
                 timescale,
                 duration_ticks,
@@ -117,6 +149,32 @@ impl Mp4AudioIndex {
         }
         Ok(None)
     }
+}
+
+fn audio_edit(track: &[u8]) -> Result<(i64, Option<u64>), Mp4Error> {
+    let Some(edits) = children(track)?
+        .into_iter()
+        .find(|atom| atom.kind == *b"edts")
+    else {
+        return Ok((0, None));
+    };
+    let edit = child(edits.data, b"elst")?;
+    if u32_at(edit.data, 4)? != 1 {
+        return Err(Mp4Error::Unsupported("multiple audio timeline edits"));
+    }
+    let (start, duration, rate_offset) = match edit.data.first() {
+        Some(0) => (
+            i64::from(u32_at(edit.data, 12)? as i32),
+            u64::from(u32_at(edit.data, 8)?),
+            16,
+        ),
+        Some(1) => (u64_at(edit.data, 16)? as i64, u64_at(edit.data, 8)?, 24),
+        _ => return Err(Mp4Error::Invalid("invalid edit list version")),
+    };
+    if start < 0 || u32_at(edit.data, rate_offset)? != 0x0001_0000 {
+        return Err(Mp4Error::Unsupported("empty or rate-adjusted audio edit"));
+    }
+    Ok((start, Some(duration)))
 }
 
 fn descriptor(data: &[u8]) -> Result<(u8, &[u8]), Mp4Error> {
@@ -535,6 +593,25 @@ mod tests {
             (5, &[0x12, 0x10][..])
         );
         assert!(descriptor(&[5, 0x80, 0x80, 0x80, 0x80]).is_err());
+    }
+
+    #[test]
+    fn audio_priming_edit_preserves_negative_first_packet_time() {
+        let mut edit = vec![0; 4];
+        edit.extend(1u32.to_be_bytes());
+        edit.extend(1000u32.to_be_bytes());
+        edit.extend(1024u32.to_be_bytes());
+        edit.extend(0x0001_0000u32.to_be_bytes());
+        let track = boxed(b"edts", &boxed(b"elst", &edit));
+        assert_eq!(audio_edit(&track).unwrap(), (1024, Some(1000)));
+        for end in 0..track.len() {
+            if end == 0 {
+                continue;
+            }
+            assert!(audio_edit(&track[..end]).is_err());
+        }
+        edit[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(audio_edit(&boxed(b"edts", &boxed(b"elst", &edit))).is_err());
     }
 
     #[test]

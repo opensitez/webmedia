@@ -1,8 +1,8 @@
 //! Codec selection and incremental sample playback for classic MP4.
 
 use super::backend::{MediaDecodeError, MediaMetadata, StreamingVideoDecoder, VideoFrame};
-use super::mp4::{Mp4Error, Mp4VideoCodec, Mp4VideoIndex};
-use super::mp4_avc::Mp4AvcStream;
+use super::mp4::{Mp4Error, Mp4Index, Mp4VideoCodec, Mp4VideoIndex};
+use super::mp4_avc::{Mp4AvcPackets, Mp4AvcStream};
 use super::vp8_decoder::Vp8Decoder;
 use super::vp9::split_superframe;
 use super::vp9_decoder::Vp9Decoder;
@@ -10,6 +10,71 @@ use std::sync::Arc;
 
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FRAMES_PER_PUSH: usize = 4;
+
+pub struct Mp4VideoPackets {
+    decoder: PacketDecoder,
+}
+
+enum PacketDecoder {
+    Avc(Mp4AvcPackets),
+    VpX(Mp4VpXStream),
+}
+
+impl Mp4VideoPackets {
+    pub fn new(index: Mp4VideoIndex, start: usize) -> Result<Self, MediaDecodeError> {
+        if index.timescale == 0
+            || (start != 0 && !index.samples.get(start).is_some_and(|s| s.keyframe))
+        {
+            return Err(MediaDecodeError::InvalidData(
+                "invalid MP4 video restart".into(),
+            ));
+        }
+        let decoder = match index.codec {
+            Mp4VideoCodec::Avc(config) => PacketDecoder::Avc(Mp4AvcPackets::with_start_sample(
+                Mp4Index {
+                    config,
+                    timescale: index.timescale,
+                    duration_ticks: index.duration_ticks,
+                    samples: index.samples,
+                },
+                start,
+            )?),
+            _ => {
+                let mut stream = Mp4VpXStream::new(index);
+                stream.next_sample = start;
+                PacketDecoder::VpX(stream)
+            }
+        };
+        Ok(Self { decoder })
+    }
+
+    pub fn push(
+        &mut self,
+        number: usize,
+        data: &[u8],
+    ) -> Result<Vec<VideoFrame>, MediaDecodeError> {
+        match &mut self.decoder {
+            PacketDecoder::Avc(decoder) => decoder.push(number, data),
+            PacketDecoder::VpX(stream) => {
+                let sample = stream.index.samples.get(number).ok_or_else(|| {
+                    MediaDecodeError::InvalidData("MP4 sample out of bounds".into())
+                })?;
+                if number != stream.next_sample
+                    || data.len() != sample.size as usize
+                    || data.len() > MAX_BUFFER_BYTES
+                {
+                    return Err(MediaDecodeError::InvalidData(
+                        "invalid MP4 access unit".into(),
+                    ));
+                }
+                stream.base_offset = sample.offset;
+                stream.bytes.clear();
+                stream.bytes.extend_from_slice(data);
+                stream.push(&[])
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Mp4VideoDecoder {
@@ -52,11 +117,16 @@ impl StreamingVideoDecoder for Mp4VideoDecoder {
     }
 
     fn finish(&self) -> Result<(), MediaDecodeError> {
-        self.decoder.as_ref().ok_or(MediaDecodeError::Unsupported)?.finish()
+        self.decoder
+            .as_ref()
+            .ok_or(MediaDecodeError::Unsupported)?
+            .finish()
     }
 
     fn has_buffered_samples(&self) -> bool {
-        self.decoder.as_ref().is_some_and(|decoder| decoder.has_buffered_samples())
+        self.decoder
+            .as_ref()
+            .is_some_and(|decoder| decoder.has_buffered_samples())
     }
 }
 
@@ -81,13 +151,18 @@ impl Mp4VpXStream {
             Mp4VideoCodec::Avc(_) => unreachable!("AVC uses its own sample stream"),
         };
         Self {
-            bytes: Vec::new(), base_offset: 0, index, next_sample: 0,
+            bytes: Vec::new(),
+            base_offset: 0,
+            index,
+            next_sample: 0,
             decoder,
         }
     }
 
     fn sample_available(&self) -> bool {
-        self.index.samples.get(self.next_sample)
+        self.index
+            .samples
+            .get(self.next_sample)
             .and_then(|sample| sample.offset.checked_add(u64::from(sample.size)))
             .is_some_and(|end| end <= self.base_offset + self.bytes.len() as u64)
     }
@@ -102,12 +177,20 @@ impl StreamingVideoDecoder for Mp4VpXStream {
         let mut frames = Vec::new();
         while frames.len() < MAX_FRAMES_PER_PUSH && self.sample_available() {
             let sample = &self.index.samples[self.next_sample];
-            let start = usize::try_from(sample.offset.checked_sub(self.base_offset)
-                .ok_or(MediaDecodeError::Unsupported)?)
-                .map_err(|_| MediaDecodeError::Unsupported)?;
-            let end = start.checked_add(sample.size as usize)
+            let start = usize::try_from(
+                sample
+                    .offset
+                    .checked_sub(self.base_offset)
+                    .ok_or(MediaDecodeError::Unsupported)?,
+            )
+            .map_err(|_| MediaDecodeError::Unsupported)?;
+            let end = start
+                .checked_add(sample.size as usize)
                 .ok_or(MediaDecodeError::Unsupported)?;
-            let data = self.bytes.get(start..end).ok_or(MediaDecodeError::Unsupported)?;
+            let data = self
+                .bytes
+                .get(start..end)
+                .ok_or(MediaDecodeError::Unsupported)?;
             let timestamp = sample.presentation_time as f32 / self.index.timescale as f32;
             match &mut self.decoder {
                 VpXDecoder::Vp8(decoder) => {
@@ -134,10 +217,14 @@ impl StreamingVideoDecoder for Mp4VpXStream {
             }
             self.next_sample += 1;
         }
-        let keep_from = self.index.samples.get(self.next_sample)
+        let keep_from = self
+            .index
+            .samples
+            .get(self.next_sample)
             .map(|sample| sample.offset)
             .unwrap_or(self.base_offset + self.bytes.len() as u64);
-        let discard = keep_from.saturating_sub(self.base_offset)
+        let discard = keep_from
+            .saturating_sub(self.base_offset)
             .min(self.bytes.len() as u64) as usize;
         self.bytes.drain(..discard);
         self.base_offset += discard as u64;
@@ -155,8 +242,13 @@ impl StreamingVideoDecoder for Mp4VpXStream {
     }
 
     fn finish(&self) -> Result<(), MediaDecodeError> {
-        if self.next_sample == self.index.samples.len() { Ok(()) }
-        else { Err(MediaDecodeError::InvalidData("truncated MP4 video stream".into())) }
+        if self.next_sample == self.index.samples.len() {
+            Ok(())
+        } else {
+            Err(MediaDecodeError::InvalidData(
+                "truncated MP4 video stream".into(),
+            ))
+        }
     }
 
     fn has_buffered_samples(&self) -> bool {
@@ -173,8 +265,8 @@ fn mp4_error(error: Mp4Error) -> MediaDecodeError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::mp4::Sample;
+    use super::*;
 
     #[test]
     fn routes_vp8_mp4_samples_through_shared_decoder() {
@@ -183,19 +275,29 @@ mod tests {
         let size = u32::from_le_bytes(ivf[32..36].try_into().unwrap()) as usize;
         let packet = &ivf[44..44 + size];
         let index = Mp4VideoIndex {
-            timescale: 1, duration_ticks: 1, codec: Mp4VideoCodec::Vp8,
-            width: 32, height: 32,
+            timescale: 1,
+            duration_ticks: 1,
+            codec: Mp4VideoCodec::Vp8,
+            width: 32,
+            height: 32,
             samples: vec![Sample {
-                offset: 0, size: size as u32, decode_time: 0,
-                presentation_time: 0, keyframe: true,
+                offset: 0,
+                size: size as u32,
+                decode_time: 0,
+                presentation_time: 0,
+                keyframe: true,
             }],
         };
+        let mut packets = Mp4VideoPackets::new(index.clone(), 0).unwrap();
+        assert!(packets.push(1, packet).is_err());
+        let packet_frames = packets.push(0, packet).unwrap();
         let mut stream = Mp4VpXStream::new(index);
         assert!(stream.push(&packet[..size / 2]).unwrap().is_empty());
         let frames = stream.push(&packet[size / 2..]).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].width, frames[0].height), (32, 32));
         assert_eq!(frames[0].rgba.len(), 32 * 32 * 4);
+        assert_eq!(packet_frames[0], frames[0]);
         stream.finish().unwrap();
     }
 
@@ -207,6 +309,19 @@ mod tests {
         let index = Mp4VideoIndex::parse_prefix(&bytes).unwrap();
         assert_eq!(index.codec, Mp4VideoCodec::Vp9);
         let expected = index.samples.len();
+        let mut packets = Mp4VideoPackets::new(index.clone(), 0).unwrap();
+        let mut packet_frames = Vec::new();
+        for (number, sample) in index.samples.iter().enumerate() {
+            packet_frames.extend(
+                packets
+                    .push(
+                        number,
+                        &bytes
+                            [sample.offset as usize..sample.offset as usize + sample.size as usize],
+                    )
+                    .unwrap(),
+            );
+        }
         let mut decoder = Mp4VideoDecoder::new();
         let mut frames = Vec::new();
         for chunk in bytes.chunks(4096) {
@@ -217,11 +332,19 @@ mod tests {
         }
         decoder.finish().unwrap();
         assert_eq!(frames.len(), expected);
+        assert_eq!(packet_frames, frames);
         assert_eq!(decoder.metadata().unwrap().width, Some(frames[0].width));
         assert_eq!(decoder.metadata().unwrap().height, Some(frames[0].height));
-        assert!(frames.windows(2).all(|pair| pair[0].timestamp <= pair[1].timestamp));
-        assert!(frames.iter().all(|frame| frame.rgba.len()
-            == frame.width as usize * frame.height as usize * 4));
+        assert!(
+            frames
+                .windows(2)
+                .all(|pair| pair[0].timestamp <= pair[1].timestamp)
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.rgba.len() == frame.width as usize * frame.height as usize * 4)
+        );
     }
 
     #[test]
@@ -235,7 +358,9 @@ mod tests {
 
     #[test]
     fn routes_avc_mp4_to_existing_decoder() {
-        let Ok(path) = std::env::var("WEBMEDIA_AVC_MP4_SAMPLE") else { return };
+        let Ok(path) = std::env::var("WEBMEDIA_AVC_MP4_SAMPLE") else {
+            return;
+        };
         let bytes = std::fs::read(path).unwrap();
         let index = Mp4VideoIndex::parse_prefix(&bytes).unwrap();
         assert!(matches!(index.codec, Mp4VideoCodec::Avc(_)));
@@ -246,7 +371,9 @@ mod tests {
             while decoder.has_buffered_samples() {
                 frames.extend(decoder.push(&[]).unwrap());
             }
-            if !frames.is_empty() { break; }
+            if !frames.is_empty() {
+                break;
+            }
         }
         assert!(!frames.is_empty());
         assert_eq!(decoder.metadata().unwrap().width, Some(frames[0].width));

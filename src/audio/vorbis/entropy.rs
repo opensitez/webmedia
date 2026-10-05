@@ -3,6 +3,93 @@
 use crate::video::backend::MediaDecodeError;
 use std::collections::BTreeSet;
 
+#[cfg(test)]
+pub(super) mod profile {
+    use std::{cell::RefCell, time::Instant};
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum Stage {
+        Spectrum,
+        Residue,
+        Transform,
+        Overlap,
+        Huffman,
+        Vector,
+    }
+
+    pub const STAGES: [Stage; 6] = [
+        Stage::Spectrum,
+        Stage::Residue,
+        Stage::Transform,
+        Stage::Overlap,
+        Stage::Huffman,
+        Stage::Vector,
+    ];
+    pub const BROAD: u8 = 0x0f;
+    pub const LEAVES: u8 = 0x30;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Sample {
+        pub calls: u64,
+        pub nanoseconds: u128,
+    }
+
+    #[derive(Default)]
+    struct State {
+        mask: u8,
+        samples: [Sample; 6],
+    }
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+
+    pub fn begin(mask: u8) {
+        STATE.with(|state| {
+            *state.borrow_mut() = State {
+                mask,
+                ..State::default()
+            }
+        });
+    }
+
+    pub fn finish() -> [Sample; 6] {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.mask = 0;
+            state.samples
+        })
+    }
+
+    pub struct Timer {
+        stage: Stage,
+        started: Instant,
+    }
+
+    impl Timer {
+        pub fn start(stage: Stage) -> Option<Self> {
+            STATE.with(|state| {
+                (state.borrow().mask & (1 << stage as u8) != 0).then(|| Self {
+                    stage,
+                    started: Instant::now(),
+                })
+            })
+        }
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            let elapsed = self.started.elapsed().as_nanos();
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                let sample = &mut state.samples[self.stage as usize];
+                sample.calls += 1;
+                sample.nanoseconds += elapsed;
+            });
+        }
+    }
+}
+
 fn invalid(message: &str) -> MediaDecodeError {
     MediaDecodeError::InvalidData(message.into())
 }
@@ -133,6 +220,8 @@ impl Huffman {
 
     /// A truncated audio packet propagates end-of-packet to the synthesis layer.
     pub fn decode(&self, bits: &mut PacketBits<'_>) -> Option<usize> {
+        #[cfg(test)]
+        let _timer = profile::Timer::start(profile::Stage::Huffman);
         if let Some(symbol) = self.single {
             bits.read(1)?;
             return Some(symbol);
@@ -290,6 +379,8 @@ impl Codebook {
     /// Materialize one vector into caller-owned storage rather than expanding
     /// the entire Cartesian lookup table during setup.
     pub fn vector(&self, entry: usize, output: &mut [f64]) -> Result<(), MediaDecodeError> {
+        #[cfg(test)]
+        let _timer = profile::Timer::start(profile::Stage::Vector);
         let lookup = self
             .lookup
             .as_ref()
@@ -322,6 +413,26 @@ impl Codebook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_masks_are_thread_local_and_count_only_selected_stages() {
+        profile::begin(profile::BROAD);
+        drop(profile::Timer::start(profile::Stage::Spectrum));
+        drop(profile::Timer::start(profile::Stage::Huffman));
+        std::thread::spawn(|| {
+            assert!(profile::Timer::start(profile::Stage::Spectrum).is_none());
+        })
+        .join()
+        .unwrap();
+        let samples = profile::finish();
+        assert_eq!(samples[profile::Stage::Spectrum as usize].calls, 1);
+        assert_eq!(samples[profile::Stage::Huffman as usize].calls, 0);
+        assert!(profile::Timer::start(profile::Stage::Spectrum).is_none());
+        profile::begin(profile::LEAVES);
+        drop(profile::Timer::start(profile::Stage::Vector));
+        let samples = profile::finish();
+        assert_eq!(samples[profile::Stage::Vector as usize].calls, 1);
+    }
 
     fn pack(fields: &[(u32, u8)]) -> Vec<u8> {
         let mut output = vec![

@@ -1,5 +1,42 @@
 //! Seven-bit fixed-point row convolution shared by VP8 and VP9.
 
+/// Copy an integer-pixel block with replication of the visible reference edges.
+#[inline]
+pub(super) fn copy_replicated_block(
+    destination: &mut [u8], destination_stride: usize, destination_start: usize,
+    reference: &[u8], reference_stride: usize, visible_width: usize, visible_height: usize,
+    source_x: i32, source_y: i32, width: usize, height: usize,
+) {
+    debug_assert!(visible_width > 0 && visible_height > 0);
+    debug_assert!(visible_width <= reference_stride);
+    debug_assert!(visible_height <= reference.len() / reference_stride);
+    debug_assert!(width > 0 && height > 0 && width <= 64 && height <= 64);
+    debug_assert!(destination_start % destination_stride + width <= destination_stride);
+    debug_assert!(destination_start + (height - 1) * destination_stride + width <= destination.len());
+    let left = (-i64::from(source_x)).max(0) as usize;
+    let left = left.min(width);
+    let from_x = i64::from(source_x).clamp(0, visible_width as i64) as usize;
+    let copied = (width - left).min(visible_width - from_x);
+    let mut previous_row = None;
+    for row in 0..height {
+        let source_row = (i64::from(source_y) + row as i64)
+            .clamp(0, visible_height as i64 - 1) as usize;
+        let to = destination_start + row * destination_stride;
+        if previous_row == Some(source_row) {
+            let previous = to - destination_stride;
+            destination.copy_within(previous..previous + width, to);
+        } else {
+            let from = source_row * reference_stride;
+            let source = &reference[from..from + visible_width];
+            let target = &mut destination[to..to + width];
+            target[..left].fill(source[0]);
+            target[left..left + copied].copy_from_slice(&source[from_x..from_x + copied]);
+            target[left + copied..].fill(source[visible_width - 1]);
+        }
+        previous_row = Some(source_row);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ConvolutionFilter<const N: usize> {
     pub(super) taps: [(usize, i32); N],
@@ -181,6 +218,36 @@ unsafe fn convolve_row_neon(source: &[u8], origin: usize, stride: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replicated_blocks_match_clamped_samples_and_preserve_guards() {
+        let reference: Vec<u8> = (0..40 * 36).map(|i| ((i * 73) ^ (i >> 3)) as u8).collect();
+        for (visible_width, visible_height) in [(1, 1), (17, 19), (37, 31)] {
+            for (width, height) in [(1, 1), (4, 8), (8, 4), (16, 16), (64, 64)] {
+                let stride = width + 7;
+                for source_x in [i32::MIN, -65, -1, 0, 1, 36, 65, i32::MAX] {
+                    for source_y in [i32::MIN, -65, -1, 0, 1, 30, 65, i32::MAX] {
+                        let mut expected = vec![91; stride * (height + 4)];
+                        let start = 2 * stride + 3;
+                        for row in 0..height {
+                            for col in 0..width {
+                                let sx = (i64::from(source_x) + col as i64)
+                                    .clamp(0, visible_width as i64 - 1) as usize;
+                                let sy = (i64::from(source_y) + row as i64)
+                                    .clamp(0, visible_height as i64 - 1) as usize;
+                                expected[start + row * stride + col] = reference[sy * 40 + sx];
+                            }
+                        }
+                        let mut actual = vec![91; expected.len()];
+                        copy_replicated_block(&mut actual, stride, start, &reference, 40,
+                            visible_width, visible_height, source_x, source_y, width, height);
+                        assert_eq!(actual, expected,
+                            "visible=({visible_width},{visible_height}) block=({width},{height}) origin=({source_x},{source_y})");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn centered_rows_match_wide_arithmetic_and_preserve_bounds() {

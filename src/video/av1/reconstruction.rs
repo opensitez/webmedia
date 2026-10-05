@@ -70,9 +70,23 @@ pub enum IntraMode {
     Paeth,
 }
 
-/// Predict an AV1 transform block using already reconstructed boundary samples.
-/// Missing boundaries are expanded per 7.11.2.1, not treated as zero samples.
-pub fn predict_intra(
+#[cfg(test)]
+thread_local! {
+    static LAZY_EDGES_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_lazy_edges_reference(reference: bool) {
+    LAZY_EDGES_REFERENCE.set(reference);
+}
+
+#[cfg(test)]
+pub(crate) fn lazy_edges_reference() -> bool {
+    LAZY_EDGES_REFERENCE.get()
+}
+
+#[inline(always)]
+pub(crate) fn validate_intra_inputs(
     mode: IntraMode,
     width: usize,
     height: usize,
@@ -80,9 +94,7 @@ pub fn predict_intra(
     above: Option<&[u16]>,
     left: Option<&[u16]>,
     top_left: Option<u16>,
-) -> Result<Vec<u16>, Error> {
-    #[cfg(test)]
-    let _measure = super::profile::measure(3);
+) -> Result<(), Error> {
     if ![8, 10, 12].contains(&bit_depth)
         || ![4, 8, 16, 32, 64].contains(&width)
         || ![4, 8, 16, 32, 64].contains(&height)
@@ -101,15 +113,52 @@ pub fn predict_intra(
     if mode == IntraMode::Paeth && above.is_some() && left.is_some() && top_left.is_none() {
         return Err(Error::Invalid("missing available corner"));
     }
+    Ok(())
+}
+
+/// Predict an AV1 transform block using already reconstructed boundary samples.
+/// Missing boundaries are expanded per 7.11.2.1, not treated as zero samples.
+pub fn predict_intra(
+    mode: IntraMode,
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    above: Option<&[u16]>,
+    left: Option<&[u16]>,
+    top_left: Option<u16>,
+) -> Result<Vec<u16>, Error> {
+    #[cfg(test)]
+    let _measure = super::profile::measure(3);
+    validate_intra_inputs(mode, width, height, bit_depth, above, left, top_left)?;
     let midpoint = 1u16 << (bit_depth - 1);
-    let top = above.map_or_else(
-        || vec![left.map_or(midpoint - 1, |l| l[0]); width],
-        |a| a[..width].to_vec(),
-    );
-    let side = left.map_or_else(
-        || vec![above.map_or(midpoint + 1, |a| a[0]); height],
-        |l| l[..height].to_vec(),
-    );
+    #[cfg(not(test))]
+    let reference = false;
+    #[cfg(test)]
+    let reference = lazy_edges_reference();
+    let top = (reference || matches!(mode, IntraMode::Vertical | IntraMode::Paeth)).then(|| {
+        above.map_or_else(
+            || std::borrow::Cow::Owned(vec![left.map_or(midpoint - 1, |l| l[0]); width]),
+            |a| {
+                if reference {
+                    std::borrow::Cow::Owned(a[..width].to_vec())
+                } else {
+                    std::borrow::Cow::Borrowed(&a[..width])
+                }
+            },
+        )
+    });
+    let side = (reference || matches!(mode, IntraMode::Horizontal | IntraMode::Paeth)).then(|| {
+        left.map_or_else(
+            || std::borrow::Cow::Owned(vec![above.map_or(midpoint + 1, |a| a[0]); height]),
+            |l| {
+                if reference {
+                    std::borrow::Cow::Owned(l[..height].to_vec())
+                } else {
+                    std::borrow::Cow::Borrowed(&l[..height])
+                }
+            },
+        )
+    });
     let corner = match (above, left) {
         (Some(_), Some(_)) => top_left.unwrap_or(midpoint),
         (Some(a), None) => a[0],
@@ -136,9 +185,11 @@ pub fn predict_intra(
         for x in 0..width {
             pixels[y * width + x] = match mode {
                 IntraMode::Dc => dc,
-                IntraMode::Vertical => top[x],
-                IntraMode::Horizontal => side[y],
+                IntraMode::Vertical => top.as_ref().unwrap()[x],
+                IntraMode::Horizontal => side.as_ref().unwrap()[y],
                 IntraMode::Paeth => {
+                    let top = top.as_ref().unwrap();
+                    let side = side.as_ref().unwrap();
                     let base = i32::from(top[x]) + i32::from(side[y]) - i32::from(corner);
                     let dl = (base - i32::from(side[y])).abs();
                     let dt = (base - i32::from(top[x])).abs();
@@ -260,6 +311,48 @@ pub fn inverse_dc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_edges_match_allocating_prediction_and_errors() {
+        for depth in [8, 10, 12] {
+            for (w, h) in super::super::coefficients::TX_DIMENSIONS {
+                for mode in [
+                    IntraMode::Dc,
+                    IntraMode::Vertical,
+                    IntraMode::Horizontal,
+                    IntraMode::Paeth,
+                ] {
+                    for trial in 0..12 {
+                        let mut above = vec![73; w + h];
+                        let mut left = vec![39; w + h];
+                        if trial == 8 {
+                            above[w + h - 1] = u16::MAX;
+                        }
+                        if trial == 9 {
+                            left[w + h - 1] = u16::MAX;
+                        }
+                        if trial == 10 {
+                            above.truncate(w - 1);
+                        }
+                        if trial == 11 {
+                            left.truncate(h - 1);
+                        }
+                        let a = (trial != 1 && trial != 3).then_some(above.as_slice());
+                        let l = (trial != 2 && trial != 3).then_some(left.as_slice());
+                        let corner = match trial {
+                            4 => None,
+                            5 => Some(u16::MAX),
+                            _ => Some(55),
+                        };
+                        set_lazy_edges_reference(true);
+                        let expected = predict_intra(mode, w, h, depth, a, l, corner);
+                        set_lazy_edges_reference(false);
+                        assert_eq!(predict_intra(mode, w, h, depth, a, l, corner), expected);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn cfl_averages_complete_transforms_before_visible_cropping() {
