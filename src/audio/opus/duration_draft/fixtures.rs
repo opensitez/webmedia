@@ -125,6 +125,7 @@ fn encoded_fullband_durations_match_unchanged_pcm_acceptance() {
             let mut decoded = Vec::new();
             let mut offset = 0;
             let mut first_error = None;
+            let mut first_entropy_failure = false;
             for (index, &size) in sizes.iter().enumerate() {
                 let packet_bytes = &bytes[offset..offset + size];
                 let packet = Packet::parse(packet_bytes).unwrap();
@@ -133,6 +134,27 @@ fn encoded_fullband_durations_match_unchanged_pcm_acceptance() {
                 assert_eq!(packet.frames.len(), 1);
                 match decoder.decode_packet(packet_bytes) {
                     Ok(pcm) => {
+                        if !first_entropy_failure {
+                            if let Some(trace) = decoder
+                                .band_trace
+                                .iter()
+                                .find(|trace| trace.errors_after > trace.errors_before)
+                            {
+                                eprintln!(
+                                    "FIRST ENTROPY ERROR duration={duration} channels={channels} packet={index} stage_positions={:?} band={} tf={} fine={} budget={} tell_before={} tell_after={} errors_before={} errors_after={}",
+                                    decoder.stage_positions,
+                                    trace.band,
+                                    trace.tf,
+                                    trace.fine_bits,
+                                    trace.budget,
+                                    trace.tell_before,
+                                    trace.tell_after,
+                                    trace.errors_before,
+                                    trace.errors_after
+                                );
+                                first_entropy_failure = true;
+                            }
+                        }
                         assert!(pcm.samples.iter().all(|v| v.is_finite()));
                         assert_eq!(
                             pcm.samples.len(),

@@ -587,6 +587,18 @@ impl ShapeReader<'_, '_> {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct BandTrace {
+    pub band: usize,
+    pub tf: i8,
+    pub fine_bits: u8,
+    pub budget: i32,
+    pub tell_before: u64,
+    pub tell_after: u64,
+    pub errors_before: u32,
+    pub errors_after: u32,
+}
+
 pub struct MusicPacketDecoder {
     channels: usize,
     history: Vec<f64>,
@@ -600,6 +612,8 @@ pub struct MusicPacketDecoder {
     uniform_errors: u32,
     shape: Vec<Vec<f64>>,
     norm: Vec<Vec<f64>>,
+    pub(super) stage_positions: Option<[u64; 5]>,
+    pub(super) band_trace: Vec<BandTrace>,
 }
 
 impl MusicPacketDecoder {
@@ -611,6 +625,8 @@ impl MusicPacketDecoder {
         self.synthesis.reset();
         self.failed = false;
         self.uniform_errors = 0;
+        self.stage_positions = None;
+        self.band_trace.clear();
         for channel in &mut self.shape {
             channel.fill(0.0);
         }
@@ -637,6 +653,8 @@ impl MusicPacketDecoder {
             uniform_errors: 0,
             shape: vec![vec![0.0; 800]; channels],
             norm: vec![vec![0.0; 800]; channels],
+            stage_positions: None,
+            band_trace: Vec::with_capacity(21),
         })
     }
 
@@ -645,6 +663,8 @@ impl MusicPacketDecoder {
             return Err(MediaDecodeError::Unsupported);
         }
         self.failed = true;
+        self.stage_positions = None;
+        self.band_trace.clear();
         let packet = Packet::parse(data)?;
         if !(28..=31).contains(&packet.configuration)
             || packet.frames.len() != 1
@@ -676,7 +696,8 @@ impl MusicPacketDecoder {
             )?
         } else {
             let mut frame = FrameStart::parse(&packet, 0)?;
-            let mut start = frame.start_shapes_draft(&self.history)?;
+            let (mut start, positions) = frame.start_shapes_draft(&self.history)?;
+            self.stage_positions = Some(positions);
             let blocks = layout.blocks(frame.transient)?;
             let norm = &mut self.norm;
             for channel in norm.iter_mut() {
@@ -693,6 +714,7 @@ impl MusicPacketDecoder {
                 let bins = layout.band(band)?;
                 let size = bins.len();
                 let tell = frame.entropy.tell_fractional() as i32;
+                let errors_before = frame.entropy.uniform_errors();
                 if band > 0 {
                     balance -= tell;
                 }
@@ -776,6 +798,16 @@ impl MusicPacketDecoder {
                     }
                 }
                 balance += start.allocation.shape_eighths[band] + tell;
+                self.band_trace.push(BandTrace {
+                    band,
+                    tf: start.tf.adjustments[band],
+                    fine_bits: start.allocation.fine_bits[band],
+                    budget,
+                    tell_before: tell as u64,
+                    tell_after: frame.entropy.tell_fractional(),
+                    errors_before,
+                    errors_after: frame.entropy.uniform_errors(),
+                });
                 update = budget > size as i32 * 8;
             }
             let anti = start.anti_collapse_reserved && frame.entropy.raw_bits(1)? != 0;
@@ -864,5 +896,100 @@ impl MusicPacketDecoder {
 
     pub fn uniform_errors(&self) -> u32 {
         self.uniform_errors
+    }
+}
+
+#[cfg(test)]
+mod stage_diagnostics {
+    use super::*;
+
+    fn two_coordinate_vector(index: u32, pulses: usize) -> [f64; 2] {
+        // RFC 6716 4.3.4.2 reduces to V(2,K)=4K, V(1,K)=2.
+        let half = 2 * pulses as u32 + 1;
+        let (local, sign) = if index < half {
+            (index, 1.0)
+        } else {
+            (index - half, -1.0)
+        };
+        let y = local.div_ceil(2) as f64;
+        let x = sign * (pulses as f64 - y);
+        let y = if local & 1 == 0 { -y } else { y };
+        let norm = (x * x + y * y).sqrt();
+        [x / norm, y / norm]
+    }
+
+    #[test]
+    fn two_bin_mono_pvq_matches_independent_coordinates_and_entropy() {
+        let menus = menus().unwrap();
+        let mut cases = 0;
+        for lm in 0..=3 {
+            for blocks in [1, 2] {
+                for (budget, pulses) in [(16, 1), (24, 2), (32, 4), (40, 8)] {
+                    for fill in 0..=254 {
+                        let bytes = [fill; 64];
+                        let mut entropy = RangeDecoder::new(&bytes);
+                        let mut expected_entropy = entropy.clone();
+                        let index = expected_entropy.uniform(4 * pulses as u32).unwrap();
+                        let expected = two_coordinate_vector(index, pulses);
+                        let mut seed = 0;
+                        let mut reader = ShapeReader {
+                            entropy: &mut entropy,
+                            menus: &menus,
+                            seed: &mut seed,
+                            remaining: 4000,
+                            spread: 0,
+                            band: 0,
+                            intensity: 21,
+                            lm,
+                        };
+                        let (actual, mask) =
+                            reader.vector(2, budget, blocks, lm, 1.0, None, 0).unwrap();
+                        assert_eq!(reader.remaining, 4000 - budget);
+                        assert_eq!(
+                            entropy.tell_fractional(),
+                            expected_entropy.tell_fractional()
+                        );
+                        for (value, expected) in actual.iter().zip(expected) {
+                            assert!(value.is_finite());
+                            assert!((value - expected).abs() < 1e-14);
+                        }
+                        assert_ne!(mask, 0);
+                        assert_eq!(entropy.uniform_errors(), 0);
+                        assert_eq!(
+                            entropy.raw_bits(5).unwrap(),
+                            expected_entropy.raw_bits(5).unwrap()
+                        );
+                        assert_eq!(entropy.bit(2).unwrap(), expected_entropy.bit(2).unwrap());
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 8160);
+    }
+
+    #[test]
+    fn two_bin_stereo_geometry_has_only_one_side_orientation_bit() {
+        // Per-channel normalization implies (L+R).(R-L)=|R|^2-|L|^2=0.
+        // In two dimensions the side direction is consequently one of the
+        // two perpendicular directions, not another independent PVQ vector.
+        // This explains RFC 6716 5.3.5's N>2 extra-degree condition; it does
+        // not establish the missing special-case bitstream ordering.
+        let mut cases = 0;
+        for left_index in 0..16 {
+            for right_index in 0..16 {
+                let left = two_coordinate_vector(left_index, 4);
+                let right = two_coordinate_vector(right_index, 4);
+                let mid = [left[0] + right[0], left[1] + right[1]];
+                let side = [right[0] - left[0], right[1] - left[1]];
+                assert!((mid[0] * side[0] + mid[1] * side[1]).abs() < 1e-14);
+                let determinant = mid[0] * side[1] - mid[1] * side[0];
+                let mid_energy = mid[0] * mid[0] + mid[1] * mid[1];
+                let side_energy = side[0] * side[0] + side[1] * side[1];
+                assert!((determinant * determinant - mid_energy * side_energy).abs() < 1e-13);
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 256);
     }
 }

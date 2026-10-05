@@ -178,6 +178,7 @@ fn decode_video_packet(
             let header = FrameHeader::parse(&packet.data)?;
             let decoded = decoder.decode(&packet.data)?;
             (header.show_frame.then(|| VideoFrame {
+                presentation_size: decoder.presentation_size(),
                 width: decoded.width as u32,
                 height: decoded.height as u32,
                 rgba: std::sync::Arc::new(decoded.rgba()),
@@ -189,6 +190,7 @@ fn decode_video_packet(
             let decoded = decoder.decode(coded[pending.next_frame])?;
             pending.next_frame += 1;
             (decoded.map(|decoded| VideoFrame {
+                presentation_size: None,
                 width: decoded.width as u32,
                 height: decoded.height as u32,
                 rgba: std::sync::Arc::new(decoded.rgba()),
@@ -229,7 +231,15 @@ impl StreamingVideoDecoder for WebmVideoDecoder {
     }
 
     fn metadata(&self) -> Option<MediaMetadata> {
-        self.stream.metadata()
+        let mut metadata = self.stream.metadata()?;
+        if let Some(CodecDecoder::Vp8(decoder)) = &self.codec {
+            metadata.presentation_size = decoder.presentation_size();
+            if let Some((width, height)) = decoder.coded_size() {
+                metadata.width = Some(width);
+                metadata.height = Some(height);
+            }
+        }
+        Some(metadata)
     }
 
     fn finish(&self) -> Result<(), MediaDecodeError> {
@@ -339,6 +349,7 @@ impl WebmStream {
             }
         });
         Some(MediaMetadata {
+            presentation_size: None,
             duration: self
                 .duration_ticks
                 .map(|ticks| (ticks * self.time_code_scale as f64 / 1e9) as f32),
@@ -853,6 +864,38 @@ mod tests {
     }
 
     #[test]
+    fn vp8_opus_startup_fixture_preserves_pixels_and_pcm_across_chunks() {
+        let bytes = include_bytes!("../../tests/fixtures/vp8-opus-startup.webm");
+        let expected = collect_media(bytes, bytes.len());
+        let mut pictures = 0;
+        let mut audio_frames = 0;
+        let mut audible = false;
+        for sample in &expected {
+            match sample {
+                MediaSample::Video(frame) => {
+                    assert_eq!((frame.width, frame.height), (32, 32));
+                    pictures += 1;
+                }
+                MediaSample::Audio { samples, .. } => {
+                    assert_eq!((samples.sample_rate, samples.channels), (48000, 2));
+                    assert!(!samples.samples.is_empty());
+                    assert_eq!(samples.samples.len() % 2, 0);
+                    assert!(samples.samples.iter().all(|value| value.is_finite()));
+                    audible |= samples.samples.iter().any(|value| value.abs() > 1e-6);
+                    audio_frames += samples.samples.len() / 2;
+                }
+                MediaSample::AudioError(error) => panic!("startup fixture audio failed: {error:?}"),
+            }
+        }
+        assert_eq!(pictures, 2);
+        assert!(audio_frames >= 9600);
+        assert!(audible, "the real encoded tone must not be replaced with silence");
+        for chunk in [1, 17, 257] {
+            assert_eq!(collect_media(bytes, chunk), expected, "input chunk size {chunk}");
+        }
+    }
+
+    #[test]
     fn media_delivery_preserves_vp9_superframes_and_reference_updates() {
         let bytes = include_bytes!("../../tests/fixtures/vp9-serial-static.webm");
         let mut decoder = WebmVideoDecoder::new();
@@ -1034,6 +1077,7 @@ mod tests {
                 for data in split_superframe(&packet.data).unwrap() {
                     if let Some(decoded) = direct.decode(data).unwrap() {
                         expected.push(VideoFrame {
+                            presentation_size: None,
                             width: decoded.width as u32,
                             height: decoded.height as u32,
                             rgba: std::sync::Arc::new(decoded.rgba()),

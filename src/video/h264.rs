@@ -1183,6 +1183,7 @@ pub(super) fn frame_from_yuv420(
     #[cfg(not(target_arch = "aarch64"))]
     let rgba = rgba_from_yuv420_scalar(sps, luma, cb, cr);
     super::VideoFrame {
+        presentation_size: None,
         width: sps.width,
         height: sps.height,
         rgba: std::sync::Arc::new(rgba),

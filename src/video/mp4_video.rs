@@ -175,7 +175,10 @@ impl StreamingVideoDecoder for Mp4VpXStream {
         }
         self.bytes.extend_from_slice(bytes);
         let mut frames = Vec::new();
-        while frames.len() < MAX_FRAMES_PER_PUSH && self.sample_available() {
+        let mut decoded_samples = 0;
+        while decoded_samples < MAX_FRAMES_PER_PUSH
+            && frames.len() < MAX_FRAMES_PER_PUSH && self.sample_available()
+        {
             let sample = &self.index.samples[self.next_sample];
             let start = usize::try_from(
                 sample
@@ -194,18 +197,23 @@ impl StreamingVideoDecoder for Mp4VpXStream {
             let timestamp = sample.presentation_time as f32 / self.index.timescale as f32;
             match &mut self.decoder {
                 VpXDecoder::Vp8(decoder) => {
+                    let show_frame = super::vp8::FrameHeader::parse(data)?.show_frame;
                     let frame = decoder.decode(data)?;
-                    frames.push(VideoFrame {
-                        width: frame.width as u32,
-                        height: frame.height as u32,
-                        rgba: Arc::new(frame.rgba()),
-                        timestamp,
-                    });
+                    if show_frame {
+                        frames.push(VideoFrame {
+                            presentation_size: decoder.presentation_size(),
+                            width: frame.width as u32,
+                            height: frame.height as u32,
+                            rgba: Arc::new(frame.rgba()),
+                            timestamp,
+                        });
+                    }
                 }
                 VpXDecoder::Vp9(decoder) => {
                     for frame_data in split_superframe(data)? {
                         if let Some(frame) = decoder.decode(frame_data)? {
                             frames.push(VideoFrame {
+                                presentation_size: None,
                                 width: frame.width as u32,
                                 height: frame.height as u32,
                                 rgba: Arc::new(frame.rgba()),
@@ -216,6 +224,7 @@ impl StreamingVideoDecoder for Mp4VpXStream {
                 }
             }
             self.next_sample += 1;
+            decoded_samples += 1;
         }
         let keep_from = self
             .index
@@ -232,10 +241,18 @@ impl StreamingVideoDecoder for Mp4VpXStream {
     }
 
     fn metadata(&self) -> Option<MediaMetadata> {
+        let (width, height) = match &self.decoder {
+            VpXDecoder::Vp8(decoder) => decoder.coded_size(),
+            VpXDecoder::Vp9(_) => None,
+        }.unwrap_or((self.index.width, self.index.height));
         Some(MediaMetadata {
+            presentation_size: match &self.decoder {
+                VpXDecoder::Vp8(decoder) => decoder.presentation_size(),
+                VpXDecoder::Vp9(_) => None,
+            },
             duration: Some(self.index.duration_ticks as f32 / self.index.timescale as f32),
-            width: Some(self.index.width),
-            height: Some(self.index.height),
+            width: Some(width),
+            height: Some(height),
             sample_rate: None,
             channels: None,
         })
@@ -268,6 +285,130 @@ mod tests {
     use super::super::mp4::Sample;
     use super::*;
 
+    fn vp8_test_container(index: &Mp4VideoIndex, payload: &[u8], trailing_moov: bool) -> Vec<u8> {
+        fn atom(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut bytes = ((data.len() + 8) as u32).to_be_bytes().to_vec();
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(data);
+            bytes
+        }
+        fn table(entries: &[u32], fields: usize) -> Vec<u8> {
+            let mut bytes = vec![0; 4];
+            bytes.extend(((entries.len() / fields) as u32).to_be_bytes());
+            for entry in entries { bytes.extend(entry.to_be_bytes()); }
+            bytes
+        }
+        let mut entry = vec![0; 78];
+        entry[6..8].copy_from_slice(&1u16.to_be_bytes());
+        entry[24..26].copy_from_slice(&(index.width as u16).to_be_bytes());
+        entry[26..28].copy_from_slice(&(index.height as u16).to_be_bytes());
+        let mut descriptions = table(&[], 1);
+        descriptions[4..8].copy_from_slice(&1u32.to_be_bytes());
+        descriptions.extend(atom(b"vp08", &entry));
+        let mut sizes = vec![0; 8];
+        sizes.extend((index.samples.len() as u32).to_be_bytes());
+        for sample in &index.samples { sizes.extend(sample.size.to_be_bytes()); }
+        let sync: Vec<_> = index.samples.iter().enumerate()
+            .filter(|(_, sample)| sample.keyframe).map(|(n, _)| n as u32 + 1).collect();
+        let make_moov = |offset| {
+            let mut sample_table = Vec::new();
+            for (kind, data) in [
+                (b"stsd", descriptions.clone()), (b"stsz", sizes.clone()),
+                (b"stsc", table(&[1, index.samples.len() as u32, 1], 3)),
+                (b"stts", table(&[index.samples.len() as u32, 1], 2)),
+                (b"stss", table(&sync, 1)), (b"stco", table(&[offset], 1)),
+            ] { sample_table.extend(atom(kind, &data)); }
+            let mut header = vec![0; 12];
+            header.extend(index.timescale.to_be_bytes());
+            header.extend((index.duration_ticks as u32).to_be_bytes());
+            let mut handler = vec![0; 8];
+            handler.extend(b"vide");
+            let mut media = atom(b"mdhd", &header);
+            media.extend(atom(b"hdlr", &handler));
+            media.extend(atom(b"minf", &atom(b"stbl", &sample_table)));
+            atom(b"moov", &atom(b"trak", &atom(b"mdia", &media)))
+        };
+        let mut bytes = atom(b"ftyp", b"isom\0\0\0\0isom");
+        let offset = bytes.len() + 8 + if trailing_moov { 0 } else { make_moov(0).len() };
+        let moov = make_moov(offset as u32);
+        if !trailing_moov { bytes.extend_from_slice(&moov); }
+        bytes.extend(atom(b"mdat", payload));
+        if trailing_moov { bytes.extend(moov); }
+        bytes
+    }
+
+    #[test]
+    fn vp8_presentation_dimensions_propagate_through_webm_and_mp4() {
+        use super::super::vp8::FrameHeader;
+        use super::super::webm::{WebmVp8Stream, WebmVideoDecoder};
+        let mut bytes = include_bytes!("../../tests/fixtures/vp8-motion.webm").to_vec();
+        let mut demux = WebmVp8Stream::new();
+        let packets = demux.push(&bytes).unwrap();
+        for packet in &packets {
+            if FrameHeader::parse(&packet.data).unwrap().key_frame {
+                let offset = bytes.windows(packet.data.len()).position(|window| window == packet.data).unwrap();
+                bytes[offset + 7] = (bytes[offset + 7] & 0x3f) | (1 << 6);
+                bytes[offset + 9] = (bytes[offset + 9] & 0x3f) | (3 << 6);
+            }
+        }
+        let mut demux = WebmVp8Stream::new();
+        let packets = demux.push(&bytes).unwrap();
+        let header = FrameHeader::parse(&packets[0].data).unwrap();
+        let presentation = header.display_size();
+        let mut payload = Vec::new();
+        let mut samples = Vec::new();
+        for (number, packet) in packets.iter().enumerate() {
+            samples.push(Sample {
+                offset: payload.len() as u64, size: packet.data.len() as u32,
+                decode_time: number as u64, presentation_time: number as i64,
+                keyframe: FrameHeader::parse(&packet.data).unwrap().key_frame,
+            });
+            payload.extend_from_slice(&packet.data);
+        }
+        let index = Mp4VideoIndex {
+            timescale: 30, duration_ticks: samples.len() as u64, codec: Mp4VideoCodec::Vp8,
+            width: header.width.unwrap() as u32, height: header.height.unwrap() as u32, samples,
+        };
+        let mp4 = vp8_test_container(&index, &payload, false);
+        let mut decoders: Vec<(Box<dyn StreamingVideoDecoder>, &[u8])> = vec![
+            (Box::new(WebmVideoDecoder::new()), &bytes),
+            (Box::new(Mp4VideoDecoder::new()), &mp4),
+        ];
+        for (decoder, input) in &mut decoders {
+            let mut count = 0;
+            for chunk in input.chunks(4096) {
+                let mut frames = decoder.push(chunk).unwrap();
+                while decoder.has_buffered_samples() { frames.extend(decoder.push(&[]).unwrap()); }
+                for frame in frames {
+                    count += 1;
+                    assert_eq!(frame.presentation_size, presentation);
+                    assert_eq!((frame.width, frame.height), (index.width, index.height));
+                    assert_eq!(frame.rgba.len(), index.width as usize * index.height as usize * 4);
+                }
+            }
+            decoder.finish().unwrap();
+            assert_eq!(count, 60);
+            assert_eq!(decoder.metadata().unwrap().presentation_size, presentation);
+        }
+        use super::super::backend::{MediaSample, StreamingMediaDecoder};
+        let mut media = super::super::webm::WebmMediaDecoder::new();
+        let mut count = 0;
+        for chunk in bytes.chunks(4096) {
+            let mut samples = media.push_media(chunk).unwrap();
+            while media.has_buffered_samples() { samples.extend(media.push_media(&[]).unwrap()); }
+            for sample in samples {
+                if let MediaSample::Video(frame) = sample {
+                    count += 1;
+                    assert_eq!(frame.presentation_size, presentation);
+                    assert_eq!((frame.width, frame.height), (index.width, index.height));
+                }
+            }
+        }
+        media.finish().unwrap();
+        assert_eq!(count, 60);
+        assert_eq!(media.metadata().unwrap().presentation_size, presentation);
+    }
+
     #[test]
     fn routes_vp8_mp4_samples_through_shared_decoder() {
         let ivf = include_bytes!("../../tests/fixtures/vp8-keyframe.ivf");
@@ -299,6 +440,99 @@ mod tests {
         assert_eq!(frames[0].rgba.len(), 32 * 32 * 4);
         assert_eq!(packet_frames[0], frames[0]);
         stream.finish().unwrap();
+    }
+
+    #[test]
+    fn vp8_mp4_hidden_samples_update_references_without_presenting() {
+        use super::super::vp8::FrameHeader;
+        use super::super::webm::WebmVp8Stream;
+        let mut demux = WebmVp8Stream::new();
+        let input = demux.push(include_bytes!("../../tests/fixtures/vp8-altref.webm")).unwrap();
+        demux.finish().unwrap();
+        let mut bytes = Vec::new();
+        let mut samples = Vec::new();
+        let mut expected = Vec::new();
+        let mut reference = Vp8Decoder::new();
+        let mut hidden = 0;
+        for (number, packet) in input.iter().enumerate() {
+            let header = FrameHeader::parse(&packet.data).unwrap();
+            samples.push(Sample {
+                offset: bytes.len() as u64,
+                size: packet.data.len() as u32,
+                decode_time: number as u64,
+                presentation_time: number as i64,
+                keyframe: header.key_frame,
+            });
+            bytes.extend_from_slice(&packet.data);
+            let frame = reference.decode(&packet.data).unwrap();
+            if header.show_frame {
+                expected.push(VideoFrame {
+                    presentation_size: None,
+                    width: frame.width as u32, height: frame.height as u32,
+                    rgba: Arc::new(frame.rgba()), timestamp: number as f32 / 30.0,
+                });
+            } else {
+                hidden += 1;
+            }
+        }
+        assert_eq!(hidden, 6);
+        assert_eq!(expected.len(), 120);
+        let index = Mp4VideoIndex {
+            timescale: 30, duration_ticks: samples.len() as u64,
+            codec: Mp4VideoCodec::Vp8,
+            width: expected[0].width, height: expected[0].height, samples,
+        };
+        let mut packets = Mp4VideoPackets::new(index.clone(), 0).unwrap();
+        let mut actual = Vec::new();
+        for (number, packet) in input.iter().enumerate() {
+            let frames = packets.push(number, &packet.data).unwrap();
+            if !FrameHeader::parse(&packet.data).unwrap().show_frame {
+                assert!(frames.is_empty(), "hidden sample {number} was presented");
+            }
+            actual.extend(frames);
+        }
+        assert_eq!(actual, expected);
+        for chunk_size in [1, 4096, bytes.len()] {
+            let mut stream = Mp4VpXStream::new(index.clone());
+            let mut actual = Vec::new();
+            for chunk in bytes.chunks(chunk_size) {
+                let before = stream.next_sample;
+                actual.extend(stream.push(chunk).unwrap());
+                assert!(stream.next_sample - before <= MAX_FRAMES_PER_PUSH);
+                while stream.has_buffered_samples() {
+                    let before = stream.next_sample;
+                    actual.extend(stream.push(&[]).unwrap());
+                    assert!(stream.next_sample - before <= MAX_FRAMES_PER_PUSH);
+                }
+            }
+            stream.finish().unwrap();
+            assert_eq!(actual, expected, "chunk size {chunk_size}");
+        }
+        for trailing_moov in [false, true] {
+            let container = vp8_test_container(&index, &bytes, trailing_moov);
+            let parsed = Mp4VideoIndex::parse_prefix(&container).unwrap();
+            assert_eq!(parsed.codec, Mp4VideoCodec::Vp8);
+            assert_eq!(parsed.samples.len(), input.len());
+            for (sample, packet) in parsed.samples.iter().zip(&input) {
+                assert_eq!(&container[sample.offset as usize..sample.offset as usize + sample.size as usize],
+                    packet.data.as_slice());
+            }
+            for chunk_size in [1, 4096, container.len()] {
+                let mut decoder = Mp4VideoDecoder::new();
+                let mut actual = Vec::new();
+                for chunk in container.chunks(chunk_size) {
+                    actual.extend(decoder.push(chunk).unwrap());
+                    while decoder.has_buffered_samples() {
+                        actual.extend(decoder.push(&[]).unwrap());
+                    }
+                }
+                decoder.finish().unwrap();
+                assert_eq!(actual, expected, "trailing moov={trailing_moov} chunk size={chunk_size}");
+                let metadata = decoder.metadata().unwrap();
+                assert_eq!(metadata.width, Some(index.width));
+                assert_eq!(metadata.height, Some(index.height));
+            }
+        }
     }
 
     #[test]

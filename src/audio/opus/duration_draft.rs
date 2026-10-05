@@ -447,3 +447,47 @@ fn draft_two_bin_stereo_allocation_uses_four_not_five_degrees() {
     }
     assert!(covered > 100, "coupled N=2 allocation must be exercised");
 }
+
+#[test]
+fn draft_stage_positions_are_bounded_and_monotonic_for_both_channels() {
+    let mut accepted = 0;
+    for configuration in 29..=31 {
+        for channels in 1..=2 {
+            let header = fixtures::header(channels, 0);
+            for first in [0, 37, 150, 254] {
+                let mut packet = [150; 129];
+                packet[0] = (configuration << 3) | (u8::from(channels == 2) << 2);
+                packet[1] = first;
+                let mut decoder = music::MusicPacketDecoder::new(&header).unwrap();
+                if let Ok(pcm) = decoder.decode_packet(&packet) {
+                    assert!(pcm.samples.iter().all(|v| v.is_finite()));
+                    let positions = decoder.stage_positions.unwrap();
+                    assert!(positions.windows(2).all(|p| p[0] <= p[1]));
+                    assert!(positions.iter().all(|&p| p <= 128 * 64));
+                    assert_eq!(decoder.band_trace.len(), 21);
+                    for (band, trace) in decoder.band_trace.iter().enumerate() {
+                        assert_eq!(trace.band, band);
+                        assert!((-3..=3).contains(&trace.tf));
+                        assert!(trace.fine_bits <= 8);
+                        assert!(trace.budget >= 0);
+                        assert!(trace.tell_before <= trace.tell_after);
+                        assert!(trace.tell_after <= 128 * 64);
+                        assert!(trace.errors_before <= trace.errors_after);
+                    }
+                    assert_eq!(
+                        decoder.band_trace.last().unwrap().errors_after,
+                        decoder.uniform_errors()
+                    );
+                    decoder.reset();
+                    assert!(decoder.stage_positions.is_none());
+                    assert!(decoder.band_trace.is_empty());
+                    accepted += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        accepted >= 12,
+        "both channel paths need observable stage coverage"
+    );
+}

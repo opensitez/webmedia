@@ -198,6 +198,7 @@ impl Av1PacketDecoder {
                     }
                     return Ok((
                         Some(VideoFrame {
+                            presentation_size: None,
                             width: width as u32,
                             height: height as u32,
                             rgba: Arc::new(yuv.rgba_with_matrix(if sequence.matrix_coefficients == 1 {

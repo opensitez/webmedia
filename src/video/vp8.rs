@@ -4,6 +4,36 @@ use super::backend::MediaDecodeError;
 use super::vp8_coeff::CoeffProbs;
 use super::vp8_probs::KEYFRAME_BMODE_PROBS;
 
+/// Presentation-only upscaling from RFC 6386 section 9.1.
+/// Reference pictures always retain their coded dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayScale {
+    Unscaled,
+    FiveFourths,
+    FiveThirds,
+    Double,
+}
+
+impl DisplayScale {
+    fn from_bits(bits: u16) -> Self {
+        match bits {
+            0 => Self::Unscaled,
+            1 => Self::FiveFourths,
+            2 => Self::FiveThirds,
+            _ => Self::Double,
+        }
+    }
+
+    pub const fn ratio(self) -> (u32, u32) {
+        match self {
+            Self::Unscaled => (1, 1),
+            Self::FiveFourths => (5, 4),
+            Self::FiveThirds => (5, 3),
+            Self::Double => (2, 1),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
     pub key_frame: bool,
@@ -12,6 +42,8 @@ pub struct FrameHeader {
     pub first_partition_size: usize,
     pub width: Option<u16>,
     pub height: Option<u16>,
+    pub horizontal_scale: Option<DisplayScale>,
+    pub vertical_scale: Option<DisplayScale>,
 }
 
 impl FrameHeader {
@@ -35,22 +67,25 @@ impl FrameHeader {
                 "VP8 first partition exceeds frame".into(),
             ));
         }
-        let (width, height) = if key_frame {
+        let (width, height, horizontal_scale, vertical_scale) = if key_frame {
             if data[3..6] != [0x9d, 0x01, 0x2a] {
                 return Err(MediaDecodeError::InvalidData(
                     "invalid VP8 keyframe marker".into(),
                 ));
             }
-            let width = u16::from_le_bytes([data[6], data[7]]) & 0x3fff;
-            let height = u16::from_le_bytes([data[8], data[9]]) & 0x3fff;
+            let raw_width = u16::from_le_bytes([data[6], data[7]]);
+            let raw_height = u16::from_le_bytes([data[8], data[9]]);
+            let width = raw_width & 0x3fff;
+            let height = raw_height & 0x3fff;
             if width == 0 || height == 0 {
                 return Err(MediaDecodeError::InvalidData(
                     "zero-sized VP8 keyframe".into(),
                 ));
             }
-            (Some(width), Some(height))
+            (Some(width), Some(height), Some(DisplayScale::from_bits(raw_width >> 14)),
+                Some(DisplayScale::from_bits(raw_height >> 14)))
         } else {
-            (None, None)
+            (None, None, None, None)
         };
         Ok(Self {
             key_frame,
@@ -59,7 +94,18 @@ impl FrameHeader {
             first_partition_size,
             width,
             height,
+            horizontal_scale,
+            vertical_scale,
         })
+    }
+
+    /// Unrounded display extent; scale ratios remain available separately.
+    /// Interframes inherit their last keyframe's display extent.
+    pub fn display_size(&self) -> Option<(f64, f64)> {
+        let (xn, xd) = self.horizontal_scale?.ratio();
+        let (yn, yd) = self.vertical_scale?.ratio();
+        Some((f64::from(self.width?) * f64::from(xn) / f64::from(xd),
+            f64::from(self.height?) * f64::from(yn) / f64::from(yd)))
     }
 
     pub fn control_partition<'a>(&self, frame: &'a [u8]) -> &'a [u8] {
@@ -117,7 +163,7 @@ pub struct KeyMacroblockMode {
 impl<'a> KeyFrameLayout<'a> {
     pub fn parse(frame: &'a [u8]) -> Result<Self, MediaDecodeError> {
         let header = FrameHeader::parse(frame)?;
-        if !header.key_frame {
+        if !header.key_frame || header.version > 3 {
             return Err(MediaDecodeError::Unsupported);
         }
         let mut control = BoolDecoder::new(header.control_partition(frame))?;
@@ -537,9 +583,24 @@ mod tests {
                 let mut scaled = frame;
                 scaled[7] |= horizontal << 6;
                 scaled[9] |= vertical << 6;
-                assert_eq!(FrameHeader::parse(&scaled).unwrap(), expected);
+                let actual = FrameHeader::parse(&scaled).unwrap();
+                assert_eq!((actual.width, actual.height), (expected.width, expected.height));
+                let scales = [DisplayScale::Unscaled, DisplayScale::FiveFourths,
+                    DisplayScale::FiveThirds, DisplayScale::Double];
+                assert_eq!(actual.horizontal_scale, Some(scales[horizontal as usize]));
+                assert_eq!(actual.vertical_scale, Some(scales[vertical as usize]));
+                let (xn, xd) = scales[horizontal as usize].ratio();
+                let (yn, yd) = scales[vertical as usize].ratio();
+                assert_eq!(actual.display_size(), Some((640.0 * xn as f64 / xd as f64,
+                    360.0 * yn as f64 / yd as f64)));
+                assert_eq!(FrameHeader { horizontal_scale: expected.horizontal_scale,
+                    vertical_scale: expected.vertical_scale, ..actual }, expected);
             }
         }
+        let inter = FrameHeader::parse(&[0x11, 0, 0]).unwrap();
+        assert_eq!(inter.horizontal_scale, None);
+        assert_eq!(inter.vertical_scale, None);
+        assert_eq!(inter.display_size(), None);
     }
 
     #[test]

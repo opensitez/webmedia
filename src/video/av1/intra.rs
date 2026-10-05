@@ -30,6 +30,7 @@ mod tests {
 
     #[test]
     fn eob_dequant_matches_full_signed_math_and_64_padding() {
+        assert!(!EOB_DEQUANT_REFERENCE.get(), "test default must match production");
         let values = [0, 1, -1, 1024, -1024, 0xfffff, -0xfffff,
             1 << 24, -(1 << 24), i32::MIN, i32::MAX];
         for (tx, (w, h)) in super::super::coefficients::TX_DIMENSIONS.into_iter().enumerate() {
@@ -64,6 +65,10 @@ mod tests {
                 }
             }
         }
+        set_eob_dequant_reference(true);
+        assert!(EOB_DEQUANT_REFERENCE.get());
+        set_eob_dequant_reference(false);
+        assert!(!EOB_DEQUANT_REFERENCE.get());
     }
 
     fn filter_intra_fixed_edges(
@@ -499,12 +504,13 @@ thread_local! {
     static DISCARDED_INTRA_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SKIP_GENERIC_PREDICTION_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REUSE_COEFFICIENTS_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static EOB_DEQUANT_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EOB_DEQUANT_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
-pub(crate) fn set_eob_dequant_candidate(enabled: bool) {
-    EOB_DEQUANT_CANDIDATE.set(enabled);
+// False matches production; true selects the retained full allocating-path reference.
+pub(crate) fn set_eob_dequant_reference(reference: bool) {
+    EOB_DEQUANT_REFERENCE.set(reference);
 }
 
 #[inline(always)]
@@ -515,17 +521,18 @@ fn dequantized_value(coefficient: i32, quant: u16, denom: i64, bound: i64) -> i3
 }
 
 #[inline(always)]
+#[cfg(test)]
 fn dequantize_full(coefficients: &mut [i32], dc: u16, ac: u16, denom: i64, bound: i64) {
     for (i, coefficient) in coefficients.iter_mut().enumerate() {
         *coefficient = dequantized_value(*coefficient, if i == 0 { dc } else { ac }, denom, bound);
     }
 }
 
-#[cfg(test)]
 fn dequantize_eob(
     coefficients: &mut [i32], w: usize, scan_prefix: &[u16],
     dc: u16, ac: u16, denom: i64, bound: i64,
 ) {
+    // Entropy positions use <=32 columns; wide transforms retain their padded row stride.
     for &position in scan_prefix {
         let position = usize::from(position);
         let index = if w <= 32 { position } else { (position >> 5) * w + (position & 31) };
@@ -2013,16 +2020,16 @@ impl<'a> IntraTile<'a> {
                         };
                         let bound = 1i64 << (7 + self.s.bit_depth);
                         #[cfg(test)]
-                        let bounded = EOB_DEQUANT_CANDIDATE.get();
+                        let reference = EOB_DEQUANT_REFERENCE.get();
                         #[cfg(not(test))]
-                        let bounded = false;
+                        let reference = false;
                         #[cfg(test)]
-                        if bounded {
+                        if reference {
+                            dequantize_full(&mut coefficients, dc_quant, ac_quant, denom, bound);
+                        }
+                        if !reference {
                             dequantize_eob(&mut coefficients, ptw, decoded.scan_prefix,
                                 dc_quant, ac_quant, denom, bound);
-                        }
-                        if !bounded {
-                            dequantize_full(&mut coefficients, dc_quant, ac_quant, denom, bound);
                         }
                         #[cfg(test)]
                         if INTER_SCRATCH_REFERENCE.with(|flag| flag.get()) {

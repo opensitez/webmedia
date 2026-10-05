@@ -79,7 +79,7 @@ pub(crate) struct CoefficientState {
 pub(crate) struct DecodedCoefficients {
     pub values: Vec<i32>,
     pub tx_type: usize,
-    #[cfg(test)]
+    /// EOB positions in the min(width, 32) layout; all positions outside are zero.
     pub scan_prefix: &'static [u16],
 }
 
@@ -340,7 +340,6 @@ impl CoefficientState {
                 values: zeroed_coefficients::<REUSE>(
                     if w <= 32 && h <= 32 { quant_storage } else { output_storage }, w * h),
                 tx_type: 0,
-                #[cfg(test)]
                 scan_prefix: &[],
             });
         }
@@ -413,7 +412,6 @@ impl CoefficientState {
         let aw = w.min(32);
         let ah = h.min(32);
         let scan = coefficient_scan(class, aw, ah)?;
-        #[cfg(test)]
         let active_scan = scan;
         #[cfg(test)]
         let reference_scan = ALLOCATION_REFERENCE.get().then(|| scan.to_vec());
@@ -546,7 +544,6 @@ impl CoefficientState {
             return Ok(DecodedCoefficients {
                 values: quant,
                 tx_type,
-                #[cfg(test)]
                 scan_prefix: &active_scan[..eob],
             });
         }
@@ -560,7 +557,6 @@ impl CoefficientState {
         Ok(DecodedCoefficients {
             values: output,
             tx_type,
-            #[cfg(test)]
             scan_prefix: &active_scan[..eob],
         })
     }

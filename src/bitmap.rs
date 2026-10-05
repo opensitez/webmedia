@@ -1,5 +1,7 @@
 //! Decode PNG, JPEG, GIF, WebP, and BMP images into premultiplied RGBA8.
 
+pub mod jpeg_xl;
+
 /// A decoded raster image. Pixels are premultiplied RGBA8, row-major.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RasterImage {
@@ -12,6 +14,11 @@ pub struct RasterImage {
 /// SVG is a document format and is not decoded here.
 #[inline]
 pub fn decode_raster(bytes: &[u8]) -> Result<RasterImage, image::ImageError> {
+    if jpeg_xl::is_jpeg_xl(bytes) {
+        return jpeg_xl::decode_stream(bytes, |_, _| {}, |_| {}).map_err(|error| {
+            image::ImageError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        });
+    }
     let image = image::load_from_memory(bytes)?;
     let has_alpha = image.color().has_alpha();
     let rgba = image.into_rgba8();

@@ -12,6 +12,7 @@ use super::vp8_residue::{ResidualMacroblock, ResidueDecoder};
 use std::sync::Arc;
 
 pub(super) struct Vp8Decoder {
+    presentation_size: Option<(f64, f64)>,
     state: Option<InterState>,
     last: Option<Arc<YuvKeyFrame>>,
     golden: Option<Arc<YuvKeyFrame>>,
@@ -64,12 +65,21 @@ fn add_prefilled_residuals(frame: &mut YuvKeyFrame, mb_x: usize, mb_y: usize,
 impl Vp8Decoder {
     pub(super) fn new() -> Self {
         Self {
+            presentation_size: None,
             state: None,
             last: None,
             golden: None,
             alternate: None,
             retired: Vec::new(),
         }
+    }
+
+    pub(super) fn presentation_size(&self) -> Option<(f64, f64)> {
+        self.presentation_size
+    }
+
+    pub(super) fn coded_size(&self) -> Option<(u32, u32)> {
+        self.last.as_ref().map(|frame| (frame.width as u32, frame.height as u32))
     }
 
     pub(super) fn decode(&mut self, packet: &[u8]) -> Result<Arc<YuvKeyFrame>, MediaDecodeError> {
@@ -81,6 +91,8 @@ impl Vp8Decoder {
         if header.version > 3 { return Err(MediaDecodeError::Unsupported); }
         if header.key_frame {
             let (frame, state) = decode_keyframe_with_state(packet)?;
+            self.presentation_size = header.display_size()
+                .filter(|&(width, height)| width != frame.width as f64 || height != frame.height as f64);
             self.retired.clear();
             self.state = Some(state);
             let reference = Arc::new(frame);
@@ -874,6 +886,42 @@ mod tests {
     }
 
     #[test]
+    fn display_scale_hints_preserve_keyframe_and_interframe_reconstruction() {
+        let mut stream = WebmVp8Stream::new();
+        let packets = stream.push(include_bytes!("../../tests/fixtures/vp8-motion.webm")).unwrap();
+        let mut baseline = Vp8Decoder::new();
+        let expected: Vec<_> = packets.iter().take(3)
+            .map(|packet| baseline.decode(&packet.data).unwrap()).collect();
+        for horizontal in 0..4u8 {
+            for vertical in 0..4u8 {
+                let mut keyframe = packets[0].data.clone();
+                keyframe[7] = (keyframe[7] & 0x3f) | (horizontal << 6);
+                keyframe[9] = (keyframe[9] & 0x3f) | (vertical << 6);
+                let presentation = FrameHeader::parse(&keyframe).unwrap().display_size()
+                    .filter(|&size| size != (expected[0].width as f64, expected[0].height as f64));
+                let mut decoder = Vp8Decoder::new();
+                for index in 0..3 {
+                    let packet = if index == 0 { keyframe.as_slice() }
+                        else { packets[index].data.as_slice() };
+                    let actual = decoder.decode(packet).unwrap();
+                    assert_eq!(decoder.presentation_size(), presentation);
+                    let reference = &expected[index];
+                    assert_eq!((actual.width, actual.height), (reference.width, reference.height));
+                    assert_eq!(actual.y.pixels, reference.y.pixels,
+                        "horizontal={horizontal} vertical={vertical} packet={index}");
+                    assert_eq!(actual.u.pixels, reference.u.pixels);
+                    assert_eq!(actual.v.pixels, reference.v.pixels);
+                }
+                assert_eq!(decoder.state, baseline.state);
+                assert!(decoder.decode(&keyframe[..10]).is_err());
+                assert_eq!(decoder.presentation_size(), presentation);
+                decoder.decode(&packets[0].data).unwrap();
+                assert_eq!(decoder.presentation_size(), None);
+            }
+        }
+    }
+
+    #[test]
     fn malformed_keyframe_preserves_committed_state_and_references() {
         let mut stream = WebmVp8Stream::new();
         let packets = stream.push(include_bytes!("../../tests/fixtures/vp8-motion.webm")).unwrap();
@@ -884,6 +932,7 @@ mod tests {
         invalid[..3].copy_from_slice(&[0x10, 0, 0]);
         invalid[6..10].copy_from_slice(&[0xff, 0x3f, 0xff, 0x3f]);
         let mut decoder = Vp8Decoder {
+            presentation_size: None,
             state: initial.state.clone(), last: initial.last.clone(),
             golden: initial.golden.clone(), alternate: initial.alternate.clone(),
             retired: Vec::new(),
@@ -950,6 +999,7 @@ mod tests {
         initial.decode(&packets[0].data).unwrap();
         initial.decode(&packets[1].data).unwrap();
         let mut clean = Vp8Decoder {
+            presentation_size: None,
             state: initial.state.clone(), last: initial.last.clone(),
             golden: initial.golden.clone(), alternate: initial.alternate.clone(),
             retired: Vec::new(),
@@ -958,6 +1008,7 @@ mod tests {
         let mut rejected = 0;
         for length in 0..packets[0].data.len() {
             let mut decoder = Vp8Decoder {
+                presentation_size: None,
                 state: initial.state.clone(), last: initial.last.clone(),
                 golden: initial.golden.clone(), alternate: initial.alternate.clone(),
                 retired: Vec::new(),
@@ -980,6 +1031,44 @@ mod tests {
     }
 
     #[test]
+    fn undefined_reference_copy_selectors_reject_without_committing_state() {
+        let mut stream = WebmVp8Stream::new();
+        let packets = stream.push(include_bytes!("../../tests/fixtures/vp8-motion.webm")).unwrap();
+        let mut initial = Vp8Decoder::new();
+        initial.decode(&packets[0].data).unwrap();
+        initial.decode(&packets[1].data).unwrap();
+        for copies in [[3, 0], [0, 3], [3, 3]] {
+            let mut decoder = Vp8Decoder {
+                presentation_size: None,
+                state: initial.state.clone(), last: initial.last.clone(),
+                golden: initial.golden.clone(), alternate: initial.alternate.clone(),
+                retired: Vec::new(),
+            };
+            let mut clean = Vp8Decoder {
+                presentation_size: None,
+                state: initial.state.clone(), last: initial.last.clone(),
+                golden: initial.golden.clone(), alternate: initial.alternate.clone(),
+                retired: Vec::new(),
+            };
+            let packet = super::super::vp8_inter::test_reserved_copy_interframe(
+                initial.state.as_ref().unwrap(), copies);
+            assert!(matches!(decoder.decode(&packet), Err(MediaDecodeError::InvalidData(_))));
+            assert_eq!(decoder.state, initial.state);
+            for (actual, prior) in [(&decoder.last, &initial.last),
+                (&decoder.golden, &initial.golden), (&decoder.alternate, &initial.alternate)] {
+                assert!(Arc::ptr_eq(actual.as_ref().unwrap(), prior.as_ref().unwrap()));
+            }
+            assert!(decoder.retired.is_empty());
+            let actual = decoder.decode(&packets[2].data).unwrap();
+            let expected = clean.decode(&packets[2].data).unwrap();
+            assert_eq!(actual.y.pixels, expected.y.pixels);
+            assert_eq!(actual.u.pixels, expected.u.pixels);
+            assert_eq!(actual.v.pixels, expected.v.pixels);
+            assert_eq!(decoder.state, clean.state);
+        }
+    }
+
+    #[test]
     fn rejected_interframe_does_not_poison_decoder_state() {
         let mut stream = WebmVp8Stream::new();
         let packets = stream.push(include_bytes!("../../tests/fixtures/vp8-segmentation.webm")).unwrap();
@@ -991,6 +1080,7 @@ mod tests {
         let mut rejected = 0;
         for length in 0..packets[1].data.len() {
             let mut decoder = Vp8Decoder {
+                presentation_size: None,
                 state: initial.state.clone(), last: initial.last.clone(),
                 golden: initial.golden.clone(), alternate: initial.alternate.clone(),
                 retired: Vec::new(),
@@ -1041,6 +1131,7 @@ mod tests {
                 assert_eq!(parsed_state.uv_mode_probs, layout.uv_mode_probs);
             } else { assert_eq!(parsed_state, initial_state); }
             let fresh = || Vp8Decoder {
+                presentation_size: None,
                 state: Some(initial_state.clone()), last: initial.last.clone(),
                 golden: initial.golden.clone(), alternate: initial.alternate.clone(), retired: Vec::new(),
             };
@@ -1108,6 +1199,538 @@ mod tests {
     }
 
     #[test]
+    fn filter_deltas_persist_reenable_reset_and_roll_back() {
+        use super::super::vp8_inter::test_filter_interframe;
+        let key = include_bytes!("../../tests/fixtures/vp8-keyframe.ivf");
+        let size = u32::from_le_bytes(key[32..36].try_into().unwrap()) as usize;
+        let packet = &key[44..44 + size];
+        let mut decoder = Vp8Decoder::new();
+        let held = decoder.decode(packet).unwrap();
+        let held_pixels = [held.y.pixels.clone(), held.u.pixels.clone(), held.v.pixels.clone()];
+        let initial = decoder.state.as_ref().unwrap().clone();
+        let mut reference_deltas = initial.reference_filter_deltas;
+        let mut mode_deltas = initial.mode_filter_deltas;
+        let updates = [
+            Some([[Some(-11), Some(23), None, None], [None, Some(17), None, Some(-9)]]),
+            Some([[None, None, Some(-7), None], [Some(13), None, Some(-5), None]]),
+            None, None,
+        ];
+        let enabled = [true, true, false, true];
+        let mut pictures = vec![held.clone()];
+        for step in 0..4 {
+            let before = decoder.state.as_ref().unwrap().clone();
+            let frame = test_filter_interframe(&before, Some(1), false, 0, 0, true,
+                16, enabled[step], updates[step], true);
+            if let Some(values) = updates[step] {
+                for (destination, changes) in [(&mut reference_deltas, values[0]),
+                    (&mut mode_deltas, values[1])] {
+                    for (value, update) in destination.iter_mut().zip(changes) {
+                        if let Some(update) = update { *value = update; }
+                    }
+                }
+            }
+            let mut scratch = before.clone();
+            let mut layout = InterFrameLayout::parse(&frame, &mut scratch).unwrap();
+            let modes = layout.read_macroblocks(&mut scratch, before.mb_width, before.mb_height).unwrap();
+            assert_eq!(scratch.reference_filter_deltas, reference_deltas);
+            assert_eq!(scratch.mode_filter_deltas, mode_deltas);
+            assert_eq!(layout.filter_adjustments, enabled[step]);
+            assert!(modes.iter().all(|mb| mb.reference == 1 && mb.mode == 7));
+            for reference in 0..=3 {
+                for mode in [0, 4, 5, 7, 8, 9] {
+                    let mut mb = modes[0].clone();
+                    mb.reference = reference; mb.mode = mode;
+                    let mode_delta = if reference == 0 {
+                        if mode == 4 { mode_deltas[0] } else { 0 }
+                    } else if mode == 7 { mode_deltas[1] }
+                    else if mode == 9 { mode_deltas[3] } else { mode_deltas[2] };
+                    let expected = if enabled[step] {
+                        (16 + reference_deltas[reference as usize] + mode_delta).clamp(0, 63)
+                    } else { 16 };
+                    assert_eq!(layout.macroblock_filter_level(&mb), expected as u8);
+                }
+            }
+            // Complete mode parsing plus an empty token partition must fail after
+            // speculative delta updates, without committing state or references.
+            let poison = Some([[Some(61); 4], [Some(-63); 4]]);
+            let mut malformed = test_filter_interframe(&before, Some(1), false, 0, 0, true,
+                16, true, poison, false);
+            malformed.truncate(malformed.len() - 2);
+            let mut parsed = before.clone();
+            let mut bad_layout = InterFrameLayout::parse(&malformed, &mut parsed).unwrap();
+            let bad_modes = bad_layout.read_macroblocks(&mut parsed, before.mb_width, before.mb_height).unwrap();
+            assert!(bad_modes.iter().all(|mb| !mb.skip_coefficients));
+            assert_ne!(parsed.reference_filter_deltas, before.reference_filter_deltas);
+            assert_ne!(parsed.mode_filter_deltas, before.mode_filter_deltas);
+            let references = [decoder.last.clone(), decoder.golden.clone(), decoder.alternate.clone()];
+            let reference_pixels = references.each_ref().map(|reference| {
+                let reference = reference.as_ref().unwrap();
+                [reference.y.pixels.clone(), reference.u.pixels.clone(), reference.v.pixels.clone()]
+            });
+            assert!(decoder.decode(&malformed).is_err());
+            assert_eq!(decoder.state.as_ref().unwrap(), &before);
+            for (actual, prior) in [&decoder.last, &decoder.golden, &decoder.alternate].into_iter().zip(&references) {
+                assert!(Arc::ptr_eq(actual.as_ref().unwrap(), prior.as_ref().unwrap()));
+            }
+            let mut opposite_state = before.clone();
+            opposite_state.reference_filter_deltas = reference_deltas;
+            opposite_state.mode_filter_deltas = mode_deltas;
+            let opposite_frame = test_filter_interframe(&opposite_state, Some(1), false, 0, 0, true,
+                16, !enabled[step], None, true);
+            let mut opposite = Vp8Decoder { presentation_size: None, state: Some(opposite_state), last: references[0].clone(),
+                golden: references[1].clone(), alternate: references[2].clone(), retired: Vec::new() };
+            let opposite_picture = opposite.decode(&opposite_frame).unwrap();
+            let strength_control = |adjustments| {
+                let mut state = initial.clone();
+                state.reference_filter_deltas = reference_deltas;
+                state.mode_filter_deltas = mode_deltas;
+                let frame = test_filter_interframe(&state, Some(1), false, 0, 0, true,
+                    16, adjustments, None, true);
+                let mut control = Vp8Decoder { presentation_size: None, state: Some(state), last: Some(held.clone()),
+                    golden: Some(held.clone()), alternate: Some(held.clone()), retired: Vec::new() };
+                control.decode(&frame).unwrap()
+            };
+            assert!(strength_control(true).y.pixels != strength_control(false).y.pixels,
+                "step {step}: enabled strength must affect an unsmoothed reference");
+            let mut clean = Vp8Decoder { presentation_size: None, state: Some(before), last: references[0].clone(),
+                golden: references[1].clone(), alternate: references[2].clone(), retired: Vec::new() };
+            let expected = clean.decode(&frame).unwrap();
+            let picture = decoder.decode(&frame).unwrap();
+            assert_eq!(decoder.state, clean.state);
+            for (a, b) in [(&picture.y, &expected.y), (&picture.u, &expected.u), (&picture.v, &expected.v)] {
+                assert_eq!(a.pixels, b.pixels);
+            }
+            if step == 0 {
+                assert!(picture.y.pixels != opposite_picture.y.pixels,
+                    "the first partial update must change reconstructed pixels");
+            }
+            for (reference, pixels) in references.iter().zip(reference_pixels) {
+                let reference = reference.as_ref().unwrap();
+                assert_eq!(reference.y.pixels, pixels[0]); assert_eq!(reference.u.pixels, pixels[1]);
+                assert_eq!(reference.v.pixels, pixels[2]);
+            }
+            pictures.push(picture);
+        }
+        assert_ne!(pictures[1].y.pixels, pictures[0].y.pixels, "updated strength must consume pixels");
+        let reset = decoder.decode(packet).unwrap();
+        assert_eq!(decoder.state.as_ref().unwrap(), &initial);
+        for reference in [&decoder.last, &decoder.golden, &decoder.alternate] {
+            assert!(Arc::ptr_eq(reference.as_ref().unwrap(), &reset));
+        }
+        let after_reset = test_filter_interframe(&initial, Some(1), false, 0, 0, true,
+            16, true, None, true);
+        let reset_picture = decoder.decode(&after_reset).unwrap();
+        let mut fresh = Vp8Decoder::new();
+        fresh.decode(packet).unwrap();
+        let fresh_picture = fresh.decode(&after_reset).unwrap();
+        assert_eq!(decoder.state, fresh.state);
+        for (actual, expected) in [(&reset_picture.y, &fresh_picture.y),
+            (&reset_picture.u, &fresh_picture.u), (&reset_picture.v, &fresh_picture.v)] {
+            assert_eq!(actual.pixels, expected.pixels);
+        }
+        assert_eq!(held.y.pixels, held_pixels[0]); assert_eq!(held.u.pixels, held_pixels[1]);
+        assert_eq!(held.v.pixels, held_pixels[2]);
+        // FNV-1a checksums from FFmpeg binary, threads=1, yuv420p. The full
+        // 7,680-byte output was independently compared byte-for-byte before retention.
+        let oracle = [0x301421c90f488426u64, 0xe39cdafadddc6038, 0xff81d7a0358e45eb,
+            0xbce6a2a4f0c99769, 0x90fe3fa9d22ba2d7];
+        for (picture, expected) in pictures.iter().zip(oracle) {
+            let mut hash = 0xcbf29ce484222325u64;
+            for (plane, width, height) in [(&picture.y, picture.width, picture.height),
+                (&picture.u, (picture.width + 1) / 2, (picture.height + 1) / 2),
+                (&picture.v, (picture.width + 1) / 2, (picture.height + 1) / 2)] {
+                for row in 0..height {
+                    for &value in &plane.pixels[row * plane.width..row * plane.width + width] {
+                        hash = (hash ^ u64::from(value)).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+            assert_eq!(hash, expected);
+        }
+    }
+
+    #[test]
+    fn segment_quantizer_clipping_order_binary_proof() {
+        use super::super::vp8_inter::test_segment_quantizer_frame;
+        use super::super::vp8_quant::DC;
+        let cases = [(false, 0, -127, 15), (false, 127, 127, -15),
+            (true, 0, -127, 15), (true, 127, 127, -15)];
+        // All 3,072 YUV samples independently matched the FFmpeg binary oracle.
+        let oracle_y = [129u8, 130, 148, 168, 129, 130, 143, 158];
+        let mut packets = Vec::new();
+        let mut native = Vec::new();
+        let mut clipped_first = Vec::new();
+        for (case, (absolute, frame_index, segment, component)) in cases.into_iter().enumerate() {
+            let base = if absolute { segment } else { i16::from(frame_index) + segment };
+            let late = (base + i16::from(component)).clamp(0, 127) as usize;
+            let early = (base.clamp(0, 127) + i16::from(component)).clamp(0, 127) as usize;
+            let late_increment = (DC[late] + 4) >> 3;
+            let early_increment = (DC[early] + 4) >> 3;
+            let key = test_segment_quantizer_frame(true, absolute, frame_index, segment, component);
+            let key_layout = KeyFrameLayout::parse(&key).unwrap();
+            let key_factor = key_layout.dequant_factors(0)[2];
+            let mut decoder = Vp8Decoder::new();
+            let key_picture = decoder.decode(&key).unwrap();
+            let inter = test_segment_quantizer_frame(false, absolute, frame_index, segment, component);
+            let mut state = decoder.state.as_ref().unwrap().clone();
+            let mut layout = InterFrameLayout::parse(&inter, &mut state).unwrap();
+            assert_eq!(layout.segment_absolute, absolute);
+            assert_eq!(layout.segment_quantizers[0], segment);
+            assert_eq!(layout.quantizer, frame_index);
+            let inter_factor = layout.dequant_factors(0)[2];
+            let modes = layout.read_macroblocks(&mut state, 1, 1).unwrap();
+            assert_eq!(modes[0].reference, 1); assert_eq!(modes[0].mode, 7);
+            assert!(!modes[0].skip_coefficients);
+            let inter_picture = decoder.decode(&inter).unwrap();
+            eprintln!("absolute={absolute} frame={frame_index} segment={segment} component={component}: late_index={late} early_index={early} key/inter_Y2DC_factor={key_factor}/{inter_factor} native_Y={}/{} early_Y={}/{}",
+                key_picture.y.pixels[0], inter_picture.y.pixels[0],
+                128 + early_increment, 128 + early_increment * 2);
+            assert_eq!(key_factor, DC[late] * 2);
+            assert_eq!(inter_factor, DC[late] * 2);
+            // DC4 * (2*DC[index]) -> Walsh DC[index] -> DCT round((DC[index])/8).
+            for (picture, multiplier) in [(&key_picture, 1), (&inter_picture, 2)] {
+                let oracle = oracle_y[case * 2 + (multiplier - 1) as usize];
+                assert!(picture.y.pixels.iter().all(|&value| value == oracle),
+                    "case {case}, frame {multiplier}: FFmpeg luma oracle {oracle}");
+                assert!(picture.y.pixels.iter().all(|&value| i32::from(value) == 128 + late_increment * multiplier));
+                assert!(picture.u.pixels.iter().chain(&picture.v.pixels).all(|&value| value == 128));
+                for plane in [&picture.y, &picture.u, &picture.v] { native.extend_from_slice(&plane.pixels); }
+                clipped_first.extend(std::iter::repeat_n((128 + early_increment * multiplier) as u8, 256));
+                clipped_first.extend(std::iter::repeat_n(128, 128));
+            }
+            packets.push(key); packets.push(inter);
+        }
+        if let Ok(path) = std::env::var("VP8_QUANT_CLIP_PROOF") {
+            let mut ivf = include_bytes!("../../tests/fixtures/vp8-keyframe.ivf")[..32].to_vec();
+            ivf[12..16].copy_from_slice(&[16, 0, 16, 0]);
+            ivf[24..28].copy_from_slice(&(packets.len() as u32).to_le_bytes());
+            for (index, packet) in packets.iter().enumerate() {
+                ivf.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+                ivf.extend_from_slice(&(index as u64).to_le_bytes()); ivf.extend_from_slice(packet);
+            }
+            std::fs::write(format!("{path}.ivf"), ivf).unwrap();
+            std::fs::write(format!("{path}-native.yuv"), native).unwrap();
+            std::fs::write(format!("{path}-early.yuv"), clipped_first).unwrap();
+        }
+    }
+
+    #[test]
+    fn mixed_reference_bias_parsed_modes_pixels_and_recovery() {
+        use super::super::vp8_inter::test_mixed_motion_interframe;
+        let key = include_bytes!("../../tests/fixtures/vp8-keyframe.ivf");
+        let size = u32::from_le_bytes(key[32..36].try_into().unwrap()) as usize;
+        let packet = &key[44..44 + size];
+        let mut decoder = Vp8Decoder::new();
+        let key_picture = decoder.decode(packet).unwrap();
+        assert_eq!((decoder.state.as_ref().unwrap().mb_width,
+            decoder.state.as_ref().unwrap().mb_height), (2, 2));
+        let mut pictures = vec![key_picture];
+        // Prepare three genuinely different references using ordinary coded frames.
+        for (requests, refresh) in [([(1, 8, 0); 4], [false, true, false]),
+            ([(1, 9, 3); 4], [false, false, true])] {
+            let (frame, _) = test_mixed_motion_interframe(decoder.state.as_ref().unwrap(),
+                [false; 2], &requests, refresh, false);
+            pictures.push(decoder.decode(&frame).unwrap());
+        }
+        let initial = decoder.state.as_ref().unwrap().clone();
+        let references = [decoder.last.clone(), decoder.golden.clone(), decoder.alternate.clone()];
+        let pixels = references.each_ref().map(|reference| {
+            let reference = reference.as_ref().unwrap();
+            [reference.y.pixels.clone(), reference.u.pixels.clone(), reference.v.pixels.clone()]
+        });
+        for a in 0..3 { for b in 0..a { assert_ne!(pixels[a][0], pixels[b][0]); } }
+        let fresh = || Vp8Decoder { presentation_size: None, state: Some(initial.clone()), last: references[0].clone(),
+            golden: references[1].clone(), alternate: references[2].clone(), retired: Vec::new() };
+        let equal = |a: &YuvKeyFrame, b: &YuvKeyFrame| {
+            assert_eq!(a.y.pixels, b.y.pixels); assert_eq!(a.u.pixels, b.u.pixels);
+            assert_eq!(a.v.pixels, b.v.pixels);
+        };
+        let mut cases = 0;
+        for flags in 0..4 { for source in 1..=3 { for target in 1..=3 {
+            for mode in [5, 6, 8, 9] {
+                let biases = [flags & 1 != 0, flags & 2 != 0];
+                let partition = ((flags + source + target) % 4) as u8;
+                let requests = [(source, 9, partition), (source % 3 + 1, 8, 0),
+                    ((source + 1) % 3 + 1, 8, 0), (target, mode, partition)];
+                let (frame, expected_modes) = test_mixed_motion_interframe(&initial,
+                    biases, &requests, [false; 3], false);
+                let mut state = initial.clone();
+                let mut layout = InterFrameLayout::parse(&frame, &mut state).unwrap();
+                assert_eq!(layout.sign_bias, biases);
+                let modes = layout.read_macroblocks(&mut state, 2, 2).unwrap();
+                for (actual, expected) in modes.iter().zip(&expected_modes) {
+                    assert_eq!(actual.reference, expected.reference);
+                    assert_eq!(actual.mode, expected.mode);
+                    assert_eq!(actual.split_partition, expected.split_partition);
+                    assert_eq!(actual.motion, expected.motion);
+                    assert!(actual.skip_coefficients);
+                }
+                assert_eq!(layout.control.read_literal(8).unwrap(), 0xa6);
+                assert_eq!(state, initial);
+                let expected = fresh().decode(&frame).unwrap();
+                let actual = decoder.decode(&frame).unwrap(); equal(&actual, &expected);
+                pictures.push(actual);
+                assert_eq!(decoder.state.as_ref().unwrap(), &initial);
+                for (actual, prior) in [&decoder.last, &decoder.golden, &decoder.alternate]
+                    .into_iter().zip(&references) {
+                    assert!(Arc::ptr_eq(actual.as_ref().unwrap(), prior.as_ref().unwrap()));
+                }
+
+                let (malformed, _) = test_mixed_motion_interframe(&initial, biases,
+                    &requests, [true; 3], true);
+                let mut scratch = initial.clone();
+                let mut parsed = InterFrameLayout::parse(&malformed, &mut scratch).unwrap();
+                assert!(parsed.read_macroblocks(&mut scratch, 2, 2).unwrap()
+                    .iter().all(|mb| !mb.skip_coefficients));
+                assert_eq!(parsed.control.read_literal(8).unwrap(), 0xa6);
+                // Empty tokens reject after all mixed-reference modes. Early tag,
+                // header and control truncations must preserve the same references.
+                for cut in [0, 3, malformed.len() / 2, malformed.len()] {
+                    let mut rejected = fresh();
+                    assert!(rejected.decode(&malformed[..cut]).is_err());
+                    assert_eq!(rejected.state.as_ref().unwrap(), &initial);
+                    for (actual, prior) in [&rejected.last, &rejected.golden, &rejected.alternate]
+                        .into_iter().zip(&references) {
+                        assert!(Arc::ptr_eq(actual.as_ref().unwrap(), prior.as_ref().unwrap()));
+                    }
+                    let recovered = rejected.decode(&frame).unwrap(); equal(&recovered, &expected);
+                    let following = rejected.decode(&frame).unwrap(); equal(&following, &expected);
+                    equal(&recovered, &expected);
+                    assert_eq!(rejected.state.as_ref().unwrap(), &initial);
+                }
+                cases += 1;
+            }
+        } } }
+        assert_eq!(cases, 144);
+        for flags in 1..4 {
+            assert!((0..36).any(|case| pictures[3 + case].y.pixels
+                != pictures[3 + flags * 36 + case].y.pixels),
+                "bias flags {flags} must affect real reconstructed pixels");
+        }
+        for (reference, prior) in references.iter().zip(&pixels) {
+            let reference = reference.as_ref().unwrap();
+            assert_eq!(reference.y.pixels, prior[0]); assert_eq!(reference.u.pixels, prior[1]);
+            assert_eq!(reference.v.pixels, prior[2]);
+        }
+        // Retain the independently byte-compared FFmpeg binary oracle for all147
+        // 32x32 frames, without an external executable dependency during unit tests.
+        let mut hash = 0xcbf29ce484222325u64;
+        for picture in &pictures {
+            for plane in [&picture.y, &picture.u, &picture.v] {
+                for &value in &plane.pixels {
+                    hash = (hash ^ u64::from(value)).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        assert_eq!(hash, 0x8bda7dbf7b59afba);
+        eprintln!("mixed bias: {cases} streams, {} rejected prefixes and recovery/following pairs", cases * 4);
+    }
+
+    #[test]
+    fn consumed_y2_and_newmv_probabilities_refresh_and_roll_back() {
+        use super::super::vp8::{BoolDecoder, FrameHeader};
+        use super::super::vp8_coeff::CoeffProbs;
+        use super::super::vp8_inter::{MotionVector, TestBoolWriter, test_consumed_entropy_interframe};
+        let key = include_bytes!("../../tests/fixtures/vp8-keyframe.ivf");
+        let size = u32::from_le_bytes(key[32..36].try_into().unwrap()) as usize;
+        let key = &key[44..44 + size];
+        let mut initial = Vp8Decoder::new();
+        let held = initial.decode(key).unwrap();
+        let initial_state = initial.state.as_ref().unwrap().clone();
+        let held_pixels = [held.y.pixels.clone(), held.u.pixels.clone(), held.v.pixels.clone()];
+        let fresh = || Vp8Decoder { presentation_size: None, state: Some(initial_state.clone()), last: initial.last.clone(),
+            golden: initial.golden.clone(), alternate: initial.alternate.clone(), retired: Vec::new() };
+        let same_pixels = |a: &YuvKeyFrame, b: &YuvKeyFrame| {
+            assert_eq!(a.y.pixels, b.y.pixels); assert_eq!(a.u.pixels, b.u.pixels);
+            assert_eq!(a.v.pixels, b.v.pixels);
+        };
+        let expected = |reference: &YuvKeyFrame| {
+            let mut output = reference.clone();
+            for (source, destination, displacement, residual) in [(&reference.y, &mut output.y, 4, 1),
+                (&reference.u, &mut output.u, 2, 0), (&reference.v, &mut output.v, 2, 0)] {
+                let height = source.pixels.len() / source.width;
+                for y in 0..height {
+                    for x in 0..source.width {
+                        let sx = x.saturating_sub(displacement);
+                        let sy = (y + displacement).min(height - 1);
+                        // Quantizer0: Y2 DC4 *8, Walsh(32+3)>>3=4, DCT(4+4)>>3=1.
+                        destination.pixels[y * destination.width + x] =
+                            source.pixels[sy * source.width + sx].saturating_add(residual);
+                    }
+                }
+            }
+            output
+        };
+        let mut uniform_writer = TestBoolWriter::new();
+        for probability in super::super::vp8_probs::COEFF_UPDATE_PROBS {
+            uniform_writer.write(true, probability);
+            for bit in (0..8).rev() { uniform_writer.write(bit == 7, 128); }
+        }
+        let uniform_bytes = uniform_writer.finish();
+        let mut uniform = CoeffProbs::default();
+        uniform.update(&mut BoolDecoder::new(&uniform_bytes).unwrap()).unwrap();
+        for refresh in [false, true] {
+            let frame = test_consumed_entropy_interframe(&initial_state, refresh);
+            let check_layout = |prior: &InterState, packet: &[u8]| {
+                let mut state = prior.clone();
+                let mut layout = InterFrameLayout::parse(packet, &mut state).unwrap();
+                assert_ne!(layout.coeff_probs, uniform);
+                assert_ne!(layout.coeff_probs, prior.coeff_probs);
+                assert_ne!(layout.mv_probs, prior.mv_probs);
+                for probabilities in layout.mv_probs {
+                    assert_eq!(probabilities[0], 254); assert_eq!(probabilities[1], 2);
+                    assert!(probabilities[2..].iter().all(|&p| p == 128));
+                }
+                let modes = layout.read_macroblocks(&mut state, prior.mb_width, prior.mb_height).unwrap();
+                assert!(modes.iter().all(|mode| mode.mode == 8 && mode.reference == 1
+                    && !mode.skip_coefficients && mode.motion == [MotionVector { row: 16, col: -16 }; 16]));
+                assert_eq!(layout.control.read_literal(8).unwrap(), 0xa6);
+                let mut tokens = BoolDecoder::new(layout.token_partitions[0]).unwrap();
+                let mut first_end = None;
+                for y in 0..prior.mb_height {
+                    for x in 0..prior.mb_width {
+                        let (block, present) = layout.coeff_probs.decode_block(&mut tokens, 1,
+                            usize::from(x > 0) + usize::from(y > 0), 0).unwrap();
+                        assert!(present); assert_eq!(block[0], 4); assert!(block[1..].iter().all(|&v| v == 0));
+                        if first_end.is_none() { first_end = Some(format!("{tokens:?}")); }
+                        for _ in 0..16 { assert_eq!(layout.coeff_probs.decode_block(&mut tokens, 0, 0, 1).unwrap(), ([0; 16], false)); }
+                        for _ in 0..8 { assert_eq!(layout.coeff_probs.decode_block(&mut tokens, 2, 0, 0).unwrap(), ([0; 16], false)); }
+                    }
+                }
+                assert_eq!(tokens.read_literal(8).unwrap(), 0x59);
+                let mut wrong_tokens = BoolDecoder::new(layout.token_partitions[0]).unwrap();
+                let wrong = uniform.decode_block(&mut wrong_tokens, 1, 0, 0);
+                assert!(wrong.as_ref().map_or(true, |(block, present)| !*present || block[0] != 4)
+                    || format!("{wrong_tokens:?}") != first_end.unwrap(), "slot264 must affect token result or cursor");
+                (state, layout.coeff_probs, layout.mv_probs)
+            };
+            let (committed, coeff, mv) = check_layout(&initial_state, &frame);
+            if refresh { assert_eq!(committed.coeff_probs, coeff); assert_eq!(committed.mv_probs, mv); }
+            else { assert_eq!(committed, initial_state); }
+            let mut wrong_state = initial_state.clone();
+            let mut wrong_layout = InterFrameLayout::parse(&frame, &mut wrong_state).unwrap();
+            wrong_layout.mv_probs = initial_state.mv_probs;
+            let wrong_modes = wrong_layout.read_macroblocks(&mut wrong_state, initial_state.mb_width, initial_state.mb_height);
+            assert!(wrong_modes.as_ref().map_or(true, |modes| modes.iter().any(|mode|
+                mode.motion != [MotionVector { row: 16, col: -16 }; 16]))
+                || wrong_layout.control.read_literal(8).ok() != Some(0xa6), "updated MV probabilities must be consumed");
+            let expected_first = expected(&held);
+            let expected_next = expected(&expected_first);
+            let mut clean = fresh();
+            let first = clean.decode(&frame).unwrap();
+            same_pixels(&first, &expected_first); assert_ne!(first.y.pixels, held.y.pixels);
+            assert_eq!(clean.state.as_ref().unwrap(), &committed);
+            let following = test_consumed_entropy_interframe(clean.state.as_ref().unwrap(), false);
+            // Following frame uses the same explicit table updates; no entropy state is committed.
+            let mut following_state = committed.clone();
+            let mut following_layout = InterFrameLayout::parse(&following, &mut following_state).unwrap();
+            following_layout.read_macroblocks(&mut following_state, committed.mb_width, committed.mb_height).unwrap();
+            assert_eq!(following_layout.control.read_literal(8).unwrap(), 0xa6);
+            assert_eq!(following_state, committed);
+            let next = clean.decode(&following).unwrap(); same_pixels(&next, &expected_next);
+            assert_eq!(clean.state.as_ref().unwrap(), &committed);
+            let control_end = 3 + FrameHeader::parse(&frame).unwrap().first_partition_size;
+            let mut rejected = 0;
+            let mut rejected_tokens = 0;
+            let mut recoveries = 0;
+            for cut in 0..frame.len() {
+                let mut decoder = fresh();
+                if decoder.decode(&frame[..cut]).is_ok() { continue; }
+                rejected += 1; rejected_tokens += usize::from(cut >= control_end);
+                assert_eq!(decoder.state.as_ref().unwrap(), &initial_state);
+                for (actual, prior) in [(&decoder.last, &initial.last), (&decoder.golden, &initial.golden),
+                    (&decoder.alternate, &initial.alternate)] {
+                    assert!(Arc::ptr_eq(actual.as_ref().unwrap(), prior.as_ref().unwrap()));
+                }
+                // Header-prefix failures share the frame-tag bounds check; avoid thousands
+                // of identical valid-frame decodes, but recover after every token-stage failure.
+                if cut >= control_end || [0, 3, control_end / 2, control_end - 1].contains(&cut) {
+                    let recovered = decoder.decode(&frame).unwrap(); same_pixels(&recovered, &expected_first);
+                    assert_eq!(decoder.state.as_ref().unwrap(), &committed);
+                    let following_frame = decoder.decode(&following).unwrap(); same_pixels(&following_frame, &expected_next);
+                    same_pixels(&recovered, &expected_first);
+                    assert_eq!(decoder.state.as_ref().unwrap(), &committed);
+                    recoveries += 1;
+                }
+                assert_eq!(held.y.pixels, held_pixels[0]); assert_eq!(held.u.pixels, held_pixels[1]);
+                assert_eq!(held.v.pixels, held_pixels[2]);
+            }
+            assert!(rejected_tokens > 0);
+            assert!(recoveries >= rejected_tokens);
+            eprintln!("consumed entropy refresh={refresh}: {rejected} rejected cuts, {rejected_tokens} after complete control, {recoveries} recovery/following pairs");
+        }
+    }
+
+    #[test]
+    fn keyframe_clamping_flags_decode_and_reserved_colorspace_preserves_references() {
+        use super::super::vp8_inter::TestBoolWriter;
+        use super::super::vp8_probs::COEFF_UPDATE_PROBS;
+        fn packet(reserved_color: bool, no_clamping: bool) -> Vec<u8> {
+            let mut writer = TestBoolWriter::new();
+            writer.write(reserved_color, 128);
+            writer.write(no_clamping, 128);
+            // No segmentation, normal filter with zero strength/sharpness,
+            // no filter deltas, one token partition, quantizer zero.
+            for _ in 0..21 { writer.write(false, 128); }
+            // Five absent quantizer deltas and no entropy refresh.
+            for _ in 0..6 { writer.write(false, 128); }
+            for probability in COEFF_UPDATE_PROBS { writer.write(false, probability); }
+            writer.write(true, 128); // Explicit coefficient-skip flags.
+            writer.write(true, 128); // Skip probability 128, MSB first.
+            for _ in 0..7 { writer.write(false, 128); }
+            writer.write(true, 128); // The sole macroblock skips coefficients.
+            writer.write(true, 145);
+            writer.write(false, 156);
+            writer.write(false, 163); // Luma DC prediction.
+            writer.write(false, 142); // Chroma DC prediction.
+            let control = writer.finish();
+            let tag = ((control.len() as u32) << 5) | 0x10;
+            let mut packet = tag.to_le_bytes()[..3].to_vec();
+            packet.extend_from_slice(&[0x9d, 0x01, 0x2a, 16, 0, 16, 0]);
+            packet.extend(control);
+            packet.extend([0, 0]);
+            packet
+        }
+        for no_clamping in [false, true] {
+            let mut decoder = Vp8Decoder::new();
+            let valid = packet(false, no_clamping);
+            let frame = decoder.decode(&valid).unwrap();
+            assert_eq!((frame.width, frame.height), (16, 16));
+            for plane in [&frame.y, &frame.u, &frame.v] {
+                assert!(plane.pixels.iter().all(|&pixel| pixel == 128));
+            }
+            if std::env::var_os("WEBMEDIA_VP8_HEADER_ORACLE").is_some() {
+                use std::io::Write;
+                use std::process::{Command, Stdio};
+                let mut ivf = b"DKIF\0\0\x20\0VP80".to_vec();
+                ivf.extend(16u16.to_le_bytes());
+                ivf.extend(16u16.to_le_bytes());
+                for value in [30u32, 1, 1, 0] { ivf.extend(value.to_le_bytes()); }
+                ivf.extend((valid.len() as u32).to_le_bytes());
+                ivf.extend(0u64.to_le_bytes());
+                ivf.extend_from_slice(&valid);
+                let mut oracle = Command::new("ffmpeg")
+                    .args(["-v", "error", "-f", "ivf", "-i", "pipe:0", "-frames:v", "1",
+                        "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"])
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                    .spawn().expect("FFmpeg executable for opt-in VP8 oracle");
+                oracle.stdin.take().unwrap().write_all(&ivf).unwrap();
+                let output = oracle.wait_with_output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                assert_eq!(output.stdout, vec![128; 16 * 16 + 2 * 8 * 8],
+                    "clamping flag={no_clamping}");
+            }
+            let committed = decoder.state.clone();
+            assert!(matches!(decoder.decode(&packet(true, no_clamping)),
+                Err(MediaDecodeError::Unsupported)));
+            assert_eq!(decoder.state, committed);
+            for reference in [&decoder.last, &decoder.golden, &decoder.alternate] {
+                assert!(Arc::ptr_eq(reference.as_ref().unwrap(), &frame));
+            }
+        }
+    }
+
+    #[test]
     fn reserved_versions_are_rejected_without_updating_references() {
         let bytes = include_bytes!("../../tests/fixtures/vp8-motion.webm");
         let mut stream = WebmVp8Stream::new();
@@ -1121,9 +1744,15 @@ mod tests {
             assert!(matches!(decoder.decode(&key), Err(MediaDecodeError::Unsupported)));
             assert!(decoder.state.is_none());
             assert!(matches!(decode_keyframe_with_state(&key), Err(MediaDecodeError::Unsupported)));
+            assert!(matches!(KeyFrameLayout::parse(&key), Err(MediaDecodeError::Unsupported)));
             let reference = decoder.decode(&packets[0].data).unwrap();
             let mut inter = packets[1].data.clone();
             inter[0] = (inter[0] & !14) | (version << 1);
+            let committed = decoder.state.as_ref().unwrap();
+            let mut parsed_state = committed.clone();
+            assert!(matches!(InterFrameLayout::parse(&inter, &mut parsed_state),
+                Err(MediaDecodeError::Unsupported)));
+            assert_eq!(&parsed_state, committed);
             assert!(matches!(decoder.decode(&inter), Err(MediaDecodeError::Unsupported)));
             assert!(Arc::ptr_eq(&reference, decoder.last.as_ref().unwrap()));
             decoder.decode(&packets[1].data).unwrap();

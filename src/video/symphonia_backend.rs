@@ -101,6 +101,7 @@ pub fn decode_audio(bytes: &[u8], mime: Option<&str>) -> Result<DecodedMedia, Me
     let duration = Some(samples.len() as f32 / channels as f32 / sample_rate as f32);
     Ok(DecodedMedia::Audio {
         metadata: MediaMetadata {
+            presentation_size: None,
             duration,
             width: None,
             height: None,

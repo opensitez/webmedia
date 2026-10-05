@@ -476,6 +476,7 @@ impl StreamingVideoDecoder for Mp4AvcStream {
         let index = self.index.as_ref()?;
         let sps = index.config.sequence_parameters.first()?;
         Some(MediaMetadata {
+            presentation_size: None,
             duration: Some(index.duration_ticks as f32 / index.timescale as f32),
             width: Some(sps.width),
             height: Some(sps.height),
@@ -579,6 +580,7 @@ mod tests {
             decoder.queue_picture(
                 time,
                 VideoFrame {
+                    presentation_size: None,
                     width: 1,
                     height: 1,
                     rgba: std::sync::Arc::new(vec![0, 0, 0, 255]),

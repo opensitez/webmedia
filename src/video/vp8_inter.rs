@@ -182,6 +182,9 @@ impl<'a> InterFrameLayout<'a> {
                 "expected VP8 interframe".into(),
             ));
         }
+        if header.version > 3 {
+            return Err(MediaDecodeError::Unsupported);
+        }
         let mut control = BoolDecoder::new(header.control_partition(frame))?;
         let segment_enabled = control.read_bit()?;
         let mut segment_map_update = false;
@@ -262,6 +265,11 @@ impl<'a> InterFrameLayout<'a> {
         } else {
             control.read_literal(2)? as u8
         };
+        if copy_to_golden > 2 || copy_to_alternate > 2 {
+            return Err(MediaDecodeError::InvalidData(
+                "undefined VP8 reference-copy selector".into(),
+            ));
+        }
         let sign_bias = [control.read_bit()?, control.read_bit()?];
         let refresh_entropy = control.read_bit()?;
         let refresh_last = control.read_bit()?;
@@ -841,20 +849,61 @@ impl TestBoolWriter {
 pub(super) fn test_interframe(state: &InterState, reference: Option<u8>, vertical: bool,
     golden: u8, alternate: u8, refresh_last: bool) -> Vec<u8>
 {
+    test_filter_interframe(state, reference, vertical, golden, alternate, refresh_last,
+        0, false, None, true)
+}
+
+#[cfg(test)]
+pub(super) fn test_filter_interframe(state: &InterState, reference: Option<u8>, vertical: bool,
+    golden: u8, alternate: u8, refresh_last: bool, level: u8, enabled: bool,
+    updates: Option<[[Option<i16>; 4]; 2]>, skip: bool) -> Vec<u8>
+{
+    write_test_filter_interframe(state, reference, vertical, golden, alternate,
+        refresh_last, level, enabled, updates, skip, None)
+}
+
+#[cfg(test)]
+pub(super) fn test_reserved_copy_interframe(state: &InterState, copies: [u8; 2]) -> Vec<u8> {
+    write_test_filter_interframe(state, Some(1), false, 0, 0, true,
+        0, false, None, true, Some(copies))
+}
+
+#[cfg(test)]
+fn write_test_filter_interframe(state: &InterState, reference: Option<u8>, vertical: bool,
+    golden: u8, alternate: u8, refresh_last: bool, level: u8, enabled: bool,
+    updates: Option<[[Option<i16>; 4]; 2]>, skip: bool,
+    copy_override: Option<[u8; 2]>) -> Vec<u8>
+{
     assert!(golden <= 3 && alternate <= 3);
     let mut writer = TestBoolWriter::new();
     writer.write(false, 128); // segmentation disabled
-    writer.write(false, 128); // normal filter, level zero
-    writer.literal(0, 6);
+    writer.write(false, 128); // normal filter
+    writer.literal(u32::from(level), 6);
     writer.literal(0, 3);
-    writer.write(false, 128); // filter deltas disabled
+    writer.write(enabled, 128);
+    if enabled {
+        writer.write(updates.is_some(), 128);
+        if let Some(updates) = updates {
+            for values in updates {
+                for value in values {
+                    writer.write(value.is_some(), 128);
+                    if let Some(value) = value {
+                        assert!((-63..=63).contains(&value));
+                        writer.literal(u32::from(value.unsigned_abs()), 6);
+                        writer.write(value < 0, 128);
+                    }
+                }
+            }
+        }
+    }
     writer.literal(0, 2); // one token partition
     writer.literal(0, 7); // quantizer and five absent deltas
     for _ in 0..5 { writer.write(false, 128); }
     writer.write(golden == 3, 128);
     writer.write(alternate == 3, 128);
-    if golden != 3 { writer.literal(u32::from(golden), 2); }
-    if alternate != 3 { writer.literal(u32::from(alternate), 2); }
+    let copies = copy_override.unwrap_or([golden, alternate]);
+    if golden != 3 { writer.literal(u32::from(copies[0]), 2); }
+    if alternate != 3 { writer.literal(u32::from(copies[1]), 2); }
     for _ in 0..3 { writer.write(false, 128); } // sign biases and entropy refresh
     writer.write(refresh_last, 128);
     for probability in super::vp8_probs::COEFF_UPDATE_PROBS { writer.write(false, probability); }
@@ -870,7 +919,7 @@ pub(super) fn test_interframe(state: &InterState, reference: Option<u8>, vertica
     }
     for y in 0..state.mb_height {
         for x in 0..state.mb_width {
-            writer.write(true, 128); // no residual coefficients
+            writer.write(skip, 128);
             writer.write(reference.is_some(), 128);
             if let Some(reference) = reference {
                 assert!((1..=3).contains(&reference));
@@ -946,6 +995,299 @@ pub(super) fn test_entropy_interframe(state: &InterState, refresh: bool, skip: b
     frame.extend(control);
     frame.extend([0, 0]);
     frame
+}
+
+#[cfg(test)]
+pub(super) fn test_consumed_entropy_interframe(state: &InterState, refresh: bool) -> Vec<u8> {
+    let mut control = TestBoolWriter::new();
+    control.write(false, 128); // segmentation
+    control.write(false, 128); // normal filter, level zero
+    control.literal(0, 6);
+    control.literal(0, 3);
+    control.write(false, 128);
+    control.literal(0, 2); // one token partition
+    control.literal(0, 7); // quantizer zero, no deltas
+    for _ in 0..5 { control.write(false, 128); }
+    for _ in 0..2 { control.write(false, 128); } // retain golden/alternate
+    for _ in 0..2 { control.literal(0, 2); }
+    for _ in 0..2 { control.write(false, 128); } // sign biases
+    control.write(refresh, 128);
+    control.write(true, 128); // refresh last
+    // Known tables isolate the consumed Y2 band0/context0 EOB node at slot264.
+    for (index, probability) in super::vp8_probs::COEFF_UPDATE_PROBS.into_iter().enumerate() {
+        control.write(true, probability);
+        control.literal(if index == 264 { 73 } else { 128 }, 8);
+    }
+    control.write(true, 128);
+    for _ in 0..4 { control.literal(128, 8); } // skip/intra/last/golden probabilities
+    control.write(false, 128); // no intra mode probability updates
+    control.write(false, 128);
+    for probabilities in MV_UPDATE_PROBS {
+        for (index, probability) in probabilities.into_iter().enumerate() {
+            control.write(true, probability);
+            control.literal(match index { 0 => 127, 1 => 1, _ => 64 }, 7);
+        }
+    }
+    let mut tokens = TestBoolWriter::new();
+    for y in 0..state.mb_height {
+        for x in 0..state.mb_width {
+            control.write(false, 128); // residuals present
+            control.write(true, 128); // inter, last reference
+            control.write(false, 128);
+            let score = usize::from(x > 0) * 2 + usize::from(y > 0) * 2
+                + usize::from(x > 0 && y > 0);
+            for (bit, probability) in [(true, MODE_CONTEXTS[0][0]),
+                (true, MODE_CONTEXTS[score][1]), (true, MODE_CONTEXTS[0][2]),
+                (false, MODE_CONTEXTS[0][3])] { control.write(bit, probability); }
+            // First difference is (+16,-16); later neighbors already predict that vector.
+            for negative in [false, true] {
+                let first = x == 0 && y == 0;
+                control.write(first, 254);
+                if first {
+                    for _ in 0..3 { control.write(false, 128); }
+                    for bit in (4..=9).rev() { control.write(bit == 4, 128); }
+                    control.write(false, 128); // bit3 of magnitude16
+                    control.write(negative, 2);
+                } else {
+                    for _ in 0..3 { control.write(false, 128); } // short magnitude zero
+                }
+            }
+            // Y2 DC=4, positive, then EOB. All Y1 AC and chroma blocks are empty.
+            tokens.write(true, if x == 0 && y == 0 { 73 } else { 128 });
+            for bit in [true, true, false, true, true, false, false] { tokens.write(bit, 128); }
+            for _ in 0..24 { tokens.write(false, 128); }
+        }
+    }
+    control.literal(0xa6, 8);
+    tokens.literal(0x59, 8);
+    let control = control.finish();
+    let tag = ((control.len() as u32) << 5) | 0x11;
+    let mut frame = tag.to_le_bytes()[..3].to_vec();
+    frame.extend(control);
+    frame.extend(tokens.finish());
+    frame
+}
+
+#[cfg(test)]
+pub(super) fn test_neighbor_oracle(decoded: &[InterMacroblock], x: usize, y: usize,
+    width: usize, height: usize, reference: u8, biases: [bool; 2])
+    -> (MotionVector, MotionVector, MotionVector, [usize; 4])
+{
+    // RFC weighted candidates: above/left/above-left, weights 2/2/1.
+    // Group normalized vectors before choosing stable nearest/near ties.
+    let bias = |r: u8| r > 1 && biases[(r - 2) as usize];
+    let mut groups = vec![(MotionVector::default(), 0usize)];
+    let mut split_weight = 0;
+    for (position, weight) in [(y.checked_sub(1).map(|row| row * width + x), 2),
+        (x.checked_sub(1).map(|col| y * width + col), 2),
+        (x.checked_sub(1).zip(y.checked_sub(1)).map(|(col, row)| row * width + col), 1)] {
+        let Some(position) = position else { continue };
+        let neighbor = &decoded[position];
+        if neighbor.reference == 0 { continue; }
+        let raw = neighbor.motion[if neighbor.mode == 9 { 15 } else { 0 }];
+        let vector = if bias(neighbor.reference) == bias(reference) { raw }
+            else { MotionVector { row: -raw.row, col: -raw.col } };
+        if let Some(group) = groups.iter_mut().find(|group| group.0 == vector) {
+            group.1 += weight;
+        } else { groups.push((vector, weight)); }
+        split_weight += usize::from(neighbor.mode == 9) * weight;
+    }
+    let zero_weight = groups[0].1;
+    groups.remove(0);
+    groups.sort_by(|a, b| b.1.cmp(&a.1));
+    let nearest = groups.first().copied().unwrap_or_default();
+    let near = groups.get(1).copied().unwrap_or_default();
+    let best = if nearest.1 >= zero_weight { nearest.0 } else { MotionVector::default() };
+    let bound = |mv: MotionVector| MotionVector {
+        row: (i32::from(mv.row).max(-64 * (y as i32 + 1))
+            .min(64 * (height - y) as i32)) as i16,
+        col: (i32::from(mv.col).max(-64 * (x as i32 + 1))
+            .min(64 * (width - x) as i32)) as i16,
+    };
+    (bound(nearest.0), bound(near.0), bound(best), [zero_weight, nearest.1, near.1, split_weight])
+}
+
+#[cfg(test)]
+pub(super) fn test_segment_quantizer_frame(key: bool, absolute: bool, frame_index: u8,
+    segment: i16, component: i8) -> Vec<u8>
+{
+    let mut control = TestBoolWriter::new();
+    if key { control.write(false, 128); control.write(false, 128); }
+    control.write(true, 128); // segmentation, retain the default segment-zero map
+    control.write(false, 128); control.write(true, 128);
+    control.write(absolute, 128);
+    control.write(true, 128);
+    control.literal(u32::from(segment.unsigned_abs()), 7);
+    control.write(segment < 0, 128);
+    for _ in 0..7 { control.write(false, 128); } // other segment features zero
+    control.write(false, 128); control.literal(0, 6); control.literal(0, 3);
+    control.write(false, 128); control.literal(0, 2);
+    control.literal(u32::from(frame_index), 7);
+    for index in 0..5 {
+        control.write(index == 1, 128); // only Y2 DC component index has a delta
+        if index == 1 {
+            control.literal(u32::from(component.unsigned_abs()), 4);
+            control.write(component < 0, 128);
+        }
+    }
+    if !key {
+        control.write(false, 128); control.write(false, 128);
+        control.literal(0, 2); control.literal(0, 2);
+        control.write(false, 128); control.write(false, 128);
+    }
+    control.write(false, 128); // frame-local entropy updates
+    if !key { control.write(true, 128); } // refresh last
+    for probability in super::vp8_probs::COEFF_UPDATE_PROBS {
+        control.write(true, probability); control.literal(128, 8);
+    }
+    control.write(true, 128); control.literal(128, 8);
+    if !key {
+        for _ in 0..3 { control.literal(128, 8); }
+        control.write(false, 128); control.write(false, 128);
+        for probabilities in MV_UPDATE_PROBS { for p in probabilities { control.write(false, p); } }
+    }
+    control.write(false, 128); // residuals present
+    if key {
+        control.write(true, 145); control.write(false, 156); control.write(false, 163); // Y DC
+        control.write(false, 142); // UV DC
+    } else {
+        control.write(true, 128); control.write(false, 128); // LAST reference
+        control.write(false, MODE_CONTEXTS[0][0]); // ZEROMV
+    }
+    let mut tokens = TestBoolWriter::new();
+    tokens.write(true, 128);
+    for bit in [true, true, false, true, true, false, false] { tokens.write(bit, 128); }
+    for _ in 0..24 { tokens.write(false, 128); } // Y2 DC4, EOB; no Y1 AC or UV
+    let control = control.finish();
+    let tag = ((control.len() as u32) << 5) | if key { 0x10 } else { 0x11 };
+    let mut frame = tag.to_le_bytes()[..3].to_vec();
+    if key { frame.extend([0x9d, 0x01, 0x2a, 16, 0, 16, 0]); }
+    frame.extend(control); frame.extend(tokens.finish()); frame
+}
+
+#[cfg(test)]
+pub(super) fn test_mixed_motion_interframe(state: &InterState, biases: [bool; 2],
+    requests: &[(u8, u8, u8)], refresh: [bool; 3], residual: bool)
+    -> (Vec<u8>, Vec<InterMacroblock>)
+{
+    assert_eq!(requests.len(), state.mb_width * state.mb_height);
+    let mut writer = TestBoolWriter::new();
+    writer.write(false, 128); // no segmentation, filtering or quantizer deltas
+    writer.write(false, 128); writer.literal(0, 6); writer.literal(0, 3);
+    writer.write(false, 128); writer.literal(0, 2); writer.literal(0, 7);
+    for _ in 0..5 { writer.write(false, 128); }
+    writer.write(refresh[1], 128); writer.write(refresh[2], 128);
+    for flag in [refresh[1], refresh[2]] { if !flag { writer.literal(0, 2); } }
+    for flag in biases { writer.write(flag, 128); }
+    writer.write(false, 128); writer.write(refresh[0], 128);
+    for probability in super::vp8_probs::COEFF_UPDATE_PROBS { writer.write(false, probability); }
+    writer.write(true, 128);
+    for _ in 0..4 { writer.literal(128, 8); }
+    writer.write(false, 128); writer.write(false, 128);
+    for probabilities in MV_UPDATE_PROBS { for p in probabilities { writer.write(false, p); } }
+    let component = |writer: &mut TestBoolWriter, value: i16, p: &[u8; 19]| {
+        let magnitude = value.unsigned_abs();
+        assert!(magnitude < 1024);
+        writer.write(magnitude >= 8, p[0]);
+        if magnitude >= 8 {
+            for bit in 0..3 { writer.write(magnitude & (1 << bit) != 0, p[9 + bit]); }
+            for bit in (4..=9).rev() { writer.write(magnitude & (1 << bit) != 0, p[9 + bit]); }
+            if magnitude >= 16 { writer.write(magnitude & 8 != 0, p[12]); }
+        } else {
+            writer.write(magnitude & 4 != 0, p[2]);
+            writer.write(magnitude & 2 != 0, p[3 + usize::from(magnitude >= 4) * 3]);
+            writer.write(magnitude & 1 != 0,
+                p[4 + usize::from(magnitude >= 4) * 3 + usize::from(magnitude & 2 != 0)]);
+        }
+        if magnitude != 0 { writer.write(value < 0, p[1]); }
+    };
+    let mut expected: Vec<InterMacroblock> = Vec::new();
+    for (index, &(reference, mode, partition)) in requests.iter().enumerate() {
+        let x = index % state.mb_width; let y = index / state.mb_width;
+        let (nearest, near, best, counts) = test_neighbor_oracle(&expected, x, y,
+            state.mb_width, state.mb_height, reference, biases);
+        writer.write(!residual, 128); writer.write(true, 128);
+        writer.write(reference != 1, 128);
+        if reference != 1 { writer.write(reference == 3, 128); }
+        writer.write(mode != 7, MODE_CONTEXTS[counts[0]][0]);
+        if mode != 7 {
+            writer.write(mode != 5, MODE_CONTEXTS[counts[1]][1]);
+            if mode != 5 {
+                writer.write(mode != 6, MODE_CONTEXTS[counts[2]][2]);
+                if mode != 6 { writer.write(mode == 9, MODE_CONTEXTS[counts[3]][3]); }
+            }
+        }
+        let mut mb = InterMacroblock { reference, mode, luma: mode,
+            skip_coefficients: !residual, ..Default::default() };
+        let vector = match mode {
+            5 => nearest, 6 => near, 7 => MotionVector::default(),
+            8 => {
+                let desired = MotionVector { row: [12, -8, 8, -12][index % 4],
+                    col: [-8, 16, -16, 8][index % 4] };
+                component(&mut writer, desired.row - best.row, &state.mv_probs[0]);
+                component(&mut writer, desired.col - best.col, &state.mv_probs[1]);
+                desired
+            }
+            9 => {
+                assert!(partition < 4);
+                writer.write(partition != 3, 110);
+                if partition != 3 {
+                    writer.write(partition != 2, 111);
+                    if partition != 2 { writer.write(partition == 1, 150); }
+                }
+                mb.split_partition = partition;
+                let pieces = [2, 2, 4, 16][partition as usize];
+                for piece in 0..pieces {
+                    let (row, col) = match partition {
+                        0 => (piece * 2, 0), 1 => (0, piece * 2),
+                        2 => (piece / 2 * 2, piece % 2 * 2), _ => (piece / 4, piece % 4),
+                    };
+                    let left = if col > 0 { mb.motion[row * 4 + col - 1] }
+                        else if x > 0 { expected[index - 1].motion[row * 4 + 3] }
+                        else { MotionVector::default() };
+                    let above = if row > 0 { mb.motion[(row - 1) * 4 + col] }
+                        else if y > 0 { expected[index - state.mb_width].motion[12 + col] }
+                        else { MotionVector::default() };
+                    let context = match (left == above, left == MotionVector::default(),
+                        above == MotionVector::default()) {
+                        (true, true, _) => 4, (true, false, _) => 3,
+                        (false, _, true) => 2, (false, true, false) => 1, _ => 0,
+                    };
+                    // First seed uses distinct NEW vectors; the final MB consumes
+                    // LEFT/ABOVE/ZERO/NEW submodes in addition to normalized best.
+                    let submode = if index == 0 { 3 } else { piece % 4 };
+                    let p = SUBMODE_PROBS[context];
+                    writer.write(submode != 0, p[0]);
+                    if submode != 0 { writer.write(submode != 1, p[1]); }
+                    if submode > 1 { writer.write(submode == 3, p[2]); }
+                    let vector = match submode {
+                        0 => left, 1 => above, 2 => MotionVector::default(),
+                        _ => {
+                            let desired = MotionVector { row: 4 + piece as i16, col: -12 + piece as i16 };
+                            component(&mut writer, desired.row - best.row, &state.mv_probs[0]);
+                            component(&mut writer, desired.col - best.col, &state.mv_probs[1]);
+                            desired
+                        }
+                    };
+                    for r in 0..4 { for c in 0..4 {
+                        let belongs = match partition { 0 => r / 2 == piece, 1 => c / 2 == piece,
+                            2 => (r / 2) * 2 + c / 2 == piece, _ => r * 4 + c == piece };
+                        if belongs { mb.motion[r * 4 + c] = vector; }
+                    } }
+                }
+                MotionVector::default()
+            }
+            _ => panic!("invalid test mode"),
+        };
+        if mode != 9 { mb.motion.fill(vector); }
+        expected.push(mb);
+    }
+    writer.literal(0xa6, 8);
+    let control = writer.finish();
+    let tag = ((control.len() as u32) << 5) | 0x11;
+    let mut frame = tag.to_le_bytes()[..3].to_vec(); frame.extend(control);
+    if !residual { frame.extend([0, 0]); }
+    (frame, expected)
 }
 
 #[cfg(test)]
@@ -1129,6 +1471,38 @@ mod tests {
         assert_eq!(nearest, MotionVector { row: -7, col: 2 });
         assert_eq!(best, nearest);
         assert_eq!(counts, [0, 2, 0, 2]);
+    }
+
+    #[test]
+    fn mixed_reference_weighting_bias_and_ties_match_independent_groups() {
+        let a = MotionVector { row: 7, col: -5 };
+        let b = MotionVector { row: -11, col: 9 };
+        let zero = MotionVector::default();
+        let patterns = [[a, b, zero], [a, a, b], [zero, a, b], [a, zero, b],
+            [a, b, a], [zero, zero, a], [a, MotionVector { row: -7, col: 5 }, zero]];
+        let mut cases = 0;
+        for flags in 0..4 { for target in 1..=3 {
+            let biases = [flags & 1 != 0, flags & 2 != 0];
+            for above in 1..=3 { for left in 1..=3 { for diagonal in 0..=3 {
+                for pattern in patterns { for split_mask in 0..8 {
+                    let mut decoded = vec![InterMacroblock::default(); 4];
+                    for (candidate, (position, reference, vector)) in [(1, above, pattern[0]),
+                        (3, left, pattern[1]), (0, diagonal, pattern[2])].into_iter().enumerate() {
+                        decoded[position].reference = reference;
+                        let split = split_mask & (1 << candidate) != 0;
+                        decoded[position].mode = if split { 9 } else { 8 };
+                        decoded[position].motion[0] = if split {
+                            MotionVector { row: 300, col: -300 }
+                        } else { vector };
+                        decoded[position].motion[15] = vector;
+                    }
+                    assert_eq!(near_vectors(&decoded, 1, 1, 3, 3, target, biases).unwrap(),
+                        test_neighbor_oracle(&decoded, 1, 1, 3, 3, target, biases));
+                    cases += 1;
+                } }
+            } } }
+        } }
+        assert_eq!(cases, 24192);
     }
 
     #[test]

@@ -39,6 +39,7 @@ impl Y4mStream {
     pub fn metadata(&self) -> Option<MediaMetadata> {
         let header = self.header?;
         Some(MediaMetadata {
+            presentation_size: None,
             duration: None,
             width: Some(header.width as u32),
             height: Some(header.height as u32),
@@ -89,6 +90,7 @@ impl Y4mStream {
             self.pending.drain(..header.frame_bytes);
             let timestamp = self.frame_index as f64 * header.fps_den as f64 / header.fps_num as f64;
             frames.push(VideoFrame {
+                presentation_size: None,
                 width: header.width as u32,
                 height: header.height as u32,
                 rgba: std::sync::Arc::new(rgba),

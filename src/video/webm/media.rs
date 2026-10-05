@@ -267,7 +267,15 @@ impl StreamingMediaDecoder for WebmMediaDecoder {
     }
 
     fn metadata(&self) -> Option<MediaMetadata> {
-        self.stream.metadata()
+        let mut metadata = self.stream.metadata()?;
+        if let Some(CodecDecoder::Vp8(decoder)) = &self.video {
+            metadata.presentation_size = decoder.presentation_size();
+            if let Some((width, height)) = decoder.coded_size() {
+                metadata.width = Some(width);
+                metadata.height = Some(height);
+            }
+        }
+        Some(metadata)
     }
 
     fn finish(&self) -> Result<(), MediaDecodeError> {
