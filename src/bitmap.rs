@@ -1,4 +1,4 @@
-//! Decode PNG, JPEG, GIF, WebP, and BMP images into premultiplied RGBA8.
+//! Decode PNG, JPEG, JPEG XL, GIF, WebP, and BMP into premultiplied RGBA8.
 
 pub mod jpeg_xl;
 

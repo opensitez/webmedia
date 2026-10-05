@@ -1,5 +1,26 @@
 # VP8 and VP9 Fixtures
 
+`vp8-opus-startup.webm` is a 6,174-byte synthetic audio/video fixture for
+playback startup, failure, and clock handoff tests. It contains a 32x32 red
+picture and a 440 Hz tone, with stereo 48 kHz Opus and two VP8 pictures.
+The FFmpeg binary generated the fixture; tests use the in-house decoders and
+do not require FFmpeg at runtime. Regenerate from this directory with:
+
+```sh
+ffmpeg -hide_banner -loglevel error \
+  -f lavfi -i color=c=red:s=32x32:r=10:d=0.2 \
+  -f lavfi -i sine=frequency=440:sample_rate=48000:duration=0.2 \
+  -c:v libvpx -deadline best -cpu-used 0 -b:v 20k -g 2 \
+  -c:a libopus -application audio -b:a 192k -vbr off \
+  -frame_duration 20 -ac 2 -shortest -n vp8-opus-startup.webm
+```
+
+`vp8-empty-opus-track.webm` contains the same two VP8 pictures and a declared
+stereo Opus track with no audio packets (802 bytes). It checks that empty audio
+does not stall video or cause fabricated PCM. Generate it with the command
+above, adding `-af aselect=0` and replacing `-shortest` with `-t 0.2`, using
+`vp8-empty-opus-track.webm` as the output name.
+
 `vp8-motion.webm` and `vp8-motion.yuv` exercise VP8 keyframes, interframe
 references, mode-dependent filter deltas, and zero-level deblocking. All 60
 displayed frames are compared pixel-exactly against the reference decoded by
@@ -202,3 +223,12 @@ ffmpeg -f lavfi -i testsrc=size=162x98:rate=15 -frames:v 30 \
 ffmpeg -i vp9-edges.webm -vf 'select=eq(n\,0)+eq(n\,5)+eq(n\,29)' \
   -fps_mode passthrough -pix_fmt yuv420p -f rawvideo -y vp9-edges-check.yuv
 ```
+# JPEG XL
+
+`jxl-alpha.png` is the webcore interlaced RGBA regression fixture.
+`jxl-alpha.jxl` is its lossless JPEG XL encoding, generated with
+`cjxl jxl-alpha.png jxl-alpha.jxl --distance=0 --effort=3` (libjxl 0.12.0).
+The PNG is the independent pixel oracle for incremental JPEG XL decoding.
+`jxl-progressive.jxl` encodes the same image with `--distance=1 --effort=3
+--progressive --container=1 --num_threads=1`, exercising progressive VarDCT
+pixels and JPEG XL container detection.
