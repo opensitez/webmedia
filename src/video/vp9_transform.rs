@@ -492,30 +492,35 @@ pub(super) fn add_inter_residual(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn inverse_dct_32x32(coefficients: &[i32], bit_depth: u8, dc_index: i32, ac_index: i32) -> [i32; 1024] {
     let mut dequant = [0i32; 1024];
     inverse_transform_square(&mut dequant, coefficients, 32, bit_depth, dc_index, ac_index, 0);
     dequant
 }
 
+#[cfg(test)]
 pub(super) fn inverse_dct_16x16(coefficients: &[i32], bit_depth: u8, dc_index: i32, ac_index: i32) -> [i32; 256] {
     let mut dequant = [0i32; 256];
     inverse_transform_square(&mut dequant, coefficients, 16, bit_depth, dc_index, ac_index, 0);
     dequant
 }
 
+#[cfg(test)]
 pub(super) fn inverse_dct_8x8(coefficients: &[i32], bit_depth: u8, dc_index: i32, ac_index: i32) -> [i32; 64] {
     let mut dequant = [0i32; 64];
     inverse_transform_square(&mut dequant, coefficients, 8, bit_depth, dc_index, ac_index, 0);
     dequant
 }
 
+#[cfg(test)]
 pub(super) fn inverse_dct_4x4(coefficients: &[i32], bit_depth: u8, dc_index: i32, ac_index: i32) -> [i32; 16] {
     let mut dequant = [0i32; 16];
     inverse_transform_square(&mut dequant, coefficients, 4, bit_depth, dc_index, ac_index, 0);
     dequant
 }
 
+#[cfg(test)]
 pub(super) fn reconstruct_32x32_intra(
     plane: &mut Plane,
     x: usize,
@@ -552,6 +557,7 @@ pub(super) fn reconstruct_32x32_intra(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn reconstruct_16x16_intra(
     plane: &mut Plane,
     x: usize,
@@ -585,6 +591,7 @@ pub(super) fn reconstruct_16x16_intra(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn reconstruct_8x8_intra(
     plane: &mut Plane,
     x: usize,
@@ -618,6 +625,7 @@ pub(super) fn reconstruct_8x8_intra(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn reconstruct_4x4_intra(
     plane: &mut Plane,
     x: usize,

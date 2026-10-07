@@ -123,6 +123,7 @@ pub(super) fn use_high_precision(reference_mv: (i32, i32)) -> bool {
     (reference_mv.0.unsigned_abs() >> 3) < 8 && (reference_mv.1.unsigned_abs() >> 3) < 8
 }
 
+#[cfg(test)]
 pub(super) fn read_motion_difference(
     bits: &mut BoolDecoder<'_>,
     probabilities: &InterframeProbabilities,

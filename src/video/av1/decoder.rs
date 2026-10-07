@@ -168,19 +168,19 @@ impl Av1Decoder {
         let initial = (old_lifecycle || store_reference && header.disable_frame_end_update_cdf)
             .then(|| tile.save_cdfs());
         #[cfg(not(test))]
-        tile.run()?;
+        tile.run_tiles_with_observer(&tiles, |_, _| {})?;
         #[cfg(test)]
         if super::profile::enabled() {
             let mut last = std::time::Instant::now();
             let mut stage = 0;
-            tile.run_with_observer(|_, _| {
+            tile.run_tiles_with_observer(&tiles, |_, _| {
                 let now = std::time::Instant::now();
                 super::profile::record_stage(stage, now.duration_since(last).as_nanos());
                 last = now;
                 stage += 1;
             })?;
         } else {
-            tile.run()?;
+            tile.run_tiles_with_observer(&tiles, |_, _| {})?;
         }
         let saved = if old_lifecycle || store_reference {
             let mut cdfs = if header.disable_frame_end_update_cdf {
@@ -259,7 +259,7 @@ pub fn decode_intra_frame(
 ) -> Result<DecodedIntraFrame, Error> {
     let coded = CodedIntraFrame::parse(obu, sequence)?;
     let mut tile = IntraTile::new(sequence, &coded.header, coded.tiles[0].1)?;
-    tile.run()?;
+    tile.run_tiles_with_observer(&coded.tiles, |_, _| {})?;
     let planes = tile.finish_planes();
     Ok(DecodedIntraFrame {
         header: coded.header,
@@ -277,13 +277,86 @@ pub fn inspect_intra_decode(
 ) -> Result<IntraDecodeProgress, Error> {
     let coded = CodedIntraFrame::parse(obu, sequence)?;
     let mut tile = IntraTile::new(sequence, &coded.header, coded.tiles[0].1)?;
-    tile.progress.stopped = tile.run().err();
+    tile.progress.stopped = tile.run_tiles_with_observer(&coded.tiles, |_, _| {}).err();
     Ok(tile.progress)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires AV1_TILE_OBU and AV1_TILE_YUV_ORACLE (native 8-bit planar samples)"]
+    fn local_intra_tiles_match_independent_decoder() {
+        let bytes = std::fs::read(std::env::var_os("AV1_TILE_OBU").unwrap()).unwrap();
+        let expected = std::fs::read(std::env::var_os("AV1_TILE_YUV_ORACLE").unwrap()).unwrap();
+        assert_intra_tiles_match(&bytes, &expected);
+    }
+
+    #[test]
+    fn four_intra_tiles_match_independent_decoder() {
+        assert_intra_tiles_match(
+            include_bytes!("../../../tests/fixtures/avif-four-tiles.obu"),
+            include_bytes!("../../../tests/fixtures/avif-four-tiles.yuv"),
+        );
+    }
+
+    fn assert_intra_tiles_match(bytes: &[u8], expected: &[u8]) {
+        let mut stream = super::super::ObuStream::new();
+        let mut decoder = Av1Decoder::new();
+        let mut output = None;
+        for obu in stream.push(bytes).unwrap() {
+            if let Some(frame) = decoder.decode_obu(&obu).unwrap() { output = Some(frame); }
+        }
+        let frame = output.expect("display frame");
+        assert!(frame.header.tiles.count() > 1);
+        assert_eq!(frame.bit_depth, 8);
+        let mut offset = 0;
+        for (number, plane) in frame.planes.iter().enumerate() {
+            for row in 0..plane.height {
+                let actual = &plane.samples[row * plane.stride..][..plane.width];
+                let reference = expected.get(offset..offset + plane.width).expect("oracle length");
+                assert_eq!(actual.iter().zip(reference).position(|(&a, &b)| a != u16::from(b)),
+                    None, "plane {number}, row {row}");
+                offset += plane.width;
+            }
+        }
+        assert_eq!(offset, expected.len());
+    }
+
+    #[test]
+    fn superblock_128_pixels_match_independent_decoder() {
+        let coded = include_bytes!("../../../tests/fixtures/avif-128.obu");
+        let expected = include_bytes!("../../../tests/fixtures/avif-128.yuv");
+        let mut stream = super::super::ObuStream::new();
+        let mut decoder = Av1Decoder::new();
+        let mut output = None;
+        for obu in stream.push(coded).unwrap() {
+            if obu.kind == 6 {
+                let sequence = decoder.sequence.as_ref().expect("sequence header");
+                let frame = CodedIntraFrame::parse(&obu, sequence).unwrap();
+                assert!(!frame.header.allow_screen_content_tools && !frame.header.allow_intrabc
+                    && !frame.header.segmentation_enabled && frame.header.quantizer_matrix_levels.is_none(),
+                    "unexpected fixture tools: {:?}", frame.header);
+            }
+            if let Some(frame) = decoder.decode_obu(&obu).unwrap() { output = Some(frame); }
+        }
+        let frame = output.expect("display frame");
+        assert!(frame.sequence.use_128x128_superblock);
+        assert_eq!((frame.header.width, frame.header.height), (256,192));
+        let mut offset = 0;
+        for plane in &frame.planes {
+            for row in 0..plane.height {
+                let actual = &plane.samples[row * plane.stride..][..plane.width];
+                let expected = &expected[offset..][..plane.width];
+                let mismatch = actual.iter().zip(expected).position(|(&a,&b)| a != u16::from(b));
+                assert_eq!(mismatch, None,
+                    "plane offset {offset}, row {row}, samples {:?}", mismatch.map(|x| (actual[x], expected[x])));
+                offset += plane.width;
+            }
+        }
+        assert_eq!(offset, expected.len());
+    }
 
     #[test]
     #[ignore = "later-clip phase distributions; requires AV1_STREAM_OBU"]

@@ -45,6 +45,12 @@ impl VideoFrame {
     pub fn display_dimensions(&self) -> (u32, u32) {
         presentation_dimensions(self.presentation_size).unwrap_or((self.width, self.height))
     }
+
+    #[cfg(feature = "acceleration")]
+    pub fn surface(&self) -> Result<crate::RgbaSurface, crate::InvalidRgbaSurface> {
+        crate::RgbaSurface::new(self.rgba.clone(), self.width, self.height)
+            .map(|surface| surface.with_presentation_size(presentation_dimensions(self.presentation_size)))
+    }
 }
 
 impl MediaMetadata {
@@ -110,6 +116,22 @@ pub struct NullMediaDecoder;
 #[cfg(test)]
 mod presentation_tests {
     use super::*;
+
+    #[cfg(feature = "acceleration")]
+    #[test]
+    fn video_surface_shares_frame_pixels_and_preserves_display_extent() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<crate::RgbaSurface>();
+        let frame = VideoFrame { presentation_size: Some((5.0 / 3.0, 2.5)),
+            width: 1, height: 2, rgba: std::sync::Arc::new(vec![0; 8]), timestamp: 1. }; 
+        let surface = frame.surface().unwrap();
+        assert!(std::sync::Arc::ptr_eq(surface.pixels(), &frame.rgba));
+        assert_eq!(surface.dimensions(), (1, 2));
+        assert_eq!(surface.display_dimensions(), (2, 3));
+        let mut invalid = frame;
+        invalid.width = u32::MAX;
+        assert!(invalid.surface().is_err());
+    }
 
     #[test]
     fn presentation_extent_rounds_without_changing_coded_size_and_rejects_invalid_values() {

@@ -9,10 +9,28 @@ use super::h264::{
 use super::h264_high::decode_cabac_idr_2005;
 use super::h264_high::{Yuv420Picture, decode_cabac_i_yuv_2005, decode_cabac_idr_yuv_2005};
 use super::h264_inter::{decode_cabac_b_2005, decode_cabac_p_2005};
-use super::mp4::{Mp4Error, Mp4Index};
+use super::mp4::{Mp4Error, Mp4Index, Sample};
 
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FRAMES_PER_PUSH: usize = 4;
+const MAX_DYNAMIC_SAMPLES: usize = 1_000_000;
+
+fn fragmented_dpb_capacity(sps: &super::h264::SequenceParameters) -> Result<usize, MediaDecodeError> {
+    // ITU-T H.264 Table A-1 / A.3: coded macroblocks, not cropped pixels or
+    // max_num_ref_frames. Missing level-1b constraint flags conservatively use
+    // the larger level-1.1 bound rather than releasing pictures too early.
+    let max_mbs: u32 = match sps.level_idc {
+        9 | 10 => 396, 11 => 900, 12 | 13 | 20 => 2376, 21 => 4752,
+        22 | 30 => 8100, 31 => 18000, 32 => 20480, 40 | 41 => 32768,
+        42 => 34816, 50 => 110400, 51 | 52 => 184320, 60..=62 => 696320,
+        _ => return Err(MediaDecodeError::Unsupported),
+    };
+    let picture_mbs = sps.width_mbs.checked_mul(sps.frame_height_mbs)
+        .filter(|size| *size != 0).ok_or_else(|| Mp4AvcStream::invalid("invalid coded picture size"))?;
+    let capacity = (max_mbs / picture_mbs).min(16);
+    if capacity == 0 { return Err(Mp4AvcStream::invalid("picture exceeds level DPB size")); }
+    Ok(capacity as usize)
+}
 
 #[derive(Default)]
 pub struct Mp4AvcStream {
@@ -27,12 +45,18 @@ pub struct Mp4AvcStream {
     dropped_nonreference_samples: usize,
     dropped_until_idr_samples: usize,
     waiting_for_idr: bool,
+    fragmented: bool,
+    input_finished: bool,
+    reorder_capacity: usize,
+    last_presented_pts: Option<i64>,
 }
 
 /// Access-unit input for container demuxers. Uses the same decode/reference/reorder
 /// machinery as incremental file input, without retaining container bytes.
 pub struct Mp4AvcPackets {
     stream: Mp4AvcStream,
+    sample_base: usize,
+    requires_keyframe: bool,
 }
 
 impl Mp4AvcPackets {
@@ -58,7 +82,70 @@ impl Mp4AvcPackets {
                 next_sample: start,
                 ..Mp4AvcStream::default()
             },
+            sample_base: 0,
+            requires_keyframe: false,
         })
+    }
+
+    pub fn new_fragmented(mut index: Mp4Index, start: usize) -> Result<Self, MediaDecodeError> {
+        let capacity = fragmented_dpb_capacity(index.config.sequence_parameters.first()
+            .ok_or(MediaDecodeError::Unsupported)?)?;
+        index.samples.clear();
+        let mut packets = Self::with_start_sample(index, 0)?;
+        packets.sample_base = start;
+        packets.requires_keyframe = true;
+        packets.stream.fragmented = true;
+        packets.stream.reorder_capacity = capacity;
+        Ok(packets)
+    }
+
+    pub fn update_samples(&mut self, samples: &[Sample], duration_ticks: u64) -> Result<(), MediaDecodeError> {
+        if self.stream.input_finished { return Err(Mp4AvcStream::invalid("samples after EOF")); }
+        let index = self.stream.index.as_mut().unwrap();
+        let supplied = samples.get(self.sample_base..)
+            .ok_or_else(|| Mp4AvcStream::invalid("missing restart prefix"))?;
+        if supplied.len() > MAX_DYNAMIC_SAMPLES || !supplied.starts_with(&index.samples) {
+            return Err(Mp4AvcStream::invalid("MP4 sample table is not append-only"));
+        }
+        index.samples.extend_from_slice(&supplied[index.samples.len()..]);
+        index.duration_ticks = duration_ticks;
+        self.stream.future_min_pts.clear();
+        Ok(())
+    }
+
+    pub fn push_sample(&mut self, number: usize, sample: Sample, data: &[u8]) -> Result<Vec<VideoFrame>, MediaDecodeError> {
+        let local = number.checked_sub(self.sample_base)
+            .ok_or_else(|| Mp4AvcStream::invalid("sample precedes restart"))?;
+        if self.stream.input_finished || local != self.stream.next_sample
+            || data.len() != sample.size as usize || data.len() > MAX_BUFFER_BYTES
+            || (self.requires_keyframe && !sample.keyframe)
+            || sample.offset.checked_add(u64::from(sample.size)).is_none() {
+            return Err(Mp4AvcStream::invalid("invalid fragmented AVC access unit"));
+        }
+        let index = self.stream.index.as_mut().unwrap();
+        if let Some(known) = index.samples.get(local) {
+            if known != &sample { return Err(Mp4AvcStream::invalid("conflicting sample metadata")); }
+        } else if self.stream.fragmented && local == index.samples.len() && index.samples.len() < MAX_DYNAMIC_SAMPLES {
+            if index.samples.last().is_some_and(|last| sample.decode_time < last.decode_time) {
+                return Err(Mp4AvcStream::invalid("nonmonotonic decode time"));
+            }
+            index.samples.push(sample);
+        } else { return Err(Mp4AvcStream::invalid("missing or excessive sample metadata")); }
+        let frames = self.push(number, data)?;
+        self.requires_keyframe = false;
+        Ok(frames)
+    }
+
+    /// Repeat until empty to drain the bounded reorder tail at definitive EOF.
+    pub fn finish_input(&mut self) -> Result<Vec<VideoFrame>, MediaDecodeError> {
+        if let Some(error) = &self.stream.decode_error { return Err(error.clone()); }
+        if self.stream.next_sample != self.stream.index.as_ref().unwrap().samples.len() {
+            return Err(Mp4AvcStream::invalid("EOF before all samples decoded"));
+        }
+        self.stream.input_finished = true;
+        let mut frames = Vec::new();
+        self.stream.drain_presentable(&mut frames)?;
+        Ok(frames)
     }
 
     pub fn push(
@@ -66,7 +153,7 @@ impl Mp4AvcPackets {
         sample_number: usize,
         data: &[u8],
     ) -> Result<Vec<VideoFrame>, MediaDecodeError> {
-        if sample_number != self.stream.next_sample {
+        if self.stream.input_finished || sample_number.checked_sub(self.sample_base) != Some(self.stream.next_sample) {
             return Err(Mp4AvcStream::invalid("out-of-order AVC access unit"));
         }
         let sample = self
@@ -75,7 +162,7 @@ impl Mp4AvcPackets {
             .as_ref()
             .unwrap()
             .samples
-            .get(sample_number)
+            .get(self.stream.next_sample)
             .ok_or_else(|| Mp4AvcStream::invalid("access unit beyond sample table"))?;
         if data.len() != sample.size as usize || data.len() > MAX_BUFFER_BYTES {
             return Err(Mp4AvcStream::invalid("access unit size mismatch"));
@@ -124,14 +211,25 @@ impl Mp4AvcStream {
             .insert(position, (presentation_time, frame));
     }
 
-    fn drain_presentable(&mut self, frames: &mut Vec<VideoFrame>) {
-        let next_time = self.future_min_pts[self.next_sample];
-        let ready = self
-            .pending_pictures
-            .partition_point(|(time, _)| *time <= next_time);
+    fn drain_presentable(&mut self, frames: &mut Vec<VideoFrame>) -> Result<(), MediaDecodeError> {
+        let ready = if self.fragmented {
+            let count = if self.input_finished { self.pending_pictures.len() }
+                else { self.pending_pictures.len().saturating_sub(self.reorder_capacity) };
+            count.min(MAX_FRAMES_PER_PUSH.saturating_sub(frames.len()))
+        } else {
+            let next_time = self.future_min_pts.get(self.next_sample).copied().unwrap_or(i64::MAX);
+            self.pending_pictures.partition_point(|(time, _)| *time <= next_time)
+        };
+        if self.fragmented && ready != 0 {
+            if self.last_presented_pts.is_some_and(|last| self.pending_pictures[0].0 < last) {
+                return Err(Self::invalid("presentation order exceeds fragmented DPB bound"));
+            }
+            self.last_presented_pts = Some(self.pending_pictures[ready - 1].0);
+        }
         for (_, frame) in self.pending_pictures.drain(..ready) {
             frames.push(frame);
         }
+        Ok(())
     }
 
     fn decode_sample(
@@ -349,7 +447,7 @@ impl StreamingVideoDecoder for Mp4AvcStream {
                 Err(error) => return Err(Self::invalid(error)),
             }
         }
-        if self.future_min_pts.is_empty() {
+        if !self.fragmented && self.future_min_pts.is_empty() {
             let index = self.index.as_ref().unwrap();
             self.future_min_pts = vec![i64::MAX; index.samples.len() + 1];
             for sample in (0..index.samples.len()).rev() {
@@ -409,7 +507,7 @@ impl StreamingVideoDecoder for Mp4AvcStream {
                     }
                     self.dropped_nonreference_samples += 1;
                     self.next_sample += 1;
-                    self.drain_presentable(&mut frames);
+                    self.drain_presentable(&mut frames)?;
                     continue;
                 }
                 Err(error) if self.next_sample + 1 < self.index.as_ref().unwrap().samples.len() => {
@@ -466,7 +564,7 @@ impl StreamingVideoDecoder for Mp4AvcStream {
                 }
             }
             self.queue_picture(presentation_time, frame);
-            self.drain_presentable(&mut frames);
+            self.drain_presentable(&mut frames)?;
         }
         self.discard_consumed_prefix();
         Ok(frames)
@@ -477,7 +575,7 @@ impl StreamingVideoDecoder for Mp4AvcStream {
         let sps = index.config.sequence_parameters.first()?;
         Some(MediaMetadata {
             presentation_size: None,
-            duration: Some(index.duration_ticks as f32 / index.timescale as f32),
+            duration: (index.duration_ticks != 0).then_some(index.duration_ticks as f32 / index.timescale as f32),
             width: Some(sps.width),
             height: Some(sps.height),
             sample_rate: None,
@@ -491,6 +589,7 @@ impl StreamingVideoDecoder for Mp4AvcStream {
             .as_ref()
             .is_some_and(|index| self.next_sample == index.samples.len())
             && self.pending_pictures.is_empty()
+            && (!self.fragmented || self.input_finished)
         {
             Ok(())
         } else {
@@ -514,6 +613,114 @@ mod tests {
         AvcConfig, parse_cabac_idr_i_slice, parse_cabac_inter_slice, parse_pps_2005, parse_sps,
         type0_pic_order_count,
     };
+
+    fn fragmented_packet_fixture() -> (Mp4Index, Vec<u8>) {
+        let sps = parse_sps(&[0x67, 0x42, 0x00, 0x0a, 0xf4, 0xf2]).unwrap();
+        let mut nal = vec![0x65, 0xb8, 0x40, 0xa0, 0xd0];
+        nal.extend([235; 256]);
+        nal.extend([128; 128]);
+        nal.push(0x80);
+        let mut data = (nal.len() as u32).to_be_bytes().to_vec();
+        data.extend(nal);
+        let index = Mp4Index {
+            timescale: 1000, duration_ticks: 1000,
+            config: AvcConfig {
+                nal_length_size: 4, sequence_parameters: vec![sps],
+                picture_parameter_sets: vec![vec![0x68, 0xce, 0x3c, 0x80]],
+            },
+            samples: vec![Sample { offset: 0, size: data.len() as u32,
+                decode_time: 0, presentation_time: 0, keyframe: true }],
+        };
+        (index, data)
+    }
+
+    #[test]
+    fn fragmented_avc_future_epoch_holds_and_drains_exact_classic_pixels() {
+        let (index, data) = fragmented_packet_fixture();
+        let mut classic = Mp4AvcPackets::new(index.clone()).unwrap();
+        let expected = classic.push(0, &data).unwrap();
+        assert_eq!(expected.len(), 1);
+        assert!(classic.finish_input().unwrap().is_empty());
+        assert!(classic.finish_input().unwrap().is_empty());
+
+        let mut fragmented = Mp4AvcPackets::new_fragmented(index.clone(), 50_000).unwrap();
+        assert!(fragmented.stream.index.as_ref().unwrap().samples.is_empty());
+        let mut not_key = index.samples[0].clone();
+        not_key.keyframe = false;
+        assert!(fragmented.push_sample(50_000, not_key, &data).is_err());
+        assert!(fragmented.push_sample(49_999, index.samples[0].clone(), &data).is_err());
+        assert!(fragmented.push_sample(50_000, index.samples[0].clone(), &data).unwrap().is_empty());
+        assert_eq!(fragmented.finish_input().unwrap(), expected);
+        assert!(fragmented.finish_input().unwrap().is_empty());
+        fragmented.finish().unwrap();
+        assert!(fragmented.push_sample(50_001, index.samples[0].clone(), &data).is_err());
+    }
+
+    #[test]
+    fn fragmented_avc_conflicting_known_metadata_is_rejected_before_decode() {
+        let (index, data) = fragmented_packet_fixture();
+        let mut packets = Mp4AvcPackets::new_fragmented(index.clone(), 0).unwrap();
+        packets.update_samples(&index.samples, 0).unwrap();
+        let mut conflicting = index.samples[0].clone();
+        conflicting.presentation_time += 1;
+        assert!(packets.push_sample(0, conflicting, &data).is_err());
+        assert_eq!(packets.stream.next_sample, 0);
+        assert!(packets.finish_input().is_err());
+        assert!(packets.push_sample(0, index.samples[0].clone(), &data).unwrap().is_empty());
+        assert_eq!(packets.finish_input().unwrap().len(), 1);
+        assert!(packets.update_samples(&index.samples, 1000).is_err());
+    }
+
+    #[test]
+    fn fragmented_avc_dpb_hold_eof_batches_and_monotonic_presentation() {
+        let (index, _) = fragmented_packet_fixture();
+        let mut packets = Mp4AvcPackets::new_fragmented(index.clone(), 0).unwrap();
+        // Tiny pictures allow sixteen frames even though this SPS uses fewer references.
+        assert_eq!(packets.stream.reorder_capacity, 16);
+        let mut delivered = Vec::new();
+        for time in [0, 100, 60, 40, 80] {
+            packets.stream.queue_picture(time, VideoFrame {
+                presentation_size: None, width: 1, height: 1,
+                rgba: std::sync::Arc::new(vec![time as u8, 0, 0, 255]),
+                timestamp: time as f32 / 1000.0,
+            });
+            packets.stream.drain_presentable(&mut delivered).unwrap();
+            assert!(delivered.is_empty());
+        }
+        let first = packets.finish_input().unwrap();
+        assert_eq!(first.iter().map(|f| f.timestamp).collect::<Vec<_>>(), [0.0, 0.04, 0.06, 0.08]);
+        let last = packets.finish_input().unwrap();
+        assert_eq!(last.iter().map(|f| f.timestamp).collect::<Vec<_>>(), [0.1]);
+        assert!(packets.finish_input().unwrap().is_empty());
+
+        let mut bounded = Mp4AvcPackets::new_fragmented(index, 0).unwrap();
+        bounded.stream.reorder_capacity = 1;
+        for time in [20, 30] {
+            bounded.stream.queue_picture(time, VideoFrame { presentation_size: None,
+                width: 1, height: 1, rgba: std::sync::Arc::new(vec![0; 4]), timestamp: time as f32 });
+        }
+        bounded.stream.drain_presentable(&mut delivered).unwrap();
+        assert_eq!(delivered.len(), 1);
+        bounded.stream.queue_picture(10, delivered[0].clone());
+        assert!(bounded.stream.drain_presentable(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn fragmented_avc_dpb_uses_coded_macroblocks_not_reference_count() {
+        let mut sps = fragmented_packet_fixture().0.config.sequence_parameters.remove(0);
+        sps.level_idc = 40;
+        sps.width_mbs = 120;
+        sps.frame_height_mbs = 68;
+        sps.max_num_ref_frames = 1;
+        assert_eq!(fragmented_dpb_capacity(&sps).unwrap(), 4);
+        sps.max_num_ref_frames = 16;
+        assert_eq!(fragmented_dpb_capacity(&sps).unwrap(), 4);
+        sps.width_mbs = 1;
+        sps.frame_height_mbs = 1;
+        assert_eq!(fragmented_dpb_capacity(&sps).unwrap(), 16);
+        sps.width_mbs = 0;
+        assert!(fragmented_dpb_capacity(&sps).is_err());
+    }
 
     #[test]
     #[ignore = "set WEBMEDIA_AAC_MP4 to an AVC MP4 fixture"]
@@ -588,7 +795,7 @@ mod tests {
                 },
             );
             decoder.next_sample += 1;
-            decoder.drain_presentable(&mut delivered);
+            decoder.drain_presentable(&mut delivered).unwrap();
         }
         assert_eq!(
             delivered

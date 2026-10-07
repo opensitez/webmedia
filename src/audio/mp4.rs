@@ -174,10 +174,10 @@ impl Mp4AacDecoder {
         } else {
             0
         };
-        let end_ticks = i128::from(self.duration_ticks) - i128::from(presentation_time);
-        let end = usize::try_from((end_ticks * rate / scale).max(0))
-            .unwrap_or(usize::MAX)
-            .min(samples.samples.len() / channels);
+        // Fragment initialization can advertise zero before any media is known.
+        // That is not a zero-length presentation; priming still applies below.
+        let end = presentation_end(self.duration_ticks, presentation_time, rate, scale,
+            samples.samples.len() / channels);
         if start >= end {
             return Ok(None);
         }
@@ -189,6 +189,12 @@ impl Mp4AacDecoder {
             + start as f64 / f64::from(samples.sample_rate);
         Ok(Some(AacAudioPacket { timestamp, samples }))
     }
+}
+
+fn presentation_end(duration: u64, time: i64, rate: i128, scale: i128, frames: usize) -> usize {
+    if duration == 0 { return frames; }
+    let ticks = i128::from(duration) - i128::from(time);
+    usize::try_from((ticks * rate / scale).max(0)).unwrap_or(usize::MAX).min(frames)
 }
 
 impl Mp4AacStream {
@@ -243,6 +249,13 @@ fn mp4_error(error: Mp4Error) -> MediaDecodeError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_fragment_duration_preserves_pcm_end_and_known_duration_trims() {
+        assert_eq!(super::presentation_end(0, 4096, 22050, 22050, 1024), 1024);
+        assert_eq!(super::presentation_end(0, -512, 22050, 22050, 1024), 1024);
+        assert_eq!(super::presentation_end(4608, 4096, 22050, 22050, 1024), 512);
+        assert_eq!(super::presentation_end(4096, 4096, 22050, 22050, 1024), 0);
+    }
     use super::*;
 
     #[test]

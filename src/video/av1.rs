@@ -20,6 +20,10 @@ mod inter;
 mod inter_tables;
 #[path = "av1/intra.rs"]
 mod intra;
+#[path = "av1/palette.rs"]
+mod palette;
+#[path = "av1/palette_tables.rs"]
+mod palette_tables;
 #[path = "av1/motion.rs"]
 mod motion;
 #[path = "av1/motion_tables.rs"]

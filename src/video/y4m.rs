@@ -212,6 +212,17 @@ fn convert_frame(data: &[u8], header: Header) -> Vec<u8> {
         height
     };
     let chroma_size = chroma_width * chroma_height;
+    #[cfg(feature = "acceleration")]
+    if header.chroma == Chroma::C420 {
+        use accelerate::video::{LumaPolicy, Plane, YuvMatrix, yuv420_to_rgba};
+        return yuv420_to_rgba(
+            width, height,
+            Plane { data: &data[..y_size], stride: width },
+            Plane { data: &data[y_size..y_size + chroma_size], stride: chroma_width },
+            Plane { data: &data[y_size + chroma_size..y_size + 2 * chroma_size], stride: chroma_width },
+            YuvMatrix::Bt601, LumaPolicy::Clamped,
+        ).expect("validated Y4M planes must cover the visible frame");
+    }
     let mut rgba = vec![0; y_size * 4];
     for y in 0..height {
         for x in 0..width {
@@ -287,6 +298,33 @@ mod tests {
                 .is_err()
         );
         assert!(Y4mStream::new().push(b"YUV4MPEG2 W2 H2 F0:1\n").is_err());
+    }
+
+    #[test]
+    fn production_yuv420_matches_clamped_reference_for_odd_rows_and_tails() {
+        for width in [1_usize, 7, 8, 15, 16, 17, 33] {
+            for height in [1_usize, 3, 6] {
+                let y_size = width * height;
+                let chroma_width = width.div_ceil(2);
+                let chroma_size = chroma_width * height.div_ceil(2);
+                let data: Vec<_> = (0..y_size + 2 * chroma_size).map(|i| (i * 53 + 7) as u8).collect();
+                let header = Header { width, height, fps_num: 30, fps_den: 1, chroma: Chroma::C420, frame_bytes: data.len() };
+                let actual = convert_frame(&data, header);
+                for y in 0..height {
+                    for x in 0..width {
+                        let c = (i32::from(data[y * width + x]) - 16).max(0) * 298;
+                        let uv = y / 2 * chroma_width + x / 2;
+                        let u = i32::from(data[y_size + uv]) - 128;
+                        let v = i32::from(data[y_size + chroma_size + uv]) - 128;
+                        assert_eq!(&actual[(y * width + x) * 4..][..4], &[
+                            ((c + 409 * v + 128) >> 8).clamp(0, 255) as u8,
+                            ((c - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8,
+                            ((c + 516 * u + 128) >> 8).clamp(0, 255) as u8, 255,
+                        ], "{width}x{height} at {x},{y}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

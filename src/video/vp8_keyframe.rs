@@ -142,16 +142,31 @@ impl YuvKeyFrame {
     }
 
     pub(super) fn rgba_with_matrix(&self, matrix: YuvMatrix) -> Vec<u8> {
+        #[cfg(feature = "acceleration")]
+        {
+            use accelerate::video::{LumaPolicy, Plane, YuvMatrix as Matrix, yuv420_to_rgba};
+            return yuv420_to_rgba(
+                self.width, self.height,
+                Plane { data: &self.y.pixels, stride: self.y.width },
+                Plane { data: &self.u.pixels, stride: self.u.width },
+                Plane { data: &self.v.pixels, stride: self.v.width },
+                match matrix { YuvMatrix::Bt601 => Matrix::Bt601, YuvMatrix::Bt709 => Matrix::Bt709 },
+                LumaPolicy::Unclamped,
+            ).expect("decoded VPx planes must cover the visible frame");
+        }
+        #[cfg(not(feature = "acceleration"))]
         match matrix {
             YuvMatrix::Bt601 => self.rgba_row_pairs::<true>(),
             YuvMatrix::Bt709 => self.rgba_row_pairs_matrix::<true, true>(),
         }
     }
 
+    #[cfg(any(test, not(feature = "acceleration")))]
     fn rgba_row_pairs<const VECTOR: bool>(&self) -> Vec<u8> {
         self.rgba_row_pairs_matrix::<VECTOR, false>()
     }
 
+    #[cfg(any(test, not(feature = "acceleration")))]
     fn rgba_row_pairs_matrix<const VECTOR: bool, const BT709: bool>(&self) -> Vec<u8> {
         let mut rgba = vec![0; self.width * self.height * 4];
         if self.width == 0 { return rgba; }
@@ -180,6 +195,7 @@ impl YuvKeyFrame {
     }
 }
 
+#[cfg(any(test, not(feature = "acceleration")))]
 fn rgba_two_rows_scalar<const BT709: bool>(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
     first_target: &mut [u8], second_target: &mut [u8], start: usize)
 {
@@ -218,6 +234,7 @@ unsafe fn rgba_two_rows_neon(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(any(test, not(feature = "acceleration")))]
 #[target_feature(enable = "neon")]
 unsafe fn rgba_two_rows_neon_matrix<const BT709: bool>(first: &[u8], second: &[u8], cb: &[u8], cr: &[u8],
     first_target: &mut [u8], second_target: &mut [u8]) -> usize
@@ -277,6 +294,7 @@ unsafe fn rgba_row_neon(luma: &[u8], cb: &[u8], cr: &[u8], target: &mut [u8]) ->
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(any(test, not(feature = "acceleration")))]
 #[target_feature(enable = "neon")]
 unsafe fn rgba_row_neon_matrix<const BT709: bool>(luma: &[u8], cb: &[u8], cr: &[u8], target: &mut [u8]) -> usize {
     use std::arch::aarch64::*;
@@ -428,6 +446,42 @@ mod tests {
                     ((y + 516 * cb + 128) >> 8).clamp(0, 255) as u8, 255,
                 ]);
             }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "acceleration")]
+    #[ignore = "release-mode shared/local YUV A/B benchmark"]
+    fn benchmark_shared_yuv_vpx() {
+        assert!(!cfg!(debug_assertions), "run with --release");
+        fn measure(frame: &YuvKeyFrame, convert: fn(&YuvKeyFrame) -> Vec<u8>) -> u128 {
+            let start = std::time::Instant::now();
+            for _ in 0..30 {
+                std::hint::black_box(convert(std::hint::black_box(frame)));
+            }
+            start.elapsed().as_nanos()
+        }
+        for (width, height) in [(1920, 1080), (1919, 1079), (1280, 720)] {
+            let frame = patterned_frame(width, height);
+            let shared = YuvKeyFrame::rgba as fn(&YuvKeyFrame) -> Vec<u8>;
+            let local = YuvKeyFrame::rgba_row_pairs::<true> as fn(&YuvKeyFrame) -> Vec<u8>;
+            assert_eq!(shared(&frame), local(&frame));
+            assert_eq!(shared(&frame), scalar_rgba(&frame));
+            for _ in 0..4 { std::hint::black_box(shared(&frame)); std::hint::black_box(local(&frame)); }
+            let mut shared_times = Vec::new();
+            let mut local_times = Vec::new();
+            for trial in 0..8 {
+                let (s, l) = if trial % 2 == 0 {
+                    (measure(&frame, shared), measure(&frame, local))
+                } else {
+                    let l = measure(&frame, local);
+                    (measure(&frame, shared), l)
+                };
+                shared_times.push(s); local_times.push(l);
+                eprintln!("VPx {width}x{height} trial {trial}: shared={s}ns local={l}ns ratio={:.4}", s as f64 / l as f64);
+            }
+            shared_times.sort_unstable(); local_times.sort_unstable();
+            eprintln!("VPx {width}x{height} median ratio={:.4}", shared_times[4] as f64 / local_times[4] as f64);
         }
     }
 

@@ -1178,9 +1178,21 @@ pub(super) fn frame_from_yuv420(
     cb: &[u8],
     cr: &[u8],
 ) -> super::VideoFrame {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(feature = "acceleration")]
+    let rgba = {
+        use accelerate::video::{LumaPolicy, Plane, YuvMatrix, yuv420_to_rgba};
+        let width = sps.width as usize;
+        yuv420_to_rgba(
+            width, sps.height as usize,
+            Plane { data: luma, stride: width },
+            Plane { data: cb, stride: width.div_ceil(2) },
+            Plane { data: cr, stride: width.div_ceil(2) },
+            YuvMatrix::Bt601, LumaPolicy::Clamped,
+        ).expect("decoded H.264 planes must cover the coded frame")
+    };
+    #[cfg(all(not(feature = "acceleration"), target_arch = "aarch64"))]
     let rgba = unsafe { rgba_from_yuv420_neon::<true, true>(sps, luma, cb, cr) };
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(not(feature = "acceleration"), not(target_arch = "aarch64")))]
     let rgba = rgba_from_yuv420_scalar(sps, luma, cb, cr);
     super::VideoFrame {
         presentation_size: None,
@@ -1191,7 +1203,7 @@ pub(super) fn frame_from_yuv420(
     }
 }
 
-#[cfg(any(test, not(target_arch = "aarch64")))]
+#[cfg(any(test, all(not(feature = "acceleration"), not(target_arch = "aarch64"))))]
 fn rgba_from_yuv420_scalar(sps: &SequenceParameters, luma: &[u8], cb: &[u8], cr: &[u8]) -> Vec<u8> {
     let luma_stride = sps.width as usize;
     let chroma_stride = luma_stride / 2;
@@ -1214,6 +1226,7 @@ fn rgba_from_yuv420_scalar(sps: &SequenceParameters, luma: &[u8], cb: &[u8], cr:
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(any(test, not(feature = "acceleration")))]
 #[target_feature(enable = "neon")]
 unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool, const PAIR_ROWS: bool>(
     sps: &SequenceParameters,
@@ -1362,10 +1375,76 @@ mod tests {
                 .map(|i| ((i * 71 + 29) & 255) as u8)
                 .collect();
             let expected = rgba_from_yuv420_scalar(&sps, &luma, &cb, &cr);
+            assert_eq!(frame_from_yuv420(&sps, &luma, &cb, &cr).rgba.as_slice(), expected.as_slice(), "production width {width}");
             let actual = unsafe { rgba_from_yuv420_neon::<true, true>(&sps, &luma, &cb, &cr) };
             assert_eq!(actual, expected, "width {width}");
             let single = unsafe { rgba_from_yuv420_neon::<true, false>(&sps, &luma, &cb, &cr) };
             assert_eq!(single, expected, "single row width {width}");
+        }
+    }
+
+    #[test]
+    fn production_yuv420_matches_clamped_scalar_for_odd_rows_and_tails() {
+        let mut sps = parse_sps(&high_720p_sps()).unwrap();
+        for width in [2_u32, 8, 16, 18, 24, 34] {
+            for height in [1_u32, 3, 6] {
+                sps.width = width;
+                sps.height = height;
+                let pixels = width as usize * height as usize;
+                let chroma = width as usize / 2 * (height as usize).div_ceil(2);
+                let y: Vec<_> = (0..pixels).map(|i| (i * 53 + 7) as u8).collect();
+                let u: Vec<_> = (0..chroma).map(|i| (i * 37 + 3) as u8).collect();
+                let v: Vec<_> = (0..chroma).map(|i| (i * 71 + 29) as u8).collect();
+                let expected = rgba_from_yuv420_scalar(&sps, &y, &u, &v);
+                assert_eq!(frame_from_yuv420(&sps, &y, &u, &v).rgba.as_slice(), expected.as_slice(), "{width}x{height}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[cfg(feature = "acceleration")]
+    #[ignore = "release-mode shared/local YUV A/B benchmark"]
+    fn benchmark_shared_yuv_h264() {
+        assert!(!cfg!(debug_assertions), "run with --release");
+        let mut sps = SequenceParameters {
+            id: 0, profile_idc: 100, level_idc: 31, width: 1920, height: 1080,
+            chroma_format_idc: 1, bit_depth_luma: 8, bit_depth_chroma: 8,
+            scaling_matrices_present: false, width_mbs: 120, frame_height_mbs: 68,
+            frame_mbs_only: true, direct_8x8_inference: true, frame_num_bits: 4,
+            max_num_ref_frames: 1, pic_order_cnt_type: 0, pic_order_cnt_lsb_bits: Some(4),
+        };
+        for (width, height) in [(1920, 1080), (1918, 1078), (1280, 720)] {
+            sps.width = width; sps.height = height;
+            let pixels = width as usize * height as usize;
+            let y: Vec<_> = (0..pixels).map(|i| (i * 53 + 7) as u8).collect();
+            let u: Vec<_> = (0..pixels / 4).map(|i| (i * 37 + 3) as u8).collect();
+            let v: Vec<_> = (0..pixels / 4).map(|i| (i * 71 + 29) as u8).collect();
+            let shared = || frame_from_yuv420(&sps, &y, &u, &v).rgba;
+            let local = || unsafe { rgba_from_yuv420_neon::<true, true>(&sps, &y, &u, &v) };
+            assert_eq!(shared().as_slice(), local().as_slice());
+            assert_eq!(shared().as_slice(), rgba_from_yuv420_scalar(&sps, &y, &u, &v));
+            for _ in 0..4 { std::hint::black_box(shared()); std::hint::black_box(local()); }
+            let measure_shared = || {
+                let start = std::time::Instant::now();
+                for _ in 0..30 { std::hint::black_box(shared()); }
+                start.elapsed().as_nanos()
+            };
+            let measure_local = || {
+                let start = std::time::Instant::now();
+                for _ in 0..30 { std::hint::black_box(local()); }
+                start.elapsed().as_nanos()
+            };
+            let mut shared_times = Vec::new(); let mut local_times = Vec::new();
+            for trial in 0..8 {
+                let (s, l) = if trial % 2 == 0 { (measure_shared(), measure_local()) } else {
+                    let l = measure_local(); (measure_shared(), l)
+                };
+                shared_times.push(s); local_times.push(l);
+                eprintln!("H264 {width}x{height} trial {trial}: shared={s}ns local={l}ns ratio={:.4}", s as f64 / l as f64);
+            }
+            shared_times.sort_unstable(); local_times.sort_unstable();
+            eprintln!("H264 {width}x{height} median ratio={:.4}", shared_times[4] as f64 / local_times[4] as f64);
         }
     }
 

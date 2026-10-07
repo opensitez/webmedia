@@ -647,6 +647,7 @@ pub(crate) struct IntraTile<'a> {
     cells: Vec<Cell>,
     cols: usize,
     rows: usize,
+    tile_bounds: [usize; 4],
     y_cdf: Vec<u16>,
     uv_no_cfl: Vec<u16>,
     uv_cfl: Vec<u16>,
@@ -659,6 +660,8 @@ pub(crate) struct IntraTile<'a> {
     delta_q_cdf: [u16; 5],
     cfl_sign: [u16; 9],
     cfl_alpha: Vec<u16>,
+    palette_cdfs: super::palette::PaletteCdfs,
+    palette_cells: Vec<Option<std::sync::Arc<super::palette::PaletteColors>>>,
     coefficients: CoefficientState,
     inter_cdfs: super::inter::InterCdfs,
     references: [Option<&'a DecodedFrame>; 7],
@@ -670,7 +673,6 @@ pub(crate) struct IntraTile<'a> {
     restoration: super::restoration::Restoration,
     qindex: u8,
     read_deltas: bool,
-    cdef_index: Option<u8>,
     decoded: Vec<Vec<bool>>,
     filter_tx: Vec<Vec<(u8, u8)>>,
     cdef_indices: Vec<i16>,
@@ -693,6 +695,7 @@ pub(crate) struct FrameCdfs {
     delta_q: [u16; 5],
     cfl_sign: [u16; 9],
     cfl_alpha: Vec<u16>,
+    palette: super::palette::PaletteCdfs,
     coefficients: CoefficientState,
     inter: super::inter::InterCdfs,
 }
@@ -734,6 +737,7 @@ impl FrameCdfs {
         self.delta_q[4] = 0;
         self.cfl_sign[8] = 0;
         reset(&mut self.cfl_alpha, 17);
+        self.palette.reset_counts();
         self.coefficients.reset_counts();
         self.inter.reset_counts();
     }
@@ -1121,6 +1125,7 @@ impl<'a> IntraTile<'a> {
             delta_q: self.delta_q_cdf,
             cfl_sign: self.cfl_sign,
             cfl_alpha: self.cfl_alpha.clone(),
+            palette: self.palette_cdfs.clone(),
             coefficients: self.coefficients.snapshot_cdfs(),
             inter: self.inter_cdfs.clone(),
         }
@@ -1142,6 +1147,7 @@ impl<'a> IntraTile<'a> {
         self.delta_q_cdf = c.delta_q;
         self.cfl_sign = c.cfl_sign;
         self.cfl_alpha = c.cfl_alpha;
+        self.palette_cdfs = c.palette;
         self.coefficients.load_cdfs(&c.coefficients);
         self.inter_cdfs = c.inter;
     }
@@ -1151,13 +1157,13 @@ impl<'a> IntraTile<'a> {
         h: &'a IntraFrameHeader,
         tile: &'a [u8],
     ) -> Result<Self, Error> {
-        if s.use_128x128_superblock || h.tiles.count() != 1 || h.width != h.upscaled_width {
-            return Err(Error::Unsupported(
-                "128x128 superblocks, multiple tiles or superresolution",
-            ));
+        if h.width != h.upscaled_width {
+            return Err(Error::Unsupported("superresolution"));
+        }
+        if h.tiles.count() > 1 && matches!(h.frame_type, 1 | 3) {
+            return Err(Error::Unsupported("multiple inter-frame tiles"));
         }
         if h.allow_intrabc
-            || h.allow_screen_content_tools
             || h.segmentation_enabled
             || h.quantizer_matrix_levels.is_some()
         {
@@ -1192,6 +1198,7 @@ impl<'a> IntraTile<'a> {
             cells: vec![Cell::default(); cols * rows],
             cols,
             rows,
+            tile_bounds: [0, 0, cols, rows],
             y_cdf: tables::Y_MODE.to_vec(),
             uv_no_cfl: tables::UV_NO_CFL.to_vec(),
             uv_cfl: tables::UV_CFL.to_vec(),
@@ -1229,6 +1236,8 @@ impl<'a> IntraTile<'a> {
             delta_q_cdf: [28160, 32120, 32677, 32768, 0],
             cfl_sign: tables::CFL_SIGN,
             cfl_alpha: tables::CFL_ALPHA.to_vec(),
+            palette_cdfs: super::palette::PaletteCdfs::default(),
+            palette_cells: vec![None; cols * rows],
             coefficients: CoefficientState::new(h.base_q_idx, &dims),
             inter_cdfs: super::inter::InterCdfs::default(),
             references: [None; 7],
@@ -1240,7 +1249,6 @@ impl<'a> IntraTile<'a> {
             restoration: super::restoration::Restoration::new(s, h)?,
             qindex: h.base_q_idx,
             read_deltas: false,
-            cdef_index: None,
             decoded: dims
                 .iter()
                 .map(|&(w, h)| vec![false; w / 4 * (h / 4)])
@@ -1263,6 +1271,7 @@ impl<'a> IntraTile<'a> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn run(&mut self) -> Result<(), Error> {
         self.run_with_observer(|_, _| {})
     }
@@ -1276,10 +1285,64 @@ impl<'a> IntraTile<'a> {
         &mut self,
         mut observer: impl FnMut(&str, &Self),
     ) -> Result<(), Error> {
-        for y in (0..self.rows).step_by(16) {
-            for x in (0..self.cols).step_by(16) {
+        if self.h.tiles.count() != 1 {
+            return Err(Error::Invalid("multi-tile frame requires all tile payloads"));
+        }
+        self.reconstruct_tile()?;
+        self.filter_frame(&mut observer)
+    }
+
+    pub(crate) fn run_tiles_with_observer(
+        &mut self,
+        tiles: &[(usize, &'a [u8])],
+        mut observer: impl FnMut(&str, &Self),
+    ) -> Result<(), Error> {
+        if self.h.tiles.count() == 1 {
+            return self.run_with_observer(observer);
+        }
+        if tiles.len() != self.h.tiles.count() {
+            return Err(Error::Invalid("incomplete tile frame"));
+        }
+        let initial = self.save_cdfs();
+        let mut updated = None;
+        let columns = self.h.tiles.column_starts.len() - 1;
+        for (expected, &(index, bytes)) in tiles.iter().enumerate() {
+            if index != expected {
+                return Err(Error::Invalid("tile ordering"));
+            }
+            let col = index % columns;
+            let row = index / columns;
+            self.tile_bounds = [
+                self.h.tiles.column_starts[col] as usize,
+                self.h.tiles.row_starts[row] as usize,
+                self.h.tiles.column_starts[col + 1] as usize,
+                self.h.tiles.row_starts[row + 1] as usize,
+            ];
+            let [x0, y0, x1, y1] = self.tile_bounds;
+            if x0 >= x1 || y0 >= y1 || x1 > self.cols || y1 > self.rows {
+                return Err(Error::Invalid("tile bounds"));
+            }
+            self.decoder = SymbolDecoder::new(bytes, !self.h.disable_cdf_update)?;
+            self.load_cdfs(&initial);
+            self.coefficients.clear_tile_boundaries();
+            self.restoration.begin_tile();
+            self.qindex = self.h.base_q_idx;
+            self.reconstruct_tile()?;
+            if index == self.h.tiles.context_update_tile as usize {
+                updated = Some(self.save_cdfs());
+            }
+        }
+        self.load_cdfs(&updated.ok_or(Error::Invalid("missing context update tile"))?);
+        self.filter_frame(&mut observer)
+    }
+
+    fn reconstruct_tile(&mut self) -> Result<(), Error> {
+        let superblock_size = if self.s.use_128x128_superblock { 128 } else { 64 };
+        let step = superblock_size / 4;
+        let [x0, y0, x1, y1] = self.tile_bounds;
+        for y in (y0..y1).step_by(step) {
+            for x in (x0..x1).step_by(step) {
                 self.read_deltas = self.h.delta_q_resolution.is_some();
-                self.cdef_index = None;
                 self.restoration.read(
                     &mut self.decoder,
                     &mut self.inter_cdfs.wiener,
@@ -1288,12 +1351,14 @@ impl<'a> IntraTile<'a> {
                     y,
                     x,
                 )?;
-                self.partition(x, y, 64)?;
-                self.cdef_indices[(y / 16) * self.cols.div_ceil(16) + x / 16] =
-                    self.cdef_index.map_or(-1, i16::from);
+                self.partition(x, y, superblock_size)?;
             }
         }
         self.decoder.finish()?;
+        Ok(())
+    }
+
+    fn filter_frame(&mut self, observer: &mut impl FnMut(&str, &Self)) -> Result<(), Error> {
         observer("reconstructed", self);
         let skips: Vec<bool> = self.cells.iter().map(|c| c.skip).collect();
         super::filters::deblock(
@@ -1328,12 +1393,12 @@ impl<'a> IntraTile<'a> {
 
     fn neighbors(&self, x: usize, y: usize) -> (Option<Cell>, Option<Cell>) {
         (
-            if y > 0 {
+            if y > self.tile_bounds[1] {
                 Some(self.cells[(y - 1) * self.cols + x])
             } else {
                 None
             },
-            if x > 0 {
+            if x > self.tile_bounds[0] {
                 Some(self.cells[y * self.cols + x - 1])
             } else {
                 None
@@ -1342,7 +1407,7 @@ impl<'a> IntraTile<'a> {
     }
 
     fn partition(&mut self, x: usize, y: usize, size: usize) -> Result<(), Error> {
-        if x >= self.cols || y >= self.rows {
+        if x >= self.tile_bounds[2] || y >= self.tile_bounds[3] {
             return Ok(());
         }
         let (above, left) = self.neighbors(x, y);
@@ -1350,8 +1415,8 @@ impl<'a> IntraTile<'a> {
             + 2 * usize::from(left.is_some_and(|c| usize::from(c.height) < size));
         let half = size / 2;
         let step = half / 4;
-        let rows = y + step < self.rows;
-        let cols = x + step < self.cols;
+        let rows = y + step < self.tile_bounds[3];
+        let cols = x + step < self.tile_bounds[2];
         let partition =
             self.partitions
                 .read_partition(&mut self.decoder, size, context, rows, cols)?;
@@ -1422,7 +1487,7 @@ impl<'a> IntraTile<'a> {
     }
 
     fn block(&mut self, x: usize, y: usize, w: usize, h: usize) -> Result<(), Error> {
-        if x >= self.cols || y >= self.rows {
+        if x >= self.tile_bounds[2] || y >= self.tile_bounds[3] {
             return Ok(());
         }
         const BLOCK_DIMS: [(usize, usize); 22] = [
@@ -1474,11 +1539,21 @@ impl<'a> IntraTile<'a> {
         let skip_ctx =
             usize::from(above.is_some_and(|c| c.skip)) + usize::from(left.is_some_and(|c| c.skip));
         let skip = skip_mode || self.decoder.read_symbol(&mut self.skip_cdf[skip_ctx])? != 0;
-        if !skip && !self.h.coded_lossless && self.s.enable_cdef && self.cdef_index.is_none() {
+        let cdef_columns = self.cols.div_ceil(16);
+        let cdef_offset = (y / 16) * cdef_columns + x / 16;
+        if !skip && !self.h.coded_lossless && self.s.enable_cdef && self.cdef_indices[cdef_offset] < 0 {
             let n = self.h.cdef_strengths.len().ilog2() as u8;
-            self.cdef_index = Some(self.decoder.read_literal(n)? as u8);
+            let index = self.decoder.read_literal(n)? as i16;
+            // A block larger than a CDEF region shares its index across all
+            // covered 64x64 regions, even inside a 128x128 superblock.
+            for row in y / 16..(y * 4 + h).div_ceil(64).min(self.rows.div_ceil(16)) {
+                for col in x / 16..(x * 4 + w).div_ceil(64).min(cdef_columns) {
+                    self.cdef_indices[row * cdef_columns + col] = index;
+                }
+            }
         }
-        if !(w == 64 && h == 64 && skip) && self.read_deltas {
+        let superblock_size = if self.s.use_128x128_superblock { 128 } else { 64 };
+        if !(w == superblock_size && h == superblock_size && skip) && self.read_deltas {
             let mut magnitude = self.decoder.read_symbol(&mut self.delta_q_cdf)? as i32;
             if magnitude == 3 {
                 let n = self.decoder.read_literal(3)? as u8 + 1;
@@ -1585,10 +1660,19 @@ impl<'a> IntraTile<'a> {
             }
             uv_angle = self.angle(uv_mode, block_index)?;
         }
+        let mut palette = if !is_inter && self.h.allow_screen_content_tools
+            && block_index >= 3 && w <= 64 && h <= 64
+        {
+            let above_palette = if y > self.tile_bounds[1] { self.palette_cells[(y - 1) * self.cols + x].as_deref() } else { None };
+            let left_palette = if x > self.tile_bounds[0] { self.palette_cells[y * self.cols + x - 1].as_deref() } else { None };
+            Some(self.palette_cdfs.read_modes(&mut self.decoder, self.s.bit_depth,
+                [w, h], [y_mode, uv_mode], has_chroma, above_palette, left_palette, y % 16 != 0)?)
+        } else { None };
         let mut filter_mode = None;
         if !is_inter
             && self.s.enable_filter_intra
             && y_mode == 0
+            && !palette.as_ref().is_some_and(|p| p.has_luma())
             && w.max(h) <= 32
             && self
                 .decoder
@@ -1597,10 +1681,16 @@ impl<'a> IntraTile<'a> {
         {
             filter_mode = Some(self.decoder.read_symbol(&mut self.filter_mode_cdf)?);
         }
+        if let Some(palette) = &mut palette {
+            self.palette_cdfs.read_tokens(&mut self.decoder, palette, [w, h],
+                [w.min((self.cols - x) * 4), h.min((self.rows - y) * 4)],
+                [self.s.subsampling_x, self.s.subsampling_y])?;
+        }
         let (mut tw, mut th) = if self.h.coded_lossless {
             (4, 4)
         } else {
-            (w, h)
+            // Max_Tx_Size_Rect caps 128-pixel blocks at 64-pixel transforms.
+            (w.min(64), h.min(64))
         };
         if !is_inter && !self.h.coded_lossless && self.h.tx_mode_select && block_index > 0 {
             let ctx = usize::from(above.is_some_and(|c| {
@@ -1608,15 +1698,15 @@ impl<'a> IntraTile<'a> {
                     c.width
                 } else {
                     c.tx_width
-                }) >= w
+                }) >= tw
             })) + usize::from(left.is_some_and(|c| {
                 usize::from(if motion_left.is_some_and(|m| m.refs[0] > 0) {
                     c.height
                 } else {
                     c.tx_height
-                }) >= h
+                }) >= th
             }));
-            let max_depth = w.max(h).ilog2() as usize - 2;
+            let max_depth = tw.max(th).ilog2() as usize - 2;
             let depth = if max_depth == 1 {
                 self.decoder.read_symbol(&mut self.tx8_cdf[ctx])?
             } else {
@@ -1730,20 +1820,27 @@ impl<'a> IntraTile<'a> {
                     _ => IntraMode::Dc,
                 };
                 let p = &self.planes[plane];
+                let tile_x0 = (self.tile_bounds[0] * 4) >> sx;
+                let tile_y0 = (self.tile_bounds[1] * 4) >> sy;
+                let tile_x1 = ((self.tile_bounds[2] * 4) >> sx).min(p.width);
+                let tile_y1 = ((self.tile_bounds[3] * 4) >> sy).min(p.height);
                 let decoded = |cx: usize, cy: usize| -> bool {
-                    cx < p.width / 4
-                        && cy < p.height / 4
+                    cx >= tile_x0 / 4 && cy >= tile_y0 / 4
+                        && cx < tile_x1 / 4 && cy < tile_y1 / 4
                         && self.decoded[plane][cy * (p.width / 4) + cx]
                 };
-                let above_right = ay > 0 && decoded(ax / 4 + ptw / 4, ay / 4 - 1);
-                let below_left = ax > 0 && decoded(ax / 4 - 1, ay / 4 + pth / 4);
+                let above_right = ay > tile_y0 && decoded(ax / 4 + ptw / 4, ay / 4 - 1);
+                let below_left = ax > tile_x0 && decoded(ax / 4 - 1, ay / 4 + pth / 4);
                 let fast_inter = inter_prediction.is_some()
                     && mode_kind == IntraMode::Dc
                     && filter_mode.is_none()
                     && uv_mode != 13;
                 #[cfg(test)]
                 let fast_inter = fast_inter && !DISCARDED_INTRA_REFERENCE.get();
-                let mut prediction = if fast_inter {
+                let palette_prediction = palette.as_ref().and_then(|p| p.prediction(plane, dx, dy, ptw, pth));
+                let mut prediction = if let Some(prediction) = palette_prediction {
+                    prediction
+                } else if fast_inter {
                     validate_discarded_inter_prediction(
                         p,
                         ax,
@@ -1764,14 +1861,14 @@ impl<'a> IntraTile<'a> {
                     }
                     prediction
                 } else {
-                    let above = if ay > 0 {
+                    let above = if ay > tile_y0 {
                         Some(
                             (0..ptw + pth)
                                 .map(|i| {
                                     p.samples[(ay - 1) * p.stride
                                         + (ax + i).min(
                                             (ax + if above_right { 2 * ptw } else { ptw } - 1)
-                                                .min(p.width - 1),
+                                                .min(tile_x1 - 1),
                                         )]
                                 })
                                 .collect::<Vec<_>>(),
@@ -1779,13 +1876,13 @@ impl<'a> IntraTile<'a> {
                     } else {
                         None
                     };
-                    let left = if ax > 0 {
+                    let left = if ax > tile_x0 {
                         Some(
                             (0..ptw + pth)
                                 .map(|i| {
                                     p.samples[(ay + i).min(
                                         (ay + if below_left { 2 * pth } else { pth } - 1)
-                                            .min(p.height - 1),
+                                            .min(tile_y1 - 1),
                                     ) * p.stride
                                         + ax
                                         - 1]
@@ -1795,7 +1892,7 @@ impl<'a> IntraTile<'a> {
                     } else {
                         None
                     };
-                    let corner = if ax > 0 && ay > 0 {
+                    let corner = if ax > tile_x0 && ay > tile_y0 {
                         Some(p.samples[(ay - 1) * p.stride + ax - 1])
                     } else {
                         None
@@ -1874,13 +1971,13 @@ impl<'a> IntraTile<'a> {
                         } else if (1..=8).contains(&mode) {
                             let smooth_neighbor = [
                                 above.as_ref().and_then(|_| {
-                                    if ay > 0 {
+                                    if ay > tile_y0 {
                                         self.cells.get((y.saturating_sub(1)) * self.cols + x)
                                     } else {
                                         None
                                     }
                                 }),
-                                if x > 0 {
+                                if x > self.tile_bounds[0] {
                                     self.cells.get(y * self.cols + x - 1)
                                 } else {
                                     None
@@ -1897,13 +1994,13 @@ impl<'a> IntraTile<'a> {
                                 self.s.bit_depth,
                                 mode,
                                 if plane == 0 { y_angle } else { uv_angle },
-                                Some(top.as_ref()).filter(|_| ay > 0),
-                                Some(side.as_ref()).filter(|_| ax > 0),
+                                Some(top.as_ref()).filter(|_| ay > tile_y0),
+                                Some(side.as_ref()).filter(|_| ax > tile_x0),
                                 corner_value,
                                 self.s.enable_intra_edge_filter,
                                 smooth_neighbor,
-                                p.width - ax,
-                                p.height - ay,
+                                tile_x1 - ax,
+                                tile_y1 - ay,
                             )?;
                         } else if (9..=11).contains(&mode) {
                             prediction = super::prediction::smooth(ptw, pth, mode, &top, &side)?;
@@ -2101,8 +2198,11 @@ impl<'a> IntraTile<'a> {
         }
         self.inter_scratch = inter_scratch;
         self.progress.blocks[index].reconstructed = true;
+        let palette_colors = palette.filter(|p| p.colors.planes.iter().any(|colors| !colors.is_empty()))
+            .map(|p| std::sync::Arc::new(p.colors));
         for row in y..(y + h / 4).min(self.rows) {
             for col in x..(x + w / 4).min(self.cols) {
+                self.palette_cells[row * self.cols + col] = palette_colors.clone();
                 self.cells[row * self.cols + col] = Cell {
                     width: w as u8,
                     height: h as u8,

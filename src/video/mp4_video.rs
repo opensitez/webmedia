@@ -1,7 +1,7 @@
 //! Codec selection and incremental sample playback for classic MP4.
 
 use super::backend::{MediaDecodeError, MediaMetadata, StreamingVideoDecoder, VideoFrame};
-use super::mp4::{Mp4Error, Mp4Index, Mp4VideoCodec, Mp4VideoIndex};
+use super::mp4::{Mp4Error, Mp4Index, Mp4VideoCodec, Mp4VideoIndex, Sample};
 use super::mp4_avc::{Mp4AvcPackets, Mp4AvcStream};
 use super::vp8_decoder::Vp8Decoder;
 use super::vp9::split_superframe;
@@ -13,6 +13,10 @@ const MAX_FRAMES_PER_PUSH: usize = 4;
 
 pub struct Mp4VideoPackets {
     decoder: PacketDecoder,
+    fragmented: bool,
+    finished: bool,
+    sample_base: usize,
+    requires_keyframe: bool,
 }
 
 enum PacketDecoder {
@@ -45,7 +49,79 @@ impl Mp4VideoPackets {
                 PacketDecoder::VpX(stream)
             }
         };
-        Ok(Self { decoder })
+        Ok(Self { decoder, fragmented: false, finished: false, sample_base: 0, requires_keyframe: false })
+    }
+
+    pub fn new_fragmented(mut index: Mp4VideoIndex, start: usize) -> Result<Self, MediaDecodeError> {
+        if index.timescale == 0 { return Err(MediaDecodeError::InvalidData("zero video timescale".into())); }
+        index.samples.clear();
+        let decoder = match index.codec {
+            Mp4VideoCodec::Avc(config) => PacketDecoder::Avc(Mp4AvcPackets::new_fragmented(
+                Mp4Index { config, timescale: index.timescale, duration_ticks: index.duration_ticks,
+                    samples: index.samples }, start)?),
+            _ => {
+                PacketDecoder::VpX(Mp4VpXStream::new(index))
+            }
+        };
+        Ok(Self { decoder, fragmented: true, finished: false,
+            sample_base: start, requires_keyframe: true })
+    }
+
+    pub fn update_samples(&mut self, samples: &[Sample], duration_ticks: u64) -> Result<(), MediaDecodeError> {
+        if self.finished { return Err(MediaDecodeError::InvalidData("samples after EOF".into())); }
+        match &mut self.decoder {
+            PacketDecoder::Avc(decoder) => decoder.update_samples(samples, duration_ticks),
+            PacketDecoder::VpX(stream) => {
+                let supplied = samples.get(self.sample_base..)
+                    .ok_or_else(|| MediaDecodeError::InvalidData("missing restart prefix".into()))?;
+                if supplied.len() > 1_000_000 || !supplied.starts_with(&stream.index.samples) {
+                    return Err(MediaDecodeError::InvalidData("MP4 sample table is not append-only".into()));
+                }
+                stream.index.samples.extend_from_slice(&supplied[stream.index.samples.len()..]);
+                stream.index.duration_ticks = duration_ticks;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn push_sample(&mut self, number: usize, sample: Sample, data: &[u8]) -> Result<Vec<VideoFrame>, MediaDecodeError> {
+        if self.finished { return Err(MediaDecodeError::InvalidData("packet after EOF".into())); }
+        match &mut self.decoder {
+            PacketDecoder::Avc(decoder) => decoder.push_sample(number, sample, data),
+            PacketDecoder::VpX(stream) => {
+                let local = number.checked_sub(self.sample_base)
+                    .ok_or_else(|| MediaDecodeError::InvalidData("sample precedes restart".into()))?;
+                if local != stream.next_sample || data.len() != sample.size as usize
+                    || data.len() > MAX_BUFFER_BYTES || (self.requires_keyframe && !sample.keyframe)
+                    || sample.offset.checked_add(u64::from(sample.size)).is_none() {
+                    return Err(MediaDecodeError::InvalidData("invalid fragmented video packet".into()));
+                }
+                if let Some(known) = stream.index.samples.get(local) {
+                    if known != &sample { return Err(MediaDecodeError::InvalidData("conflicting sample metadata".into())); }
+                } else if self.fragmented && local == stream.index.samples.len() && local < 1_000_000 {
+                    if stream.index.samples.last().is_some_and(|last| sample.decode_time < last.decode_time) {
+                        return Err(MediaDecodeError::InvalidData("nonmonotonic decode time".into()));
+                    }
+                    stream.index.samples.push(sample);
+                } else { return Err(MediaDecodeError::InvalidData("missing or excessive sample metadata".into())); }
+                stream.base_offset = stream.index.samples[local].offset;
+                stream.bytes.clear();
+                stream.bytes.extend_from_slice(data);
+                let frames = stream.push(&[])?;
+                self.requires_keyframe = false;
+                Ok(frames)
+            }
+        }
+    }
+
+    /// Repeat until empty at definitive EOF; AVC may retain a reorder tail.
+    pub fn finish_input(&mut self) -> Result<Vec<VideoFrame>, MediaDecodeError> {
+        let frames = match &mut self.decoder {
+            PacketDecoder::Avc(decoder) => decoder.finish_input()?,
+            PacketDecoder::VpX(stream) => { stream.finish()?; Vec::new() }
+        };
+        self.finished = true;
+        Ok(frames)
     }
 
     pub fn push(
@@ -53,13 +129,16 @@ impl Mp4VideoPackets {
         number: usize,
         data: &[u8],
     ) -> Result<Vec<VideoFrame>, MediaDecodeError> {
+        if self.finished { return Err(MediaDecodeError::InvalidData("packet after EOF".into())); }
         match &mut self.decoder {
             PacketDecoder::Avc(decoder) => decoder.push(number, data),
             PacketDecoder::VpX(stream) => {
-                let sample = stream.index.samples.get(number).ok_or_else(|| {
+                let local = number.checked_sub(self.sample_base)
+                    .ok_or_else(|| MediaDecodeError::InvalidData("sample precedes restart".into()))?;
+                let sample = stream.index.samples.get(local).ok_or_else(|| {
                     MediaDecodeError::InvalidData("MP4 sample out of bounds".into())
                 })?;
-                if number != stream.next_sample
+                if local != stream.next_sample
                     || data.len() != sample.size as usize
                     || data.len() > MAX_BUFFER_BYTES
                 {
@@ -407,6 +486,40 @@ mod tests {
         media.finish().unwrap();
         assert_eq!(count, 60);
         assert_eq!(media.metadata().unwrap().presentation_size, presentation);
+    }
+
+    #[test]
+    fn fragmented_vp8_future_epoch_metadata_and_eof_match_classic_pixels() {
+        let ivf = include_bytes!("../../tests/fixtures/vp8-keyframe.ivf");
+        let size = u32::from_le_bytes(ivf[32..36].try_into().unwrap()) as usize;
+        let data = &ivf[44..44 + size];
+        let sample = Sample { offset: 0, size: size as u32,
+            decode_time: 0, presentation_time: 0, keyframe: true };
+        let index = Mp4VideoIndex { timescale: 1, duration_ticks: 1,
+            codec: Mp4VideoCodec::Vp8, width: 32, height: 32, samples: vec![sample.clone()] };
+        let mut classic = Mp4VideoPackets::new(index.clone(), 0).unwrap();
+        let expected = classic.push(0, data).unwrap();
+        assert_eq!(expected.len(), 1);
+        assert!(classic.finish_input().unwrap().is_empty());
+
+        let mut fragmented = Mp4VideoPackets::new_fragmented(index.clone(), 90_000).unwrap();
+        let mut not_key = sample.clone();
+        not_key.keyframe = false;
+        assert!(fragmented.push_sample(90_000, not_key, data).is_err());
+        assert!(fragmented.push_sample(89_999, sample.clone(), data).is_err());
+        assert_eq!(fragmented.push_sample(90_000, sample.clone(), data).unwrap(), expected);
+        assert!(fragmented.finish_input().unwrap().is_empty());
+        assert!(fragmented.finish_input().unwrap().is_empty());
+        assert!(fragmented.push_sample(90_001, sample.clone(), data).is_err());
+
+        let mut known = Mp4VideoPackets::new_fragmented(index, 0).unwrap();
+        known.update_samples(std::slice::from_ref(&sample), 0).unwrap();
+        let mut conflicting = sample.clone();
+        conflicting.presentation_time = 1;
+        assert!(known.push_sample(0, conflicting, data).is_err());
+        assert!(known.finish_input().is_err());
+        assert_eq!(known.push_sample(0, sample, data).unwrap(), expected);
+        assert!(known.finish_input().unwrap().is_empty());
     }
 
     #[test]

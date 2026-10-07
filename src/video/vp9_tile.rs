@@ -7,7 +7,9 @@ use super::vp9_adapt::{CoefficientCounts, NonCoefficientCounts};
 use super::vp9_compressed::CompressedHeader;
 use super::vp9_coef_probs::PARETO_TABLE;
 use super::vp9_mode_probs::KEYFRAME_LUMA_MODE_PROBS;
-use super::vp9_motion::{read_motion_difference, read_motion_difference_counted, use_high_precision};
+#[cfg(test)]
+use super::vp9_motion::read_motion_difference;
+use super::vp9_motion::{read_motion_difference_counted, use_high_precision};
 use super::vp9_scan::coefficient_scan;
 
 const INTRA_MODE_TREE: [i8; 18] = [
@@ -260,6 +262,7 @@ pub struct TileBlock {
     pub block: FirstBlock,
 }
 
+#[cfg(test)]
 pub fn decode_keyframe_tile_prefix(
     layout: &KeyframeLayout<'_>,
     compressed: &CompressedHeader,
@@ -271,6 +274,7 @@ pub fn decode_keyframe_tile_prefix(
         .map(|(blocks, _)| blocks)
 }
 
+#[cfg(test)]
 pub(super) fn decode_keyframe_tile_counted(
     layout: &KeyframeLayout<'_>,
     compressed: &CompressedHeader,
@@ -306,6 +310,7 @@ pub(super) fn decode_keyframe_tile_counted(
     Ok((reader.blocks, reader.coef_counts))
 }
 
+#[cfg(test)]
 pub fn decode_interframe_tile_prefix(
     layout: &KeyframeLayout<'_>,
     frame: &InterframeHeader,
@@ -320,6 +325,7 @@ pub fn decode_interframe_tile_prefix(
         previous_predictions, previous_segments).map(|(blocks, _, _)| blocks)
 }
 
+#[cfg(test)]
 pub(super) fn decode_interframe_tile_counted(
     layout: &KeyframeLayout<'_>,
     frame: &InterframeHeader,
@@ -1243,6 +1249,7 @@ fn read_inter_motion(
     }
 }
 
+#[cfg(test)]
 pub fn first_block(
     layout: &KeyframeLayout<'_>,
     compressed: &CompressedHeader,
@@ -1259,6 +1266,7 @@ pub fn first_block(
     read_block_64x64(&mut bits, layout, compressed, None, None).map(Some)
 }
 
+#[cfg(test)]
 pub fn first_tile_row_prefix(
     layout: &KeyframeLayout<'_>,
     compressed: &CompressedHeader,
@@ -1269,6 +1277,7 @@ pub fn first_tile_row_prefix(
     Ok((blocks, next_partition))
 }
 
+#[cfg(test)]
 fn read_first_tile_row_prefix<'a>(
     layout: &KeyframeLayout<'_>,
     compressed: &CompressedHeader,
@@ -1291,6 +1300,7 @@ fn read_first_tile_row_prefix<'a>(
     Ok((blocks, None, bits))
 }
 
+#[cfg(test)]
 pub fn first_split_top_left_path(
     layout: &KeyframeLayout<'_>,
     compressed: &CompressedHeader,
@@ -1312,6 +1322,7 @@ pub fn first_split_top_left_path(
     Ok(Some(path))
 }
 
+#[cfg(test)]
 pub fn first_split_top_left_16x16(
     layout: &KeyframeLayout<'_>,
     compressed: &CompressedHeader,
@@ -1328,6 +1339,7 @@ pub fn first_split_top_left_16x16(
     read_block_16x16(&mut bits, layout, compressed, blocks.last()).map(Some)
 }
 
+#[cfg(test)]
 fn read_block_16x16(
     bits: &mut BoolDecoder<'_>,
     layout: &KeyframeLayout<'_>,
@@ -1389,6 +1401,7 @@ fn read_block_16x16(
     })
 }
 
+#[cfg(test)]
 fn read_block_64x64(
     bits: &mut BoolDecoder<'_>,
     layout: &KeyframeLayout<'_>,
@@ -1484,6 +1497,7 @@ fn read_block_64x64(
     })
 }
 
+#[cfg(test)]
 fn read_transform(
     bits: &mut BoolDecoder<'_>,
     compressed: &CompressedHeader,
@@ -1495,6 +1509,7 @@ fn read_transform(
     read_transform_with_mode(bits, compressed, tx_size, bit_depth, block_type, initial_context, 0)
 }
 
+#[cfg(test)]
 fn read_transform_with_mode(
     bits: &mut BoolDecoder<'_>,
     compressed: &CompressedHeader,
@@ -1631,6 +1646,7 @@ fn read_tree(bits: &mut BoolDecoder<'_>, tree: &[i8], probabilities: &[u8]) -> R
     }
 }
 
+#[cfg(test)]
 pub fn first_partition(tile: &[u8]) -> Result<Partition, MediaDecodeError> {
     let mut bits = BoolDecoder::new(tile)?;
     if bits.read_bit()? {
@@ -1639,6 +1655,7 @@ pub fn first_partition(tile: &[u8]) -> Result<Partition, MediaDecodeError> {
     read_partition(&mut bits, 12, true, true)
 }
 
+#[cfg(test)]
 pub fn first_inter_partition(
     tile: &[u8], compressed: &CompressedHeader,
 ) -> Result<Partition, MediaDecodeError> {
@@ -1652,6 +1669,7 @@ pub fn first_inter_partition(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub struct FirstInterBlockMode {
     pub skip: bool,
     pub reference: u8,
@@ -1660,6 +1678,7 @@ pub struct FirstInterBlockMode {
     pub motion: (i32, i32),
 }
 
+#[cfg(test)]
 pub fn first_inter_block_mode(
     layout: &KeyframeLayout<'_>,
     frame: &super::vp9::InterframeHeader,

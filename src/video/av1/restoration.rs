@@ -70,6 +70,10 @@ pub(crate) struct Restoration {
 }
 
 impl Restoration {
+    pub(crate) fn begin_tile(&mut self) {
+        self.previous = [[[3, -7, 15]; 2]; 3];
+    }
+
     pub(crate) fn new(s: &SequenceHeader, h: &IntraFrameHeader) -> Result<Self, Error> {
         if h.restoration_types.iter().any(|&r| r != 0 && r != 2) {
             return Err(Error::Unsupported("self-guided or switchable restoration"));
@@ -109,6 +113,7 @@ impl Restoration {
         row: usize,
         col: usize,
     ) -> Result<(), Error> {
+        let superblock_step = if s.use_128x128_superblock { 32 } else { 16 };
         for plane in 0..self.units.len() {
             if h.restoration_types[plane] == 0 {
                 continue;
@@ -118,9 +123,9 @@ impl Restoration {
             let size = h.restoration_unit_sizes[plane] as usize;
             let (cols, rows) = self.dimensions[plane];
             let r0 = (row * (4 >> sy)).div_ceil(size);
-            let r1 = ((row + 16) * (4 >> sy)).div_ceil(size).min(rows);
+            let r1 = ((row + superblock_step) * (4 >> sy)).div_ceil(size).min(rows);
             let c0 = (col * (4 >> sx)).div_ceil(size);
-            let c1 = ((col + 16) * (4 >> sx)).div_ceil(size).min(cols);
+            let c1 = ((col + superblock_step) * (4 >> sx)).div_ceil(size).min(cols);
             for r in r0..r1 {
                 for c in c0..c1 {
                     if d.read_symbol(cdf)? == 0 {

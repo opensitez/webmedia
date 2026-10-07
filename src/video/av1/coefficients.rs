@@ -84,6 +84,15 @@ pub(crate) struct DecodedCoefficients {
 }
 
 impl CoefficientState {
+    pub(crate) fn clear_tile_boundaries(&mut self) {
+        for b in &mut self.boundaries {
+            b.above_level.fill(0);
+            b.above_dc.fill(0);
+            b.left_level.fill(0);
+            b.left_dc.fill(0);
+        }
+    }
+
     pub(crate) fn snapshot_cdfs(&self) -> Self {
         #[cfg(test)]
         if super::decoder::lifecycle_reference() {

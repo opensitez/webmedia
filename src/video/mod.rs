@@ -1,6 +1,6 @@
 //! Streaming video codecs and container parsing.
 
-pub mod av1;
+pub use crate::av1;
 pub mod backend;
 pub mod h264;
 pub mod h264_cabac;

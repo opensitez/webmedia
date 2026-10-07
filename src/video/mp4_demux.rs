@@ -1,6 +1,9 @@
 //! One bounded MP4 reader feeding independently scheduled codec workers.
 
-use super::mp4::{Mp4AudioIndex, Mp4Error, Mp4VideoIndex, Sample};
+use super::mp4::{
+    Mp4AudioIndex, Mp4Error, Mp4Fragment, Mp4FragmentDecodeTimes, Mp4FragmentInit, Mp4VideoIndex,
+    Sample,
+};
 
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PACKETS: usize = 64;
@@ -18,6 +21,8 @@ pub struct Packet {
     pub presentation_time: i64,
     pub timescale: u32,
     pub keyframe: bool,
+    pub sample: Sample,
+    pub fragmented: bool,
     pub data: Vec<u8>,
 }
 
@@ -31,6 +36,11 @@ pub struct Mp4Demux {
     next_audio: usize,
     next_video: usize,
     start_time: f64,
+    fragments: Option<Mp4FragmentInit>,
+    fragment_times: Mp4FragmentDecodeTimes,
+    scan_offset: u64,
+    open_ended_mdat: bool,
+    data_ranges: Vec<(u64, u64)>,
 }
 
 impl Mp4Demux {
@@ -54,6 +64,100 @@ impl Mp4Demux {
 
     pub fn video_index(&self) -> Option<&Mp4VideoIndex> {
         self.video.as_ref()
+    }
+
+    pub fn is_fragmented(&self) -> bool {
+        self.fragments.is_some()
+    }
+
+    fn scan_fragments(&mut self) -> Result<(), Mp4Error> {
+        if self.fragments.is_none() || self.open_ended_mdat {
+            return Ok(());
+        }
+        let available_end = self.base_offset + self.bytes.len() as u64;
+        while self.scan_offset < available_end {
+            let at = usize::try_from(
+                self.scan_offset
+                    .checked_sub(self.base_offset)
+                    .ok_or(Mp4Error::Invalid("discarded fragment header"))?,
+            )
+            .map_err(|_| Mp4Error::TooLarge)?;
+            let Some(header) = self.bytes.get(at..at.saturating_add(8)) else {
+                break;
+            };
+            let short = u32::from_be_bytes(header[..4].try_into().unwrap());
+            let kind: [u8; 4] = header[4..8].try_into().unwrap();
+            let (size, header_len) = if short == 1 {
+                let Some(extended) = self.bytes.get(at + 8..at + 16) else {
+                    break;
+                };
+                (u64::from_be_bytes(extended.try_into().unwrap()), 16u64)
+            } else if short == 0 {
+                if kind != *b"mdat" {
+                    return Err(Mp4Error::Unsupported("open-ended non-media box"));
+                }
+                self.data_ranges.push((self.scan_offset + 8, u64::MAX));
+                self.open_ended_mdat = true;
+                self.scan_offset = u64::MAX;
+                break;
+            } else {
+                (u64::from(short), 8u64)
+            };
+            if size < header_len {
+                return Err(Mp4Error::Invalid("invalid box size"));
+            }
+            let end = self
+                .scan_offset
+                .checked_add(size)
+                .ok_or(Mp4Error::TooLarge)?;
+            if kind == *b"moof" {
+                if end > available_end {
+                    break;
+                }
+                let fragment = Mp4Fragment::parse_prefix(
+                    &self.bytes[at..],
+                    self.scan_offset,
+                    self.fragments.as_ref().unwrap(),
+                    self.fragment_times,
+                )?;
+                for (index, samples) in [
+                    (
+                        self.video.as_mut().map(|index| &mut index.samples),
+                        &fragment.video_samples,
+                    ),
+                    (
+                        self.audio.as_mut().map(|index| &mut index.samples),
+                        &fragment.audio_samples,
+                    ),
+                ] {
+                    if let Some(index) = index {
+                        if samples.len() > 1_000_000usize.saturating_sub(index.len()) {
+                            return Err(Mp4Error::TooLarge);
+                        }
+                        if samples
+                            .iter()
+                            .any(|sample| sample.offset < self.base_offset)
+                        {
+                            return Err(Mp4Error::Invalid(
+                                "fragment sample precedes retained input",
+                            ));
+                        }
+                        index.extend_from_slice(samples);
+                    }
+                }
+                self.fragment_times = fragment.decode_times;
+                if let Some(index) = &mut self.video {
+                    index.duration_ticks = index.duration_ticks.max(self.fragment_times.video);
+                }
+                if let Some(index) = &mut self.audio {
+                    index.duration_ticks = index.duration_ticks.max(self.fragment_times.audio);
+                }
+            } else if kind == *b"mdat" {
+                self.data_ranges.push((self.scan_offset + header_len, end));
+            }
+            self.scan_offset = end;
+        }
+        Ok(())
     }
 
     fn next(&self) -> Option<(Track, usize, u32, &Sample)> {
@@ -82,6 +186,12 @@ impl Mp4Demux {
         }
         self.bytes.extend_from_slice(bytes);
         if !self.indexed {
+            self.fragments = match Mp4FragmentInit::parse_prefix(&self.bytes) {
+                Ok(init) => Some(init),
+                Err(Mp4Error::Unsupported("not fragmented MP4")) => None,
+                Err(Mp4Error::Incomplete) => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
             let audio = match Mp4AudioIndex::parse_prefix(&self.bytes) {
                 Err(Mp4Error::Incomplete) => return Ok(Vec::new()),
                 result => result?,
@@ -120,6 +230,7 @@ impl Mp4Demux {
             }
             self.indexed = true;
         }
+        self.scan_fragments()?;
         let mut packets = Vec::new();
         while packets.len() < MAX_PACKETS {
             let Some((track, sample_number, timescale, sample)) = self.next() else {
@@ -133,6 +244,22 @@ impl Mp4Demux {
             let end = start
                 .checked_add(sample.size as usize)
                 .ok_or(Mp4Error::TooLarge)?;
+            if self.fragments.is_some() {
+                let sample_end = sample
+                    .offset
+                    .checked_add(u64::from(sample.size))
+                    .ok_or(Mp4Error::TooLarge)?;
+                if !self
+                    .data_ranges
+                    .iter()
+                    .any(|&(begin, end)| sample.offset >= begin && sample_end <= end)
+                {
+                    if sample.offset >= self.scan_offset {
+                        break;
+                    }
+                    return Err(Mp4Error::Invalid("fragment sample outside media data"));
+                }
+            }
             let Some(data) = self.bytes.get(start..end) else {
                 break;
             };
@@ -142,6 +269,8 @@ impl Mp4Demux {
                 timescale,
                 presentation_time: sample.presentation_time,
                 keyframe: sample.keyframe,
+                sample: sample.clone(),
+                fragmented: self.fragments.is_some(),
                 data: data.to_vec(),
             });
             match track {
@@ -149,22 +278,31 @@ impl Mp4Demux {
                 Track::Video => self.next_video += 1,
             }
         }
-        let retain = self
+        let mut retain = self
             .next()
             .map(|next| next.3.offset)
             .unwrap_or(self.base_offset + self.bytes.len() as u64);
+        if self.fragments.is_some() {
+            retain = retain.min(self.scan_offset);
+        }
         let discard = retain
             .saturating_sub(self.base_offset)
             .min(self.bytes.len() as u64) as usize;
         if discard >= 256 * 1024 || self.next().is_none() {
             self.bytes.drain(..discard);
             self.base_offset += discard as u64;
+            self.data_ranges.retain(|&(_, end)| end > self.base_offset);
         }
         Ok(packets)
     }
 
     pub fn finish(&self) -> Result<(), Mp4Error> {
-        if !self.indexed || self.next().is_some() {
+        if !self.indexed
+            || self.next().is_some()
+            || (self.fragments.is_some()
+                && !self.open_ended_mdat
+                && self.scan_offset != self.base_offset + self.bytes.len() as u64)
+        {
             Err(Mp4Error::Incomplete)
         } else {
             Ok(())
@@ -175,6 +313,225 @@ impl Mp4Demux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collect_fragments(bytes: &[u8], chunk_size: usize) -> (Mp4Demux, Vec<Packet>) {
+        let mut demux = Mp4Demux::new();
+        let mut packets = Vec::new();
+        for chunk in bytes.chunks(chunk_size) {
+            packets.extend(demux.push(chunk).unwrap());
+            loop {
+                let ready = demux.push(&[]).unwrap();
+                if ready.is_empty() {
+                    break;
+                }
+                packets.extend(ready);
+            }
+        }
+        (demux, packets)
+    }
+
+    #[test]
+    fn fragmented_demux_streams_both_tracks_without_duplicate_commits() {
+        let bytes = super::super::mp4::fragmented_test_file();
+        for size in [1, 2, 7, 16, 63, 257, bytes.len()] {
+            let (mut demux, packets) = collect_fragments(&bytes, size);
+            demux.finish().unwrap();
+            assert!(demux.is_fragmented());
+            assert_eq!(packets.len(), 12, "chunk size {size}");
+            let mut counts = [0; 2];
+            let mut offset = 0;
+            for packet in packets {
+                let slot = usize::from(packet.track == Track::Video);
+                assert_eq!(packet.sample_number, counts[slot]);
+                counts[slot] += 1;
+                assert!(packet.fragmented);
+                assert!(packet.sample.offset >= offset);
+                offset = packet.sample.offset;
+                assert_eq!(packet.presentation_time, packet.sample.presentation_time);
+                assert_eq!(
+                    packet.data,
+                    bytes[offset as usize..offset as usize + packet.sample.size as usize]
+                );
+            }
+            assert_eq!(counts, [6, 6]);
+            assert_eq!(demux.video_index().unwrap().duration_ticks, 60);
+            assert_eq!(demux.audio_index().unwrap().duration_ticks, 6144);
+            assert!(demux.bytes.is_empty());
+            assert!(demux.push(&[]).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn fragmented_demux_rejects_truncated_headers_and_payloads() {
+        let bytes = super::super::mp4::fragmented_test_file();
+        for cut in 1..=7 {
+            let (demux, _) = collect_fragments(&bytes[..bytes.len() - cut], 13);
+            assert_eq!(demux.finish(), Err(Mp4Error::Incomplete));
+        }
+        for partial in 1..8 {
+            let mut demux = Mp4Demux::new();
+            demux.push(&bytes).unwrap();
+            demux.push(&[0; 7][..partial]).unwrap();
+            assert_eq!(demux.finish(), Err(Mp4Error::Incomplete));
+        }
+    }
+
+    #[test]
+    fn fragmented_demux_requires_samples_to_belong_to_media_payload() {
+        let mut bytes = super::super::mp4::fragmented_test_file();
+        let at = bytes.windows(4).position(|word| word == b"trun").unwrap();
+        // Data offset points at the fragment header rather than its mdat payload.
+        bytes[at + 12..at + 16].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(
+            Mp4Demux::new().push(&bytes).unwrap_err(),
+            Mp4Error::Invalid("fragment sample outside media data")
+        );
+    }
+
+    #[test]
+    fn fragmented_demux_accepts_final_open_ended_mdat() {
+        let mut bytes = super::super::mp4::fragmented_test_file();
+        let at = bytes.windows(4).rposition(|word| word == b"mdat").unwrap();
+        bytes[at - 4..at].fill(0);
+        let (demux, packets) = collect_fragments(&bytes, 11);
+        assert_eq!(packets.len(), 12);
+        demux.finish().unwrap();
+    }
+
+    #[test]
+    #[ignore = "set WEBMEDIA_FRAGMENTED_MP4 to the downloaded CNN hero"]
+    fn fragmented_cnn_demux_streams_all_audio_and_video_samples() {
+        let bytes = std::fs::read(std::env::var("WEBMEDIA_FRAGMENTED_MP4").unwrap()).unwrap();
+        let (demux, packets) = collect_fragments(&bytes, 4093);
+        demux.finish().unwrap();
+        let audio = packets.iter().filter(|p| p.track == Track::Audio).count();
+        let video = packets.iter().filter(|p| p.track == Track::Video).count();
+        // Independently counted with ffprobe on this fixed CNN clip.
+        assert_eq!((video, audio), (240, 175));
+        assert!(packets.iter().all(|p| p.fragmented && !p.data.is_empty()));
+        assert!(demux.bytes.is_empty());
+        eprintln!("CNN demux: {video} video and {audio} audio packets");
+    }
+
+    #[test]
+    #[ignore = "set WEBMEDIA_FRAGMENTED_MP4 to the downloaded CNN hero"]
+    fn fragmented_cnn_decodes_video_and_aac_through_existing_workers() {
+        use super::super::mp4_video::Mp4VideoPackets;
+        use crate::audio::mp4::Mp4AacDecoder;
+        let bytes = std::fs::read(std::env::var("WEBMEDIA_FRAGMENTED_MP4").unwrap()).unwrap();
+        let (demux, packets) = collect_fragments(&bytes, 4093);
+        let mut metadata = demux.video_index().unwrap().clone();
+        metadata.samples.clear();
+        let mut video = Mp4VideoPackets::new_fragmented(metadata, 0).unwrap();
+        let mut audio = Mp4AacDecoder::new(demux.audio_index().unwrap()).unwrap();
+        let mut decoded = 0;
+        let mut last_time = -1.0;
+        let mut signal = false;
+        let mut audio_frames = 0;
+        for packet in packets {
+            match packet.track {
+                Track::Video if packet.sample_number < 18 => {
+                    for frame in video
+                        .push_sample(packet.sample_number, packet.sample, &packet.data)
+                        .unwrap()
+                    {
+                        assert_eq!((frame.width, frame.height), (1440, 1080));
+                        assert!(frame.timestamp >= last_time);
+                        last_time = frame.timestamp;
+                        decoded += 1;
+                    }
+                }
+                Track::Audio if packet.sample_number < 32 => {
+                    if let Some(frame) = audio
+                        .decode(packet.presentation_time, &packet.data)
+                        .unwrap()
+                    {
+                        audio_frames += frame.samples.samples.len();
+                        signal |= frame
+                            .samples
+                            .samples
+                            .iter()
+                            .any(|sample| sample.abs() > 0.0001);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            decoded > 0,
+            "fragment reorder must not hold the entire movie"
+        );
+        // The CNN loop's AAC track is digital silence (ffmpeg astats: -inf).
+        assert!(!signal && audio_frames > 1024);
+        eprintln!("CNN decoded {decoded} early video frames and {audio_frames} PCM samples");
+    }
+
+    #[test]
+    #[ignore = "set WEBMEDIA_FRAGMENTED_LOCAL_MP4 to goodtimes_h264_fragmented.mp4"]
+    fn fragmented_local_video_and_audible_audio_decode_to_eof() {
+        use super::super::mp4_video::Mp4VideoPackets;
+        use crate::audio::mp4::Mp4AacDecoder;
+        let bytes = std::fs::read(std::env::var("WEBMEDIA_FRAGMENTED_LOCAL_MP4").unwrap()).unwrap();
+        let (demux, packets) = collect_fragments(&bytes, 4093);
+        demux.finish().unwrap();
+        let expected = demux.video_index().unwrap().samples.len();
+        let mut metadata = demux.video_index().unwrap().clone();
+        metadata.samples.clear();
+        let mut video = Mp4VideoPackets::new_fragmented(metadata, 0).unwrap();
+        let mut audio_metadata = demux.audio_index().unwrap().clone();
+        audio_metadata.duration_ticks = 0;
+        let mut audio = Mp4AacDecoder::new(&audio_metadata).unwrap();
+        let mut times = Vec::new();
+        let mut pcm = 0;
+        let mut signal = false;
+        let start = std::time::Instant::now();
+        for packet in packets {
+            match packet.track {
+                Track::Video => {
+                    times.extend(
+                        video
+                            .push_sample(packet.sample_number, packet.sample, &packet.data)
+                            .unwrap()
+                            .into_iter()
+                            .map(|frame| frame.timestamp),
+                    );
+                }
+                Track::Audio => {
+                    if let Some(frame) = audio
+                        .decode(packet.presentation_time, &packet.data)
+                        .unwrap()
+                    {
+                        pcm += frame.samples.samples.len();
+                        signal |= frame
+                            .samples
+                            .samples
+                            .iter()
+                            .any(|sample| sample.abs() > 0.001);
+                    }
+                }
+            }
+        }
+        loop {
+            let tail = video.finish_input().unwrap();
+            if tail.is_empty() {
+                break;
+            }
+            times.extend(tail.into_iter().map(|frame| frame.timestamp));
+        }
+        assert_eq!(
+            times.len(),
+            expected,
+            "every decoded picture must reach presentation"
+        );
+        assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(signal && pcm > 44100 * 20);
+        assert!(*times.last().unwrap() > 11.0);
+        eprintln!(
+            "Local fragmented decode: {} frames, {pcm} audible PCM samples in {:.2}s",
+            times.len(),
+            start.elapsed().as_secs_f64()
+        );
+    }
 
     #[test]
     fn incomplete_input_is_not_success() {
