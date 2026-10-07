@@ -7,4 +7,5 @@ pub mod mp4;
 pub mod opus;
 pub mod transform;
 pub mod vorbis;
+pub mod wav;
 pub mod webm;

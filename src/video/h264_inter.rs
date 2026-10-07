@@ -738,7 +738,7 @@ pub fn decode_cabac_p_2005(
     let reference = references
         .last()
         .ok_or(AvcError::Unsupported("P reference picture"))?;
-    if sps.profile_idc != 100
+    if !matches!(sps.profile_idc, 77 | 100)
         || sps.chroma_format_idc != 1
         || sps.bit_depth_luma != 8
         || sps.bit_depth_chroma != 8
@@ -1893,7 +1893,7 @@ pub fn decode_cabac_b_2005(
 ) -> Result<Yuv420Picture, AvcError> {
     #[cfg(test)]
     let _profile_picture = profiling::scope(profiling::Stage::Other);
-    if sps.profile_idc != 100
+    if !matches!(sps.profile_idc, 77 | 100)
         || sps.chroma_format_idc != 1
         || sps.bit_depth_luma != 8
         || sps.bit_depth_chroma != 8

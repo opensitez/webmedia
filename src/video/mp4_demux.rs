@@ -6,6 +6,7 @@ use super::mp4::{
 };
 
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_MOVIE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PACKETS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +57,72 @@ impl Mp4Demux {
             start_time: seconds,
             ..Self::default()
         })
+    }
+
+    /// Seed classic MP4 from a separately fetched movie box. Sample offsets remain
+    /// absolute file offsets; the caller starts input at `input_offset()`.
+    /// Fragmented MP4 returns None and must use the ordinary incremental path.
+    pub fn from_movie_box(movie: &[u8], file_size: u64, seconds: f64)
+        -> Result<Option<Self>, Mp4Error>
+    {
+        if movie.len() > MAX_MOVIE_BYTES { return Err(Mp4Error::TooLarge); }
+        let mut demux = Self::with_start_time(seconds)?;
+        match Mp4FragmentInit::parse_prefix(movie) {
+            Ok(_) => return Ok(None),
+            Err(Mp4Error::Unsupported("not fragmented MP4")) => {},
+            Err(error) => return Err(error),
+        }
+        demux.audio = Mp4AudioIndex::parse_prefix(movie)?;
+        demux.video = match Mp4VideoIndex::parse_prefix(movie) {
+            Ok(index) => Some(index),
+            Err(Mp4Error::Invalid("no video track")) => None,
+            Err(error) => return Err(error),
+        };
+        if demux.audio.is_none() && demux.video.is_none() {
+            return Err(Mp4Error::Invalid("no supported media tracks"));
+        }
+        for (timescale, samples) in demux.audio.iter().map(|index| (index.timescale, &index.samples))
+            .chain(demux.video.iter().map(|index| (index.timescale, &index.samples)))
+        {
+            if timescale == 0 { return Err(Mp4Error::Invalid("zero media timescale")); }
+            let mut previous_end = 0;
+            for sample in samples {
+                let end = sample.offset.checked_add(u64::from(sample.size)).ok_or(Mp4Error::TooLarge)?;
+                if sample.size as usize > MAX_BUFFER_BYTES { return Err(Mp4Error::TooLarge); }
+                if sample.offset < previous_end || end > file_size {
+                    return Err(Mp4Error::Invalid("sample outside file or nonmonotonic offsets"));
+                }
+                previous_end = end;
+            }
+        }
+        demux.select_start();
+        demux.indexed = true;
+        demux.base_offset = demux.next().map_or(file_size, |next| next.3.offset);
+        Ok(Some(demux))
+    }
+
+    /// Absolute offset at which the next push must begin.
+    pub fn input_offset(&self) -> u64 { self.base_offset + self.bytes.len() as u64 }
+
+    /// End of the final indexed sample, excluding a trailing movie box.
+    pub fn media_end(&self) -> Option<u64> {
+        self.audio.iter().flat_map(|index| &index.samples)
+            .chain(self.video.iter().flat_map(|index| &index.samples))
+            .filter_map(|sample| sample.offset.checked_add(u64::from(sample.size))).max()
+    }
+
+    fn select_start(&mut self) {
+        if self.start_time <= 0.0 { return; }
+        if let Some(index) = &self.audio {
+            self.next_audio = index.samples.partition_point(|sample|
+                sample.presentation_time as f64 / f64::from(index.timescale) < self.start_time)
+                .saturating_sub(2);
+        }
+        if let Some(index) = &self.video {
+            self.next_video = index.samples.iter().rposition(|sample|
+                sample.keyframe && sample.presentation_time as f64 / f64::from(index.timescale)
+                    <= self.start_time).unwrap_or(0);
+        }
     }
 
     pub fn audio_index(&self) -> Option<&Mp4AudioIndex> {
@@ -206,28 +273,7 @@ impl Mp4Demux {
             }
             self.audio = audio;
             self.video = video;
-            if self.start_time > 0.0 {
-                if let Some(index) = &self.audio {
-                    self.next_audio = index
-                        .samples
-                        .partition_point(|sample| {
-                            sample.presentation_time as f64 / f64::from(index.timescale)
-                                < self.start_time
-                        })
-                        .saturating_sub(2);
-                }
-                if let Some(index) = &self.video {
-                    self.next_video = index
-                        .samples
-                        .iter()
-                        .rposition(|sample| {
-                            sample.keyframe
-                                && sample.presentation_time as f64 / f64::from(index.timescale)
-                                    <= self.start_time
-                        })
-                        .unwrap_or(0);
-                }
-            }
+            self.select_start();
             self.indexed = true;
         }
         self.scan_fragments()?;
@@ -313,6 +359,86 @@ impl Mp4Demux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classic_movie(offset: u64) -> Vec<u8> {
+        fn atom(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut bytes = ((data.len() + 8) as u32).to_be_bytes().to_vec();
+            bytes.extend(kind);
+            bytes.extend(data);
+            bytes
+        }
+        fn words(values: &[u32]) -> Vec<u8> {
+            values.iter().flat_map(|value| value.to_be_bytes()).collect()
+        }
+        let mut entry = vec![0; 78];
+        entry[24..26].copy_from_slice(&2u16.to_be_bytes());
+        entry[26..28].copy_from_slice(&2u16.to_be_bytes());
+        let mut description = words(&[0, 1]);
+        description.extend(atom(b"vp08", &entry));
+        let mut offsets = words(&[0, 1]);
+        offsets.extend(offset.to_be_bytes());
+        let mut tables = atom(b"stsd", &description);
+        for (kind, data) in [(b"stsz", words(&[0, 0, 2, 6, 6])),
+            (b"stsc", words(&[0, 1, 1, 2, 1])), (b"stts", words(&[0, 1, 2, 100]))] {
+            tables.extend(atom(kind, &data));
+        }
+        tables.extend(atom(b"co64", &offsets));
+        let mut media = atom(b"mdhd", &words(&[0, 0, 0, 1000]));
+        let mut handler = words(&[0, 0]);
+        handler.extend(b"vide");
+        media.extend(atom(b"hdlr", &handler));
+        media.extend(atom(b"minf", &atom(b"stbl", &tables)));
+        atom(b"moov", &atom(b"trak", &atom(b"mdia", &media)))
+    }
+
+    #[test]
+    fn separately_fetched_trailing_movie_keeps_absolute_offsets_and_bounded_input() {
+        let sample_offset = 99 * 1024 * 1024u64;
+        let movie = classic_movie(sample_offset);
+        let mut demux = Mp4Demux::from_movie_box(&movie, sample_offset + 12 + movie.len() as u64, 0.0)
+            .unwrap().unwrap();
+        assert_eq!(demux.input_offset(), sample_offset);
+        assert_eq!(demux.media_end(), Some(sample_offset + 12));
+        let mut packets = Vec::new();
+        for chunk in [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].chunks(2) {
+            packets.extend(demux.push(chunk).unwrap());
+            assert!(demux.bytes.len() <= 12);
+        }
+        demux.finish().unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].data, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(packets[1].data, [7, 8, 9, 10, 11, 12]);
+        assert_eq!(packets[1].sample.offset, sample_offset + 6);
+        assert_eq!(packets[1].sample_number, 1);
+    }
+
+    #[test]
+    fn seeded_seek_starts_at_selected_keyframe_and_rejects_out_of_file_samples() {
+        let movie = classic_movie(100_000_000);
+        let mut demux = Mp4Demux::from_movie_box(&movie, 100_000_012, 0.1).unwrap().unwrap();
+        assert_eq!(demux.input_offset(), 100_000_006);
+        let packets = demux.push(&[7, 8, 9, 10, 11, 12]).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].sample_number, 1);
+        assert_eq!(packets[0].presentation_time, 100);
+        demux.finish().unwrap();
+        assert!(matches!(Mp4Demux::from_movie_box(&movie, 100_000_011, 0.0),
+            Err(Mp4Error::Invalid("sample outside file or nonmonotonic offsets"))));
+        assert!(Mp4Demux::from_movie_box(&movie, u64::MAX, f64::NAN).is_err());
+        assert!(Mp4Demux::from_movie_box(&classic_movie(u64::MAX - 5), u64::MAX, 0.0).is_err());
+    }
+
+    #[test]
+    fn fragmented_movie_seed_keeps_incremental_fragment_path() {
+        let bytes = super::super::mp4::fragmented_test_file();
+        assert!(Mp4Demux::from_movie_box(&bytes, bytes.len() as u64, 0.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn public_movie_seed_rejects_oversized_input_before_parsing() {
+        let bytes = vec![0; MAX_MOVIE_BYTES + 1];
+        assert!(matches!(Mp4Demux::from_movie_box(&bytes, u64::MAX, 0.0), Err(Mp4Error::TooLarge)));
+    }
 
     fn collect_fragments(bytes: &[u8], chunk_size: usize) -> (Mp4Demux, Vec<Packet>) {
         let mut demux = Mp4Demux::new();

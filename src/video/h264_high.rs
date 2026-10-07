@@ -149,7 +149,7 @@ pub fn decode_cabac_i_yuv_2005(
 ) -> Result<(Yuv420Picture, Vec<MemoryManagement>), AvcError> {
     #[cfg(test)]
     let _profile_picture = super::h264_inter::profiling::scope(super::h264_inter::profiling::Stage::Other);
-    if sps.profile_idc != 100
+    if !matches!(sps.profile_idc, 77 | 100)
         || sps.chroma_format_idc != 1
         || sps.bit_depth_luma != 8
         || sps.bit_depth_chroma != 8

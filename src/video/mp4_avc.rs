@@ -133,7 +133,20 @@ impl Mp4AvcPackets {
         } else { return Err(Mp4AvcStream::invalid("missing or excessive sample metadata")); }
         let frames = self.push(number, data)?;
         self.requires_keyframe = false;
+        self.compact_fragmented_metadata();
         Ok(frames)
+    }
+
+    fn compact_fragmented_metadata(&mut self) {
+        if !self.stream.fragmented || self.stream.next_sample < 4096 { return; }
+        // Keep the last consumed entry for monotonic DTS validation. Pictures
+        // and codec references own their timestamps, not sample-table indices.
+        let consumed = self.stream.next_sample - 1;
+        let index = self.stream.index.as_mut().unwrap();
+        index.samples.drain(..consumed);
+        index.samples.shrink_to(index.samples.len().max(4096));
+        self.sample_base += consumed;
+        self.stream.next_sample -= consumed;
     }
 
     /// Repeat until empty to drain the bounded reorder tail at definitive EOF.
@@ -293,7 +306,7 @@ impl Mp4AvcStream {
                             let pps = parse_pps_2003(pps).map_err(Self::avc_error)?;
                             decode_intra_2003(&nal, sps, &pps).map_err(Self::avc_error)?
                         }
-                        100 => {
+                        77 | 100 => {
                             let pps = parse_pps_2005(pps).map_err(Self::avc_error)?;
                             let yuv = decode_cabac_idr_yuv_2005(&nal, sps, &pps)
                                 .map_err(Self::avc_error)?;
@@ -635,6 +648,28 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_packet_metadata_stays_bounded_without_resetting_codec_output() {
+        let (index, data) = fragmented_packet_fixture();
+        let mut decoder = Mp4AvcPackets::new_fragmented(index, 0).unwrap();
+        let mut frames = 0;
+        for number in 0..4200 {
+            let output = decoder.push_sample(number, Sample { offset: number as u64 * data.len() as u64,
+                size: data.len() as u32, decode_time: number as u64 * 40,
+                presentation_time: number as i64 * 40, keyframe: true }, &data).unwrap();
+            frames += output.len();
+            assert!(decoder.stream.index.as_ref().unwrap().samples.len() <= 4096);
+        }
+        loop {
+            let tail = decoder.finish_input().unwrap();
+            if tail.is_empty() { break; }
+            frames += tail.len();
+        }
+        assert_eq!(frames, 4200);
+        assert!(decoder.sample_base > 0);
+        assert!(decoder.stream.index.as_ref().unwrap().samples.capacity() <= 4096);
+    }
+
+    #[test]
     fn fragmented_avc_future_epoch_holds_and_drains_exact_classic_pixels() {
         let (index, data) = fragmented_packet_fixture();
         let mut classic = Mp4AvcPackets::new(index.clone()).unwrap();
@@ -947,6 +982,34 @@ mod tests {
             (1280, 720)
         );
         assert!(rejection.is_none(), "prefix rejection: {rejection:?}");
+    }
+
+    #[test]
+    fn main_profile_cabac_stream_emits_all_reordered_frames() {
+        let bytes = include_bytes!("../../tests/fixtures/h264-main.mp4");
+        let index = Mp4Index::parse_prefix(bytes).unwrap();
+        assert_eq!(index.config.sequence_parameters[0].profile_idc, 77);
+        assert_eq!(index.samples.len(), 12);
+        let mut decoder = Mp4AvcPackets::new(index.clone()).unwrap();
+        let mut frames = Vec::new();
+        for (number, sample) in index.samples.iter().enumerate() {
+            let start = sample.offset as usize;
+            let end = start + sample.size as usize;
+            frames.extend(decoder.push(number, &bytes[start..end]).unwrap());
+        }
+        loop {
+            let tail = decoder.finish_input().unwrap();
+            if tail.is_empty() {
+                break;
+            }
+            frames.extend(tail);
+        }
+        assert_eq!(decoder.stream.dropped_until_idr_samples, 0);
+        assert_eq!(decoder.stream.dropped_nonreference_samples, 0);
+        assert_eq!(frames.len(), 12);
+        assert!(frames.iter().all(|frame| (frame.width, frame.height) == (32, 32)));
+        assert!(frames.windows(2).all(|pair| pair[0].timestamp < pair[1].timestamp));
+        assert!(frames[0].rgba.chunks_exact(4).any(|pixel| pixel[..3] != [0, 0, 0]));
     }
 
     #[test]
