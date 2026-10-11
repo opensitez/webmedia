@@ -9,6 +9,30 @@ pub fn is_jpeg_xl(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xff, 0x0a]) || bytes.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n")
 }
 
+/// Read basic image information without allocating an output pixel buffer.
+pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    let mut options = JxlDecoderOptions::default();
+    options.sample_limit = Some(64 * 1024 * 1024);
+    let mut input = Input { reader: std::io::Cursor::new(bytes), bytes: Vec::new(), consumed: 0 };
+    let mut decoder = JxlDecoder::new(options);
+    loop {
+        let mut bytes = &input.bytes[input.consumed..];
+        let result = decoder.process(&mut bytes, None).map_err(|error| error.to_string())?;
+        input.consumed = input.bytes.len() - bytes.len();
+        match result {
+            ProcessingResult::Complete { result } => {
+                let (width, height) = result.basic_info().size;
+                return Ok((u32::try_from(width).map_err(|_| "JPEG XL width exceeds limits")?,
+                    u32::try_from(height).map_err(|_| "JPEG XL height exceeds limits")?));
+            }
+            ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                decoder = fallback;
+                input.refill()?;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

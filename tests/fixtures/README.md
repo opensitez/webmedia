@@ -1,4 +1,15 @@
-# VP8 and VP9 Fixtures
+# Video Fixtures
+
+`h264-main.mp4` is an original synthetic 32x32, twelve-frame H.264 Main
+profile CABAC fixture with reordered B pictures. It checks MP4 dispatch and
+shared I/P/B decoding without a network request or runtime FFmpeg dependency.
+Regenerate from this directory with:
+
+```sh
+ffmpeg -v error -f lavfi -i testsrc2=size=32x32:rate=6 -frames:v 12 \
+  -c:v libx264 -profile:v main -pix_fmt yuv420p -bf 2 -g 12 \
+  -movflags +faststart h264-main.mp4
+```
 
 `vp8-opus-startup.webm` is a 6,174-byte synthetic audio/video fixture for
 playback startup, failure, and clock handoff tests. It contains a 32x32 red

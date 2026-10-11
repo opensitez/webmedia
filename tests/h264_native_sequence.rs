@@ -4,6 +4,8 @@
 //! For paired timing, compile with `--test`, set H264_WORKER_FIXTURE (and optionally
 //! H264_WORKER_SAMPLES), then run benchmark_actual_same_frame_blend_cache --ignored --nocapture.
 #![allow(dead_code)]
+#[cfg(feature = "acceleration")]
+pub use webmedia::{InvalidRgbaSurface, RgbaSurface};
 #[path = "../src/video/backend.rs"]
 mod backend;
 pub use backend::VideoFrame;

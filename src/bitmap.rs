@@ -1,4 +1,4 @@
-//! Decode PNG, JPEG, JPEG XL, GIF, WebP, and BMP into premultiplied RGBA8.
+//! Decode PNG, JPEG, JPEG XL, GIF, WebP, BMP, and ICO into premultiplied RGBA8.
 
 pub mod jpeg_xl;
 pub mod avif;
@@ -47,6 +47,21 @@ pub fn decode_raster(bytes: &[u8]) -> Result<RasterImage, image::ImageError> {
     })
 }
 
+/// Read the display dimensions without allocating decoded pixel storage.
+/// Uses the same byte-based format identification as `decode_raster`.
+pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32), image::ImageError> {
+    if avif::is_avif(bytes) {
+        return avif::dimensions(bytes).map_err(|error| image::ImageError::IoError(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error)));
+    }
+    if jpeg_xl::is_jpeg_xl(bytes) {
+        return jpeg_xl::dimensions(bytes).map_err(|error| image::ImageError::IoError(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error)));
+    }
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?.into_dimensions()
+}
+
 /// Convert straight RGBA8 pixels to premultiplied RGBA8 in place.
 #[inline]
 pub fn premultiply_rgba(rgba: &mut [u8]) {
@@ -78,6 +93,20 @@ mod tests {
         assert_eq!(surface.pixels().as_ptr(), address);
         assert_eq!(surface.dimensions(), (1, 1));
         assert_eq!(surface.layer_frame([0., 0., 10., 10.]).rgba.as_ptr(), address);
+    }
+
+    #[test]
+    fn ico_is_identified_from_bytes_and_preserves_transparency() {
+        let pixels = image::RgbaImage::from_raw(2, 1,
+            vec![200, 100, 50, 128, 40, 80, 120, 255]).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut output, image::ImageFormat::Ico)
+            .unwrap();
+        let decoded = decode_raster(output.get_ref()).unwrap();
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(decoded.rgba, [100, 50, 25, 128, 40, 80, 120, 255]);
+        assert!(decode_raster(&output.get_ref()[..12]).is_err());
     }
 
     #[test]

@@ -11,10 +11,11 @@ pub(crate) fn deblock(
     tx: &[Vec<(u8, u8)>],
     motion: &[Option<super::inter::MotionCell>],
     skips: &[bool],
+    segments: &[u8],
     mi_cols: usize,
 ) -> Result<(), Error> {
-    if h.segmentation_enabled || h.delta_lf.is_some() {
-        return Err(Error::Unsupported("segmented or delta loop filter"));
+    if h.delta_lf.is_some() {
+        return Err(Error::Unsupported("delta loop filter"));
     }
     for (plane, p) in planes.iter_mut().enumerate() {
         if plane > 0 && h.loop_filter_levels[plane + 1] == 0 {
@@ -75,6 +76,12 @@ pub(crate) fn deblock(
                         let cell = motion[at]
                             .ok_or(Error::Invalid("missing adjacent loop filter mode info"))?;
                         let mut level = i32::from(h.loop_filter_levels[index]);
+                        if h.segmentation_enabled {
+                            let segment = usize::from(segments[at]);
+                            if h.segment_feature_enabled[segment][index + 1] {
+                                level = (level + h.segment_features[segment][index + 1]).clamp(0, 63);
+                            }
+                        }
                         if h.loop_filter_delta_enabled {
                             let shift = level >> 5;
                             level +=

@@ -29,6 +29,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quantizer_matrix_eob_matches_normative_signed_reconstruction() {
+        for (tx, (w, h)) in super::super::coefficients::TX_DIMENSIONS.into_iter().enumerate() {
+            let tw = w.min(32);
+            let th = h.min(32);
+            let offset = super::super::quantization_tables::OFFSETS[tx];
+            let denom = match tx { 3 | 9 | 10 | 17 | 18 => 2, 4 | 11 | 12 => 4, _ => 1 };
+            for level in 0..15 {
+                for plane in 0..2 {
+                    let matrix = &super::super::quantization_tables::MATRICES[level][plane]
+                        [offset..offset + tw * th];
+                    for class in 0..3 {
+                        let scan = super::super::coefficients::coefficient_scan(class, tw, th).unwrap();
+                        for eob in [1, scan.len() / 2, scan.len()] {
+                            let mut input = vec![0; w * h];
+                            for (i, &position) in scan[..eob].iter().enumerate() {
+                                let position = usize::from(position);
+                                input[position / tw * w + position % tw] =
+                                    if i % 2 == 0 { 12345 } else { -54321 };
+                            }
+                            let mut actual = input.clone();
+                            dequantize_eob_matrix(&mut actual, w, &scan[..eob],
+                                65535, 32767, denom, 1 << 19, Some(matrix));
+                            for row in 0..h {
+                                for col in 0..w {
+                                    let i = row * w + col;
+                                    let expected = if row >= th || col >= tw { 0 } else {
+                                        let q = if i == 0 { 65535i64 } else { 32767 };
+                                        let q2 = (q * i64::from(matrix[row * tw + col]) + 16) / 32;
+                                        let product = i64::from(input[i]) * q2;
+                                        let value = product.signum() * (product.abs() % (1 << 24)) / denom;
+                                        value.clamp(-(1 << 19), (1 << 19) - 1) as i32
+                                    };
+                                    assert_eq!(actual[i], expected, "tx={tx} level={level} plane={plane} index={i}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn eob_dequant_matches_full_signed_math_and_64_padding() {
         assert!(!EOB_DEQUANT_REFERENCE.get(), "test default must match production");
         let values = [0, 1, -1, 1024, -1024, 0xfffff, -0xfffff,
@@ -514,7 +557,7 @@ pub(crate) fn set_eob_dequant_reference(reference: bool) {
 }
 
 #[inline(always)]
-fn dequantized_value(coefficient: i32, quant: u16, denom: i64, bound: i64) -> i32 {
+fn dequantized_value(coefficient: i32, quant: u32, denom: i64, bound: i64) -> i32 {
     let product = i64::from(coefficient) * i64::from(quant);
     let dequant = ((product.abs() & 0xffffff) / denom) * product.signum();
     dequant.clamp(-bound, bound - 1) as i32
@@ -524,7 +567,7 @@ fn dequantized_value(coefficient: i32, quant: u16, denom: i64, bound: i64) -> i3
 #[cfg(test)]
 fn dequantize_full(coefficients: &mut [i32], dc: u16, ac: u16, denom: i64, bound: i64) {
     for (i, coefficient) in coefficients.iter_mut().enumerate() {
-        *coefficient = dequantized_value(*coefficient, if i == 0 { dc } else { ac }, denom, bound);
+        *coefficient = dequantized_value(*coefficient, u32::from(if i == 0 { dc } else { ac }), denom, bound);
     }
 }
 
@@ -532,13 +575,20 @@ fn dequantize_eob(
     coefficients: &mut [i32], w: usize, scan_prefix: &[u16],
     dc: u16, ac: u16, denom: i64, bound: i64,
 ) {
+    dequantize_eob_matrix(coefficients, w, scan_prefix, dc, ac, denom, bound, None);
+}
+
+fn dequantize_eob_matrix(
+    coefficients: &mut [i32], w: usize, scan_prefix: &[u16],
+    dc: u16, ac: u16, denom: i64, bound: i64, matrix: Option<&[u8]>,
+) {
     // Entropy positions use <=32 columns; wide transforms retain their padded row stride.
     for &position in scan_prefix {
         let position = usize::from(position);
         let index = if w <= 32 { position } else { (position >> 5) * w + (position & 31) };
-        coefficients[index] = dequantized_value(
-            coefficients[index], if index == 0 { dc } else { ac }, denom, bound,
-        );
+        let quant = u32::from(if position == 0 { dc } else { ac });
+        let quant = matrix.map_or(quant, |weights| (quant * u32::from(weights[position]) + 16) >> 5);
+        coefficients[index] = dequantized_value(coefficients[index], quant, denom, bound);
     }
 }
 
@@ -652,6 +702,8 @@ pub(crate) struct IntraTile<'a> {
     uv_no_cfl: Vec<u16>,
     uv_cfl: Vec<u16>,
     skip_cdf: [[u16; 3]; 3],
+    segment_cdfs: [[u16; 9]; 3],
+    segment_ids: Vec<u8>,
     filter_cdf: [[u16; 3]; 22],
     filter_mode_cdf: [u16; 6],
     angle_cdf: [[u16; 8]; 8],
@@ -687,6 +739,7 @@ pub(crate) struct FrameCdfs {
     uv_no_cfl: Vec<u16>,
     uv_cfl: Vec<u16>,
     skip: [[u16; 3]; 3],
+    segments: [[u16; 9]; 3],
     filter: [[u16; 3]; 22],
     filter_mode: [u16; 6],
     angle: [[u16; 8]; 8],
@@ -718,6 +771,9 @@ impl FrameCdfs {
         reset(&mut self.uv_cfl, 15);
         for row in &mut self.skip {
             row[2] = 0;
+        }
+        for row in &mut self.segments {
+            row[8] = 0;
         }
         for row in &mut self.filter {
             row[2] = 0;
@@ -1117,6 +1173,7 @@ impl<'a> IntraTile<'a> {
             uv_no_cfl: self.uv_no_cfl.clone(),
             uv_cfl: self.uv_cfl.clone(),
             skip: self.skip_cdf,
+            segments: self.segment_cdfs,
             filter: self.filter_cdf,
             filter_mode: self.filter_mode_cdf,
             angle: self.angle_cdf,
@@ -1139,6 +1196,7 @@ impl<'a> IntraTile<'a> {
         self.uv_no_cfl = c.uv_no_cfl;
         self.uv_cfl = c.uv_cfl;
         self.skip_cdf = c.skip;
+        self.segment_cdfs = c.segments;
         self.filter_cdf = c.filter;
         self.filter_mode_cdf = c.filter_mode;
         self.angle_cdf = c.angle;
@@ -1163,13 +1221,11 @@ impl<'a> IntraTile<'a> {
         if h.tiles.count() > 1 && matches!(h.frame_type, 1 | 3) {
             return Err(Error::Unsupported("multiple inter-frame tiles"));
         }
-        if h.allow_intrabc
-            || h.segmentation_enabled
-            || h.quantizer_matrix_levels.is_some()
-        {
-            return Err(Error::Unsupported(
-                "intra block tools, quantizer matrix or restoration",
-            ));
+        if h.allow_intrabc {
+            return Err(Error::Unsupported("intra block copy"));
+        }
+        if h.segmentation_enabled && matches!(h.frame_type, 1 | 3) {
+            return Err(Error::Unsupported("inter-frame segmentation"));
         }
         if h.width as u64 * h.height as u64 > 16 * 1024 * 1024 {
             return Err(Error::Unsupported("AV1 pixel allocation limit"));
@@ -1203,6 +1259,8 @@ impl<'a> IntraTile<'a> {
             uv_no_cfl: tables::UV_NO_CFL.to_vec(),
             uv_cfl: tables::UV_CFL.to_vec(),
             skip_cdf: [[31671, 32768, 0], [16515, 32768, 0], [4576, 32768, 0]],
+            segment_cdfs: super::segmentation::DEFAULT_CDFS,
+            segment_ids: vec![0; cols * rows],
             filter_cdf,
             filter_mode_cdf: [8949, 12776, 17211, 29558, 32768, 0],
             angle_cdf: [
@@ -1345,7 +1403,7 @@ impl<'a> IntraTile<'a> {
                 self.read_deltas = self.h.delta_q_resolution.is_some();
                 self.restoration.read(
                     &mut self.decoder,
-                    &mut self.inter_cdfs.wiener,
+                    &mut self.inter_cdfs,
                     self.s,
                     self.h,
                     y,
@@ -1368,6 +1426,7 @@ impl<'a> IntraTile<'a> {
             &self.filter_tx,
             &self.motion_cells,
             &skips,
+            &self.segment_ids,
             self.cols,
         )?;
         observer("deblocked", self);
@@ -1404,6 +1463,24 @@ impl<'a> IntraTile<'a> {
                 None
             },
         )
+    }
+
+    fn read_segment(&mut self, x: usize, y: usize, w: usize, h: usize, skip: bool) -> Result<u8, Error> {
+        if !self.h.segmentation_enabled { return Ok(0); }
+        let upper = y > self.tile_bounds[1];
+        let left = x > self.tile_bounds[0];
+        let neighbors = [
+            (upper && left).then(|| self.segment_ids[(y - 1) * self.cols + x - 1]),
+            upper.then(|| self.segment_ids[(y - 1) * self.cols + x]),
+            left.then(|| self.segment_ids[y * self.cols + x - 1]),
+        ];
+        let segment = super::segmentation::read(&mut self.decoder, &mut self.segment_cdfs,
+            self.h, neighbors, skip)?;
+        for row in y..(y + h / 4).min(self.tile_bounds[3]) {
+            self.segment_ids[row * self.cols + x..row * self.cols + (x + w / 4).min(self.tile_bounds[2])]
+                .fill(segment);
+        }
+        Ok(segment)
     }
 
     fn partition(&mut self, x: usize, y: usize, size: usize) -> Result<(), Error> {
@@ -1519,6 +1596,8 @@ impl<'a> IntraTile<'a> {
             .position(|&d| d == (w, h))
             .ok_or(Error::Invalid("block dimensions"))?;
         let (above, left) = self.neighbors(x, y);
+        let pre_skip = super::segmentation::pre_skip(self.h);
+        let mut segment = if pre_skip { self.read_segment(x, y, w, h, false)? } else { 0 };
         let inter_frame = matches!(self.h.frame_type, 1 | 3);
         let motion_above = if y > 0 {
             self.motion_cells[(y - 1) * self.cols + x]
@@ -1538,7 +1617,10 @@ impl<'a> IntraTile<'a> {
                 .read_skip_mode(&mut self.decoder, motion_above, motion_left)?;
         let skip_ctx =
             usize::from(above.is_some_and(|c| c.skip)) + usize::from(left.is_some_and(|c| c.skip));
-        let skip = skip_mode || self.decoder.read_symbol(&mut self.skip_cdf[skip_ctx])? != 0;
+        let skip = skip_mode || (pre_skip && super::segmentation::skip(self.h, segment))
+            || self.decoder.read_symbol(&mut self.skip_cdf[skip_ctx])? != 0;
+        if !pre_skip { segment = self.read_segment(x, y, w, h, skip)?; }
+        let lossless = super::segmentation::lossless(self.h, segment);
         let cdef_columns = self.cols.div_ceil(16);
         let cdef_offset = (y / 16) * cdef_columns + x / 16;
         if !skip && !self.h.coded_lossless && self.s.enable_cdef && self.cdef_indices[cdef_offset] < 0 {
@@ -1570,6 +1652,8 @@ impl<'a> IntraTile<'a> {
             }
         }
         self.read_deltas = false;
+        let block_qindex = super::segmentation::qindex(self.h, segment, self.qindex);
+        let base_qindex = super::segmentation::qindex(self.h, segment, self.h.base_q_idx);
         let is_inter = inter_frame
             && (skip_mode
                 || self
@@ -1627,7 +1711,7 @@ impl<'a> IntraTile<'a> {
         if has_chroma && !is_inter {
             let uv_w = (w >> usize::from(self.s.subsampling_x)).max(4);
             let uv_h = (h >> usize::from(self.s.subsampling_y)).max(4);
-            let cfl_allowed = if self.h.coded_lossless {
+            let cfl_allowed = if lossless {
                 uv_w == 4 && uv_h == 4
             } else {
                 w.max(h) <= 32
@@ -1686,13 +1770,13 @@ impl<'a> IntraTile<'a> {
                 [w.min((self.cols - x) * 4), h.min((self.rows - y) * 4)],
                 [self.s.subsampling_x, self.s.subsampling_y])?;
         }
-        let (mut tw, mut th) = if self.h.coded_lossless {
+        let (mut tw, mut th) = if lossless {
             (4, 4)
         } else {
             // Max_Tx_Size_Rect caps 128-pixel blocks at 64-pixel transforms.
             (w.min(64), h.min(64))
         };
-        if !is_inter && !self.h.coded_lossless && self.h.tx_mode_select && block_index > 0 {
+        if !is_inter && !lossless && self.h.tx_mode_select && block_index > 0 {
             let ctx = usize::from(above.is_some_and(|c| {
                 usize::from(if motion_above.is_some_and(|m| m.refs[0] > 0) {
                     c.width
@@ -1720,7 +1804,7 @@ impl<'a> IntraTile<'a> {
             }
         }
         let mut inter_txs = Vec::new();
-        if is_inter && !skip && !self.h.coded_lossless && self.h.tx_mode_select && w.max(h) > 4 {
+        if is_inter && !skip && !lossless && self.h.tx_mode_select && w.max(h) > 4 {
             self.read_var_tx([y, x], [y, x], [th, tw], [h, w], 0, &mut inter_txs)?;
         }
         let index = self.progress.blocks.len();
@@ -1732,7 +1816,7 @@ impl<'a> IntraTile<'a> {
             skip,
             y_mode,
             uv_mode,
-            qindex: self.qindex,
+            qindex: block_qindex,
             reconstructed: false,
         });
         // CFL uses complete reconstructed transforms, including their non-visible edge samples.
@@ -1766,7 +1850,7 @@ impl<'a> IntraTile<'a> {
             let ph = (h >> sy).max(4);
             let (ptw, pth) = if plane == 0 {
                 (tw, th)
-            } else if self.h.coded_lossless {
+            } else if lossless {
                 (4, 4)
             } else {
                 if pw == 64 || ph == 64 {
@@ -2052,8 +2136,8 @@ impl<'a> IntraTile<'a> {
                             if plane == 0 {
                                 filter_mode.map_or(mode, |m| [0, 1, 2, 6, 0][m])
                             } else { mode },
-                            self.h.coded_lossless, self.h.reduced_tx_set,
-                            self.h.base_q_idx, inherited,
+                            lossless, self.h.reduced_tx_set,
+                            base_qindex, inherited,
                             &mut inter_scratch.quant_coefficients,
                             &mut inter_scratch.padded_coefficients,
                         )?)
@@ -2075,9 +2159,9 @@ impl<'a> IntraTile<'a> {
                         } else {
                             mode
                         },
-                        self.h.coded_lossless,
+                        lossless,
                         self.h.reduced_tx_set,
-                        self.h.base_q_idx,
+                        base_qindex,
                         inherited,
                     )?
                     };
@@ -2101,7 +2185,7 @@ impl<'a> IntraTile<'a> {
                         }];
                         let dc_quant = tables::DC_QUANT[((self.s.bit_depth - 8) / 2) as usize
                             * 256
-                            + (i32::from(self.qindex) + dc_delta).clamp(0, 255) as usize];
+                            + (i32::from(block_qindex) + dc_delta).clamp(0, 255) as usize];
                         let ac_delta = if plane == 0 {
                             0
                         } else {
@@ -2109,7 +2193,7 @@ impl<'a> IntraTile<'a> {
                         };
                         let ac_quant = tables::AC_QUANT[((self.s.bit_depth - 8) / 2) as usize
                             * 256
-                            + (i32::from(self.qindex) + ac_delta).clamp(0, 255) as usize];
+                            + (i32::from(block_qindex) + ac_delta).clamp(0, 255) as usize];
                         let denom = match tx_index(ptw, pth)? {
                             3 | 9 | 10 | 17 | 18 => 2,
                             4 | 11 | 12 => 4,
@@ -2120,20 +2204,35 @@ impl<'a> IntraTile<'a> {
                         let reference = EOB_DEQUANT_REFERENCE.get();
                         #[cfg(not(test))]
                         let reference = false;
+                        let matrix = self.h.quantizer_matrix_levels.and_then(|levels| {
+                            let level = usize::from(levels[plane]);
+                            if level >= 15 || decoded.tx_type >= 9 || lossless {
+                                None
+                            } else {
+                                let offset = super::quantization_tables::OFFSETS[tx_index(ptw, pth).ok()?];
+                                Some(&super::quantization_tables::MATRICES[level][usize::from(plane > 0)]
+                                    [offset..offset + ptw.min(32) * pth.min(32)])
+                            }
+                        });
                         #[cfg(test)]
-                        if reference {
+                        if reference && matrix.is_none() {
                             dequantize_full(&mut coefficients, dc_quant, ac_quant, denom, bound);
                         }
-                        if !reference {
-                            dequantize_eob(&mut coefficients, ptw, decoded.scan_prefix,
-                                dc_quant, ac_quant, denom, bound);
+                        if !reference || matrix.is_some() {
+                            if matrix.is_none() {
+                                dequantize_eob(&mut coefficients, ptw, decoded.scan_prefix,
+                                    dc_quant, ac_quant, denom, bound);
+                            } else {
+                                dequantize_eob_matrix(&mut coefficients, ptw, decoded.scan_prefix,
+                                    dc_quant, ac_quant, denom, bound, matrix);
+                            }
                         }
                         #[cfg(test)]
                         if INTER_SCRATCH_REFERENCE.with(|flag| flag.get()) {
                             inter_scratch.residual = Vec::new();
                         }
                         inter_scratch.residual.resize(ptw * pth, 0);
-                        if self.h.coded_lossless {
+                        if lossless {
                             inter_scratch
                                 .residual
                                 .copy_from_slice(&inverse_lossless_4x4(

@@ -156,9 +156,10 @@ pub fn decode_cabac_i_yuv_2005(
         || !sps.frame_mbs_only
         || sps.scaling_matrices_present
         || pps.scaling_matrices_present
-        || sps.width != sps.width_mbs * 16
+        || sps.width == 0
+        || sps.width + sps.crop_left > sps.width_mbs * 16
         || sps.height == 0
-        || sps.height > sps.frame_height_mbs * 16
+        || sps.height + sps.crop_top > sps.frame_height_mbs * 16
     {
         return Err(AvcError::Unsupported("High-profile I picture format"));
     }
@@ -167,11 +168,12 @@ pub fn decode_cabac_i_yuv_2005(
         return Err(AvcError::Unsupported("I picture starts in a later slice"));
     }
     let coded_height = sps.frame_height_mbs * 16;
-    let pixels = u64::from(sps.width) * u64::from(coded_height);
+    let coded_width = sps.width_mbs * 16;
+    let pixels = u64::from(coded_width) * u64::from(coded_height);
     if pixels > 8 * 1024 * 1024 {
         return Err(AvcError::TooLarge);
     }
-    let width = sps.width as usize;
+    let width = coded_width as usize;
     let height = coded_height as usize;
     let mut luma = vec![0; width * height];
     let mut cb = vec![0; width * height / 4];

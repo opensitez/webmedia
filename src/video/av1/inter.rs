@@ -72,6 +72,7 @@ macro_rules! cdf_fields {
 
 cdf_fields! {
     wiener: WIENER / 3,
+    sgrproj: SGRPROJ / 3, restoration_type: RESTORATION_TYPE / 4,
     y_mode: Y_MODE / 14, split: TXFM_SPLIT / 3,
     new_mv: NEW_MV / 3, zero_mv: ZERO_MV / 3, ref_mv: REF_MV / 3, drl: DRL_MODE / 3,
     is_inter: IS_INTER / 3, comp_mode: COMP_MODE / 3, skip_mode: SKIP_MODE / 3,

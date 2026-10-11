@@ -30,6 +30,8 @@ mod motion;
 mod motion_tables;
 #[path = "av1/prediction.rs"]
 mod prediction;
+#[path = "av1/quantization_tables.rs"]
+mod quantization_tables;
 #[cfg(test)]
 #[path = "av1/profile.rs"]
 mod profile;
@@ -37,6 +39,8 @@ mod profile;
 pub mod reconstruction;
 #[path = "av1/restoration.rs"]
 mod restoration;
+#[path = "av1/segmentation.rs"]
+mod segmentation;
 #[path = "av1/syntax.rs"]
 pub mod syntax;
 #[path = "av1/tables.rs"]

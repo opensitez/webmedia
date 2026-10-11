@@ -1,4 +1,4 @@
-//! Wiener restoration units and stripe filtering, AV1 5.11.57-58 and 7.17.4-6.
+//! Wiener, self-guided and switchable restoration, AV1 5.11.57-58 and 7.17.
 
 use super::decoder::DecodedPlane;
 use super::entropy::SymbolDecoder;
@@ -63,21 +63,112 @@ fn signed_subexp(
     Ok(low + v as i32)
 }
 
+#[derive(Clone, Copy)]
+enum Unit {
+    Wiener([[i32; 3]; 2]),
+    SelfGuided { set: usize, weights: [i32; 2] },
+}
+
+const SGR_PARAMS: [[i32; 4]; 16] = [
+    [2, 12, 1, 4], [2, 15, 1, 6], [2, 18, 1, 8], [2, 21, 1, 9],
+    [2, 24, 1, 10], [2, 29, 1, 11], [2, 36, 1, 12], [2, 45, 1, 13],
+    [2, 56, 1, 14], [2, 68, 1, 15], [0, 0, 1, 5], [0, 0, 1, 8],
+    [0, 0, 1, 11], [0, 0, 1, 14], [2, 30, 0, 0], [2, 75, 0, 0],
+];
+const SGR_SGR_BITS: u32 = 8;
+const SGR_RST_BITS: u32 = 4;
+const SGR_PRJ_BITS: u32 = 7;
+const SGR_MTABLE_BITS: u32 = 20;
+const SGR_RECIP_BITS: u32 = 12;
+
+fn round(value: i64, bits: u32) -> i64 {
+    if bits == 0 { value } else { (value + (1 << (bits - 1))) >> bits }
+}
+
+fn self_guided(
+    source: impl Fn(i32, i32) -> i16, width: usize, height: usize,
+    depth: u8, set: usize, weights: [i32; 2], output: &mut [u16], stride: usize,
+) {
+    let mut filtered = [Vec::new(), Vec::new()];
+    for pass in 0..2 {
+        let radius = SGR_PARAMS[set][pass * 2];
+        if radius == 0 { continue; }
+        let n = i64::from((2 * radius + 1).pow(2));
+        let n2e = n * n * i64::from(SGR_PARAMS[set][pass * 2 + 1]);
+        let scale = ((1 << SGR_MTABLE_BITS) + n2e / 2) / n2e;
+        let reciprocal = ((1 << SGR_RECIP_BITS) + n / 2) / n;
+        let pitch = width + 2;
+        let mut a = vec![0i64; pitch * (height + 2)];
+        let mut b = vec![0i64; a.len()];
+        for y in -1..=height as i32 {
+            for x in -1..=width as i32 {
+                let (mut squares, mut sum) = (0i64, 0i64);
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        let sample = i64::from(source(x + dx, y + dy));
+                        squares += sample * sample;
+                        sum += sample;
+                    }
+                }
+                squares = round(squares, 2 * u32::from(depth - 8));
+                let reduced = round(sum, u32::from(depth - 8));
+                let variance = (squares * n - reduced * reduced).max(0);
+                let z = round(variance * scale, SGR_MTABLE_BITS);
+                let coefficient = if z >= 255 { 256 } else if z == 0 { 1 }
+                    else { ((z << SGR_SGR_BITS) + z / 2) / (z + 1) };
+                let i = (y + 1) as usize * pitch + (x + 1) as usize;
+                a[i] = coefficient;
+                b[i] = round(((1 << SGR_SGR_BITS) - coefficient) * sum * reciprocal, SGR_RECIP_BITS);
+            }
+        }
+        filtered[pass].resize(width * height, 0i64);
+        for y in 0..height {
+            let shift = if pass == 0 && y & 1 != 0 { 4 } else { 5 };
+            for x in 0..width {
+                let (mut aa, mut bb) = (0i64, 0i64);
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let weight = if pass == 0 {
+                            if (y as i32 + dy) & 1 == 0 { 0 } else if dx == 0 { 6 } else { 5 }
+                        } else if dx == 0 || dy == 0 { 4 } else { 3 };
+                        let i = (y as i32 + dy + 1) as usize * pitch + (x as i32 + dx + 1) as usize;
+                        aa += weight * a[i];
+                        bb += weight * b[i];
+                    }
+                }
+                filtered[pass][y * width + x] = round(aa * i64::from(source(x as i32, y as i32)) + bb,
+                    SGR_SGR_BITS + shift - SGR_RST_BITS);
+            }
+        }
+    }
+    let w0 = i64::from(weights[0]);
+    let w1 = i64::from(weights[1]);
+    let w2 = (1 << SGR_PRJ_BITS) - w0 - w1;
+    for y in 0..height {
+        for x in 0..width {
+            let u = i64::from(source(x as i32, y as i32)) << SGR_RST_BITS;
+            let f0 = if filtered[0].is_empty() { u } else { filtered[0][y * width + x] };
+            let f1 = if filtered[1].is_empty() { u } else { filtered[1][y * width + x] };
+            output[y * stride + x] = round(w0 * f0 + w1 * u + w2 * f1,
+                SGR_RST_BITS + SGR_PRJ_BITS).clamp(0, (1 << depth) - 1) as u16;
+        }
+    }
+}
+
 pub(crate) struct Restoration {
-    units: Vec<Vec<Option<[[i32; 3]; 2]>>>,
+    units: Vec<Vec<Option<Unit>>>,
     dimensions: Vec<(usize, usize)>,
     previous: [[[i32; 3]; 2]; 3],
+    previous_sgr: [[i32; 2]; 3],
 }
 
 impl Restoration {
     pub(crate) fn begin_tile(&mut self) {
         self.previous = [[[3, -7, 15]; 2]; 3];
+        self.previous_sgr = [[-32, 31]; 3];
     }
 
     pub(crate) fn new(s: &SequenceHeader, h: &IntraFrameHeader) -> Result<Self, Error> {
-        if h.restoration_types.iter().any(|&r| r != 0 && r != 2) {
-            return Err(Error::Unsupported("self-guided or switchable restoration"));
-        }
         let mut dimensions = Vec::new();
         let mut units = Vec::new();
         for (plane, &kind) in h.restoration_types.iter().enumerate() {
@@ -101,13 +192,14 @@ impl Restoration {
             units,
             dimensions,
             previous: [[[3, -7, 15]; 2]; 3],
+            previous_sgr: [[-32, 31]; 3],
         })
     }
 
     pub(crate) fn read(
         &mut self,
         d: &mut SymbolDecoder<'_>,
-        cdf: &mut [u16],
+        cdfs: &mut super::inter::InterCdfs,
         s: &SequenceHeader,
         h: &IntraFrameHeader,
         row: usize,
@@ -128,7 +220,27 @@ impl Restoration {
             let c1 = ((col + superblock_step) * (4 >> sx)).div_ceil(size).min(cols);
             for r in r0..r1 {
                 for c in c0..c1 {
-                    if d.read_symbol(cdf)? == 0 {
+                    let kind = match h.restoration_types[plane] {
+                        2 => usize::from(d.read_symbol(&mut cdfs.wiener)? != 0),
+                        3 => 2 * usize::from(d.read_symbol(&mut cdfs.sgrproj)? != 0),
+                        1 => d.read_symbol(&mut cdfs.restoration_type)?,
+                        _ => return Err(Error::Invalid("restoration type")),
+                    };
+                    if kind == 0 {
+                        continue;
+                    }
+                    if kind == 2 {
+                        let set = d.read_literal(4)? as usize;
+                        let mut weights = [0; 2];
+                        for pass in 0..2 {
+                            let (low, high) = if pass == 0 { (-96, 32) } else { (-32, 96) };
+                            weights[pass] = if SGR_PARAMS[set][pass * 2] != 0 {
+                                signed_subexp(d, low, high, 4, self.previous_sgr[plane][pass])?
+                            } else if pass == 0 { 0 }
+                            else { ((1 << SGR_PRJ_BITS) - self.previous_sgr[plane][0]).clamp(low, high - 1) };
+                            self.previous_sgr[plane][pass] = weights[pass];
+                        }
+                        self.units[plane][r * cols + c] = Some(Unit::SelfGuided { set, weights });
                         continue;
                     }
                     let mut coefficients = [[0; 3]; 2];
@@ -145,7 +257,7 @@ impl Restoration {
                             self.previous[plane][pass][tap] = value;
                         }
                     }
-                    self.units[plane][r * cols + c] = Some(coefficients);
+                    self.units[plane][r * cols + c] = Some(Unit::Wiener(coefficients));
                 }
             }
         }
@@ -209,7 +321,7 @@ impl Restoration {
                 let ht = (end as usize + 1 - y).min(height - y);
                 let unit_y = ((y + (8 >> sy)) / size).min(rows - 1);
                 for unit_x in 0..cols {
-                    let Some(coeff) = self.units[plane][unit_y * cols + unit_x] else {
+                    let Some(unit) = self.units[plane][unit_y * cols + unit_x] else {
                         continue;
                     };
                     let x = unit_x * size;
@@ -229,6 +341,15 @@ impl Restoration {
                             (cdef, yy)
                         };
                         p.samples[yy as usize * p.stride + xx] as i16
+                    };
+                    let coeff = match unit {
+                        Unit::Wiener(coeff) => coeff,
+                        Unit::SelfGuided { set, weights } => {
+                            self_guided(|xx, yy| source(x as i32 + xx, y as i32 + yy),
+                                w, ht, s.bit_depth, set, weights,
+                                &mut out.samples[y * out.stride + x..], out.stride);
+                            continue;
+                        }
                     };
                     let make_filter = |c: [i32; 3]| {
                         [
@@ -309,7 +430,7 @@ impl Restoration {
                     let end = start + (64 >> sy) - 1;
                     let unit_y = ((y + (8 >> sy)) / size).min(rows - 1);
                     let unit_x = (x / size).min(cols - 1);
-                    let Some(coeff) = self.units[plane][unit_y * cols + unit_x] else {
+                    let Some(unit) = self.units[plane][unit_y * cols + unit_x] else {
                         continue;
                     };
                     let source = |xx: i32, yy: i32| -> i32 {
@@ -323,6 +444,17 @@ impl Restoration {
                             (&cdef[plane], yy)
                         };
                         i32::from(p.samples[yy as usize * p.stride + xx])
+                    };
+                    let coeff = match unit {
+                        Unit::Wiener(coeff) => coeff,
+                        Unit::SelfGuided { set, weights } => {
+                            let w = (4 >> sx).min(width - x);
+                            let ht = (4 >> sy).min(height - y);
+                            self_guided(|xx, yy| source(x as i32 + xx, y as i32 + yy) as i16,
+                                w, ht, s.bit_depth, set, weights,
+                                &mut out.samples[y * out.stride + x..], out.stride);
+                            continue;
+                        }
                     };
                     let make_filter = |c: [i32; 3]| {
                         [
@@ -532,6 +664,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn self_guided_stripes_match_small_blocks_for_every_parameter_set() {
+        for depth in [8u8, 10, 12] {
+            let max = (1 << depth) - 1;
+            for set in 0..16 {
+                for weights in [[-96, -32], [-32, 31], [31, 95]] {
+                    let (width, height) = (19usize, 18usize);
+                    let source = |x: i32, y: i32| {
+                        let x = x.clamp(0, width as i32 - 1);
+                        let y = y.clamp(0, height as i32 - 1);
+                        ((x * 73 + y * 97 + 31) & max) as i16
+                    };
+                    let mut actual = vec![0; width * height];
+                    self_guided(source, width, height, depth, set, weights, &mut actual, width);
+                    let mut reference = vec![0; width * height];
+                    for y in (0..height).step_by(4) {
+                        for x in (0..width).step_by(4) {
+                            self_guided(|xx, yy| source(x as i32 + xx, y as i32 + yy),
+                                4.min(width - x), 4.min(height - y), depth, set, weights,
+                                &mut reference[y * width + x..], width);
+                        }
+                    }
+                    assert_eq!(actual, reference, "depth={depth} set={set} weights={weights:?}");
+                    for value in [0, 1, max / 2, max] {
+                        let mut uniform = vec![0; width * height];
+                        self_guided(|_, _| value as i16, width, height, depth, set, weights,
+                            &mut uniform, width);
+                        // The normative reciprocal and high-depth rounding can
+                        // move a uniform signal by one LSB; do not assume ideal DC gain.
+                        let precision_round = |v: i64, bits: u32| {
+                            if bits == 0 { v } else { (v + (1 << (bits - 1))) >> bits }
+                        };
+                        let mut f = [i64::from(value) << 4; 2];
+                        for pass in 0..2 {
+                            let radius = SGR_PARAMS[set][pass * 2];
+                            if radius == 0 { continue; }
+                            let n = i64::from((radius * 2 + 1).pow(2));
+                            let sum = n * i64::from(value);
+                            let squares = precision_round(n * i64::from(value).pow(2),
+                                2 * u32::from(depth - 8));
+                            let mean = precision_round(sum, u32::from(depth - 8));
+                            let n2e = n * n * i64::from(SGR_PARAMS[set][pass * 2 + 1]);
+                            let scale = ((1 << 20) + n2e / 2) / n2e;
+                            let z = precision_round((squares * n - mean * mean).max(0) * scale, 20);
+                            let a = if z >= 255 { 256 } else if z == 0 { 1 }
+                                else { (z * 256 + z / 2) / (z + 1) };
+                            let reciprocal = ((1 << 12) + n / 2) / n;
+                            let b = precision_round((256 - a) * sum * reciprocal, 12);
+                            f[pass] = precision_round(a * i64::from(value) + b, 4);
+                        }
+                        let w0 = i64::from(weights[0]);
+                        let w1 = i64::from(weights[1]);
+                        let expected = precision_round(w0 * f[0] + w1 * (i64::from(value) << 4)
+                            + (128 - w0 - w1) * f[1], 11).clamp(0, i64::from(max)) as u16;
+                        assert!(uniform.iter().all(|&sample| sample == expected),
+                            "rounded DC depth={depth} set={set} value={value}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stripe_scalar_and_neon_match_original_at_unit_edges() {
         let bytes = [
             0x12, 0x00, 0x0a, 0x0b, 0x02, 0x00, 0x00, 0x05, 0x15, 0x7f, 0xfc, 0x4a, 0xf9, 0x00,
@@ -582,7 +776,7 @@ mod tests {
                                         axis[0] = 0;
                                     }
                                 }
-                                *unit = Some(coeff);
+                                *unit = Some(Unit::Wiener(coeff));
                             }
                         }
                         let mut make_planes = || {
@@ -634,6 +828,7 @@ mod tests {
             units: vec![vec![None]],
             dimensions: vec![(1, 1)],
             previous: [[[3, -7, 15]; 2]; 3],
+            previous_sgr: [[-32, 31]; 3],
         };
         assert!(!filter.has_filter());
     }

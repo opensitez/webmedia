@@ -23,6 +23,8 @@ pub struct SequenceParameters {
     pub level_idc: u8,
     pub width: u32,
     pub height: u32,
+    pub crop_left: u32,
+    pub crop_top: u32,
     pub chroma_format_idc: u32,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
@@ -989,6 +991,8 @@ pub fn parse_sps(nal: &[u8]) -> Result<SequenceParameters, AvcError> {
         level_idc,
         width,
         height,
+        crop_left: crop[0].checked_mul(sub_x).ok_or(AvcError::TooLarge)?,
+        crop_top: crop[2].checked_mul(sub_y * frame_height_units).ok_or(AvcError::TooLarge)?,
         chroma_format_idc,
         bit_depth_luma,
         bit_depth_chroma,
@@ -1182,11 +1186,14 @@ pub(super) fn frame_from_yuv420(
     let rgba = {
         use accelerate::video::{LumaPolicy, Plane, YuvMatrix, yuv420_to_rgba};
         let width = sps.width as usize;
+        let stride = (sps.width_mbs as usize * 16).max(width);
+        let y_offset = sps.crop_top as usize * stride + sps.crop_left as usize;
+        let uv_offset = sps.crop_top as usize / 2 * stride.div_ceil(2) + sps.crop_left as usize / 2;
         yuv420_to_rgba(
             width, sps.height as usize,
-            Plane { data: luma, stride: width },
-            Plane { data: cb, stride: width.div_ceil(2) },
-            Plane { data: cr, stride: width.div_ceil(2) },
+            Plane { data: &luma[y_offset..], stride },
+            Plane { data: &cb[uv_offset..], stride: stride.div_ceil(2) },
+            Plane { data: &cr[uv_offset..], stride: stride.div_ceil(2) },
             YuvMatrix::Bt601, LumaPolicy::Clamped,
         ).expect("decoded H.264 planes must cover the coded frame")
     };
@@ -1205,17 +1212,22 @@ pub(super) fn frame_from_yuv420(
 
 #[cfg(any(test, all(not(feature = "acceleration"), not(target_arch = "aarch64"))))]
 fn rgba_from_yuv420_scalar(sps: &SequenceParameters, luma: &[u8], cb: &[u8], cr: &[u8]) -> Vec<u8> {
-    let luma_stride = sps.width as usize;
+    let width = sps.width as usize;
+    let luma_stride = (sps.width_mbs as usize * 16).max(width);
     let chroma_stride = luma_stride / 2;
-    let mut rgba = vec![0u8; luma.len() * 4];
+    let luma = &luma[sps.crop_top as usize * luma_stride + sps.crop_left as usize..];
+    let uv_offset = sps.crop_top as usize / 2 * chroma_stride + sps.crop_left as usize / 2;
+    let cb = &cb[uv_offset..];
+    let cr = &cr[uv_offset..];
+    let mut rgba = vec![0u8; width * sps.height as usize * 4];
     for y in 0..sps.height as usize {
-        for x in 0..luma_stride {
+        for x in 0..width {
             let value = i32::from(luma[y * luma_stride + x]) - 16;
             let uv = (y / 2) * chroma_stride + x / 2;
             let u = i32::from(cb[uv]) - 128;
             let v = i32::from(cr[uv]) - 128;
             let c = value.max(0) * 298;
-            let index = (y * luma_stride + x) * 4;
+            let index = (y * width + x) * 4;
             rgba[index] = ((c + 409 * v + 128) >> 8).clamp(0, 255) as u8;
             rgba[index + 1] = ((c - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
             rgba[index + 2] = ((c + 516 * u + 128) >> 8).clamp(0, 255) as u8;
@@ -1271,7 +1283,12 @@ unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool, const PAIR_ROWS:
     unsafe {
         let width = sps.width as usize;
         let height = sps.height as usize;
-        let chroma_width = width / 2;
+        let stride = (sps.width_mbs as usize * 16).max(width);
+        let chroma_width = stride / 2;
+        let luma = &luma[sps.crop_top as usize * stride + sps.crop_left as usize..];
+        let uv_offset = sps.crop_top as usize / 2 * chroma_width + sps.crop_left as usize / 2;
+        let cb = &cb[uv_offset..];
+        let cr = &cr[uv_offset..];
         let mut rgba = vec![0u8; width * height * 4];
         for y in (0..height).step_by(if PAIR_ROWS { 2 } else { 1 }) {
             let rows = if PAIR_ROWS { (height - y).min(2) } else { 1 };
@@ -1298,7 +1315,7 @@ unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool, const PAIR_ROWS:
                 let high = chroma_terms(vget_high_s16(u8), vget_high_s16(v8));
                 for row in y..y + rows {
                     let y8 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(
-                        luma.as_ptr().add(row * width + x),
+                        luma.as_ptr().add(row * stride + x),
                     )));
                     let (r0, g0, b0) = convert_four(vget_low_s16(y8), low);
                     let (r1, g1, b1) = convert_four(vget_high_s16(y8), high);
@@ -1315,7 +1332,7 @@ unsafe fn rgba_from_yuv420_neon<const VECTOR_CHROMA_LOAD: bool, const PAIR_ROWS:
                 let u = i32::from(cb[uv]) - 128;
                 let v = i32::from(cr[uv]) - 128;
                 for row in y..y + rows {
-                    let value = i32::from(luma[row * width + x]) - 16;
+                    let value = i32::from(luma[row * stride + x]) - 16;
                     let c = value.max(0) * 298;
                     let offset = (row * width + x) * 4;
                     rgba[offset] = ((c + 409 * v + 128) >> 8).clamp(0, 255) as u8;
@@ -1353,6 +1370,8 @@ mod tests {
                 level_idc: 31,
                 width,
                 height,
+                crop_left: 0,
+                crop_top: 0,
                 chroma_format_idc: 1,
                 bit_depth_luma: 8,
                 bit_depth_chroma: 8,
@@ -1390,15 +1409,48 @@ mod tests {
             for height in [1_u32, 3, 6] {
                 sps.width = width;
                 sps.height = height;
+                sps.width_mbs = width.div_ceil(16);
                 let pixels = width as usize * height as usize;
-                let chroma = width as usize / 2 * (height as usize).div_ceil(2);
-                let y: Vec<_> = (0..pixels).map(|i| (i * 53 + 7) as u8).collect();
+                let stride = sps.width_mbs as usize * 16;
+                let chroma = stride / 2 * (height as usize).div_ceil(2);
+                let y: Vec<_> = (0..stride * height as usize).map(|i| (i * 53 + 7) as u8).collect();
                 let u: Vec<_> = (0..chroma).map(|i| (i * 37 + 3) as u8).collect();
                 let v: Vec<_> = (0..chroma).map(|i| (i * 71 + 29) as u8).collect();
                 let expected = rgba_from_yuv420_scalar(&sps, &y, &u, &v);
                 assert_eq!(frame_from_yuv420(&sps, &y, &u, &v).rgba.as_slice(), expected.as_slice(), "{width}x{height}");
+                assert_eq!(expected.len(), pixels * 4);
             }
         }
+    }
+
+    #[test]
+    fn display_crop_preserves_coded_stride_and_reference_planes() {
+        let mut sps = parse_sps(&high_720p_sps()).unwrap();
+        sps.width_mbs = 2;
+        sps.frame_height_mbs = 1;
+        sps.width = 24;
+        sps.height = 10;
+        sps.crop_left = 2;
+        sps.crop_top = 2;
+        let y: Vec<_> = (0..32 * 16).map(|i| (i * 7 + 16) as u8).collect();
+        let u: Vec<_> = (0..16 * 8).map(|i| (i * 13 + 32) as u8).collect();
+        let v: Vec<_> = (0..16 * 8).map(|i| (i * 19 + 48) as u8).collect();
+        let original = (y.clone(), u.clone(), v.clone());
+        let mut compact = sps.clone();
+        compact.crop_left = 0;
+        compact.crop_top = 0;
+        compact.width_mbs = 1;
+        let yy: Vec<_> = (2..12).flat_map(|row| y[row * 32 + 2..row * 32 + 26].iter().copied()).collect();
+        let uu: Vec<_> = (1..6).flat_map(|row| u[row * 16 + 1..row * 16 + 13].iter().copied()).collect();
+        let vv: Vec<_> = (1..6).flat_map(|row| v[row * 16 + 1..row * 16 + 13].iter().copied()).collect();
+        let expected = rgba_from_yuv420_scalar(&compact, &yy, &uu, &vv);
+        assert_eq!(rgba_from_yuv420_scalar(&sps, &y, &u, &v), expected);
+        let frame = frame_from_yuv420(&sps, &y, &u, &v);
+        assert_eq!((frame.width, frame.height), (24, 10));
+        assert_eq!(*frame.rgba, expected);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(unsafe { rgba_from_yuv420_neon::<true, true>(&sps, &y, &u, &v) }, expected);
+        assert_eq!((y, u, v), original);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1408,6 +1460,7 @@ mod tests {
     fn benchmark_shared_yuv_h264() {
         assert!(!cfg!(debug_assertions), "run with --release");
         let mut sps = SequenceParameters {
+            crop_left: 0, crop_top: 0,
             id: 0, profile_idc: 100, level_idc: 31, width: 1920, height: 1080,
             chroma_format_idc: 1, bit_depth_luma: 8, bit_depth_chroma: 8,
             scaling_matrices_present: false, width_mbs: 120, frame_height_mbs: 68,
@@ -1416,7 +1469,8 @@ mod tests {
         };
         for (width, height) in [(1920, 1080), (1918, 1078), (1280, 720)] {
             sps.width = width; sps.height = height;
-            let pixels = width as usize * height as usize;
+            sps.width_mbs = width.div_ceil(16);
+            let pixels = sps.width_mbs as usize * 16 * height as usize;
             let y: Vec<_> = (0..pixels).map(|i| (i * 53 + 7) as u8).collect();
             let u: Vec<_> = (0..pixels / 4).map(|i| (i * 37 + 3) as u8).collect();
             let v: Vec<_> = (0..pixels / 4).map(|i| (i * 71 + 29) as u8).collect();
@@ -1453,6 +1507,7 @@ mod tests {
     #[ignore = "run explicitly when measuring the native 1280x720 conversion path"]
     fn benchmark_neon_yuv_conversion() {
         let sps = SequenceParameters {
+            crop_left: 0, crop_top: 0,
             id: 0,
             profile_idc: 100,
             level_idc: 31,

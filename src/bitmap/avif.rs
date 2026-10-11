@@ -609,15 +609,18 @@ fn decode_index(index: &Index, bytes: &[u8]) -> Result<RasterImage, Error> {
             continue;
         }
         let alpha = coded_frame(index, bytes, id)?;
-        if !alpha.sequence.monochrome
-            || (alpha.header.width, alpha.header.height) != (image.width, image.height)
-        {
+        if (alpha.header.width, alpha.header.height) != (image.width, image.height) {
             return Err(Error::Invalid("alpha plane dimensions"));
         }
+        // Some legacy encoders store auxiliary alpha in a three-channel AV1
+        // item. Use its full-resolution luma plane, ignoring the chroma planes.
         let plane = alpha
             .planes
             .first()
             .ok_or(Error::Invalid("missing alpha plane"))?;
+        if plane.width != image.width as usize || plane.height != image.height as usize {
+            return Err(Error::Invalid("alpha plane dimensions"));
+        }
         let maximum = (1u32 << alpha.bit_depth) - 1;
         for y in 0..image.height as usize {
             for x in 0..image.width as usize {
@@ -625,6 +628,9 @@ fn decode_index(index: &Index, bytes: &[u8]) -> Result<RasterImage, Error> {
                     .samples
                     .get(y * plane.stride + x)
                     .ok_or(Error::Invalid("alpha storage"))? as u32;
+                if a > maximum {
+                    return Err(Error::Invalid("alpha sample range"));
+                }
                 let a = ((a * 255 + maximum / 2) / maximum) as u8;
                 let pixel = &mut image.rgba[(y * image.width as usize + x) * 4..][..4];
                 for value in &mut pixel[..3] {
@@ -763,6 +769,14 @@ pub fn decode(bytes: &[u8]) -> Result<RasterImage, Error> {
     decode_index(&find_index(bytes)?, bytes)
 }
 
+/// Primary display dimensions, including orientation, without pixel decoding.
+pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32), Error> {
+    if bytes.len() > MAX_INPUT { return Err(Error::Limit); }
+    if !is_avif(bytes) { return Err(Error::Invalid("AVIF file type")); }
+    let index = find_index(bytes)?;
+    index.display_dimensions(index.primary)
+}
+
 /// Parsed primary image coding information, without reconstructing pixels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInfo {
@@ -837,15 +851,21 @@ mod tests {
         let frame = coded_frame(&index, &bytes, index.primary).unwrap();
         if let Some(path) = std::env::var_os("WEBMEDIA_AVIF_YUV_ORACLE") {
             let expected = std::fs::read(path).unwrap();
-            assert_eq!(frame.bit_depth, 8, "oracle uses 8-bit native planar samples");
+            let sample_bytes = if frame.bit_depth > 8 { 2 } else { 1 };
             let mut offset = 0;
             for (number, plane) in frame.planes.iter().enumerate() {
                 for row in 0..plane.height {
                     let actual = &plane.samples[row * plane.stride..][..plane.width];
-                    let reference = expected.get(offset..offset + plane.width).expect("oracle length");
-                    let mismatch = actual.iter().zip(reference).position(|(&a, &b)| a != u16::from(b));
-                    assert_eq!(mismatch, None, "native plane {number}, row {row}");
-                    offset += plane.width;
+                    let reference = expected.get(offset..offset + plane.width * sample_bytes).expect("oracle length");
+                    let mismatch = actual.iter().zip(reference.chunks_exact(sample_bytes)).position(|(&a, b)| {
+                        let b = if sample_bytes == 1 { u16::from(b[0]) }
+                            else { u16::from_le_bytes([b[0], b[1]]) };
+                        a != b
+                    });
+                    assert_eq!(mismatch, None, "native plane {number}, row {row}: {:?}",
+                        mismatch.map(|col| (actual[col],
+                            &reference[col * sample_bytes..(col + 1) * sample_bytes])));
+                    offset += plane.width * sample_bytes;
                 }
             }
             assert_eq!(offset, expected.len());

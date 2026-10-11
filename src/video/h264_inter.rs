@@ -745,10 +745,11 @@ pub fn decode_cabac_p_2005(
         || !sps.frame_mbs_only
         || sps.scaling_matrices_present
         || pps.scaling_matrices_present
-        || sps.width != sps.width_mbs * 16
+        || sps.width == 0
+        || sps.width + sps.crop_left > sps.width_mbs * 16
         || sps.height == 0
-        || sps.height > sps.frame_height_mbs * 16
-        || reference.width != sps.width as usize
+        || sps.height + sps.crop_top > sps.frame_height_mbs * 16
+        || reference.width != (sps.width_mbs * 16) as usize
         || reference.height != (sps.frame_height_mbs * 16) as usize
     {
         return Err(AvcError::Unsupported("P picture format"));
@@ -1900,9 +1901,10 @@ pub fn decode_cabac_b_2005(
         || !sps.frame_mbs_only
         || sps.scaling_matrices_present
         || pps.scaling_matrices_present
-        || sps.width != sps.width_mbs * 16
+        || sps.width == 0
+        || sps.width + sps.crop_left > sps.width_mbs * 16
         || sps.height == 0
-        || sps.height > sps.frame_height_mbs * 16
+        || sps.height + sps.crop_top > sps.frame_height_mbs * 16
         || pps.core.weighted_bipred_idc == 1
     {
         return Err(AvcError::Unsupported("B picture format"));
@@ -1954,7 +1956,7 @@ pub fn decode_cabac_b_2005(
         return Err(AvcError::Unsupported("B reference list length"));
     }
     if references.iter().any(|picture| {
-        picture.width != sps.width as usize
+        picture.width != (sps.width_mbs * 16) as usize
             || picture.height != (sps.frame_height_mbs * 16) as usize
     }) {
         return Err(AvcError::Unsupported("B reference dimensions"));
@@ -1962,7 +1964,7 @@ pub fn decode_cabac_b_2005(
     let width_mbs = sps.width_mbs as usize;
     let height_mbs = sps.frame_height_mbs as usize;
     let mut picture = Yuv420Picture {
-        width: sps.width as usize,
+        width: (sps.width_mbs * 16) as usize,
         height: (sps.frame_height_mbs * 16) as usize,
         frame_num: slice.frame_num,
         pic_order_cnt_lsb: slice.pic_order_cnt_lsb,
