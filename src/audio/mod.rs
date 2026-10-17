@@ -5,6 +5,7 @@
 pub mod aac;
 pub mod mp4;
 pub mod opus;
+pub mod pcm;
 pub mod transform;
 pub mod vorbis;
 pub mod wav;

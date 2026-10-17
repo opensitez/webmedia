@@ -629,17 +629,27 @@ impl MusicPacketDecoder {
         self.failed = true;
         let packet = Packet::parse(data)?;
         if packet.configuration != 31
-            || packet.frames.len() != 1
             || packet.stereo != (self.channels == 2)
         {
             return Err(MediaDecodeError::Unsupported);
         }
+        let mut samples = Vec::with_capacity(packet.samples_48khz() * self.channels);
+        for frame_index in 0..packet.frames.len() {
+            self.decode_frame(&packet, frame_index, &mut samples)?;
+        }
+        self.failed = false;
+        Ok(AudioSamples { sample_rate: 48000, channels: self.channels as u16, samples })
+    }
+
+    fn decode_frame(&mut self, packet: &Packet<'_>, frame_index: usize, samples: &mut Vec<f32>)
+        -> Result<(), MediaDecodeError>
+    {
         let layout = packet.celt_layout()?.ok_or(MediaDecodeError::Unsupported)?;
         let shape = &mut self.shape;
         for channel in shape.iter_mut() {
             channel.fill(0.0);
         }
-        let pcm = if packet.frames[0] == [0xff, 0xfe] {
+        let pcm = if packet.frames[frame_index] == [0xff, 0xfe] {
             self.history.fill(-28.0);
             let normalized = [shape[0].as_slice(), shape.get(1).map_or(&[], Vec::as_slice)];
             self.synthesis.synthesize(
@@ -652,7 +662,7 @@ impl MusicPacketDecoder {
                 None,
             )?
         } else {
-            let mut frame = FrameStart::parse(&packet, 0)?;
+            let mut frame = FrameStart::parse(packet, frame_index)?;
             let mut start = frame.start_shapes(&self.history)?;
             let blocks = if frame.transient { 8 } else { 1 };
             let norm = &mut self.norm;
@@ -822,17 +832,13 @@ impl MusicPacketDecoder {
             self.uniform_errors += frame.entropy.uniform_errors();
             pcm
         };
-        self.failed = false;
-        Ok(AudioSamples {
-            sample_rate: 48000,
-            channels: self.channels as u16,
-            samples: pcm
+        samples.extend(pcm
                 .into_iter()
                 // The shared spectral synthesis carries a 1/2 IMDCT factor.
                 // Restore the packet convention, then RFC Appendix A SCALEOUT.
                 .map(|sample| (sample * 2.0 * self.output_gain / 32768.0) as f32)
-                .collect(),
-        })
+                );
+        Ok(())
     }
 
     pub fn uniform_errors(&self) -> u32 {
@@ -843,6 +849,31 @@ impl MusicPacketDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multiframe_music_packets_preserve_sequential_synthesis_and_bounds() {
+        let header = IdentificationHeader::parse(
+            b"OpusHead\x01\x02\x00\x00\x80\xbb\x00\x00\x00\x00\x00",
+        ).unwrap();
+        let single = [0xfc, 0xff, 0xfe];
+        for packet in [
+            vec![0xfd,0xff,0xfe,0xff,0xfe],
+            vec![0xfe,2,0xff,0xfe,0xff,0xfe],
+            vec![0xff,2,0xff,0xfe,0xff,0xfe],
+            vec![0xff,0xc2,2,2,0xff,0xfe,0xff,0xfe,0,0],
+            [vec![0xff,6], vec![0xff,0xfe].repeat(6)].concat(),
+        ] {
+            let frames = Packet::parse(&packet).unwrap().frames.len();
+            let mut grouped = MusicPacketDecoder::new(&header).unwrap();
+            let mut separate = MusicPacketDecoder::new(&header).unwrap();
+            let actual = grouped.decode_packet(&packet).unwrap();
+            let expected: Vec<_> = (0..frames).flat_map(|_| separate.decode_packet(&single).unwrap().samples).collect();
+            assert_eq!(actual.samples,expected);
+            assert_eq!(actual.samples.len(),frames*960*2);
+            assert_eq!(grouped.decode_packet(&single).unwrap(), separate.decode_packet(&single).unwrap());
+        }
+        let mut decoder = MusicPacketDecoder::new(&header).unwrap();
+        assert!(decoder.decode_packet(&[0xff,7]).is_err(), "packets cannot exceed 120ms");
+    }
     #[test]
     fn pulse_selection_preserves_duplicate_cost_boundaries() {
         let menus = menus().unwrap();

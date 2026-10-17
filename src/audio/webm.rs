@@ -6,6 +6,9 @@ use crate::video::backend::{AudioSamples, MediaDecodeError};
 pub enum WebmAudioCodec {
     Opus,
     Vorbis,
+    PcmLittleEndian,
+    PcmBigEndian,
+    PcmFloat,
 }
 
 impl WebmAudioCodec {
@@ -13,6 +16,9 @@ impl WebmAudioCodec {
         match id {
             b"A_OPUS" => Some(Self::Opus),
             b"A_VORBIS" => Some(Self::Vorbis),
+            b"A_PCM/INT/LIT" => Some(Self::PcmLittleEndian),
+            b"A_PCM/INT/BIG" => Some(Self::PcmBigEndian),
+            b"A_PCM/FLOAT/IEEE" => Some(Self::PcmFloat),
             _ => None,
         }
     }
@@ -25,6 +31,7 @@ pub struct WebmAudioTrack {
     /// Container sampling frequency, not necessarily the decoder output rate.
     pub sampling_frequency: f64,
     pub channels: u16,
+    pub bit_depth: Option<u16>,
     pub codec_private: Vec<u8>,
     pub codec_delay_ns: u64,
     pub seek_pre_roll_ns: u64,

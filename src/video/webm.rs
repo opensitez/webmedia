@@ -31,6 +31,7 @@ const CODEC_ID: u32 = 0x86;
 const CODEC_PRIVATE: u32 = 0x63a2;
 const SAMPLING_FREQUENCY: u32 = 0xb5;
 const CHANNELS: u32 = 0x9f;
+const BIT_DEPTH: u32 = 0x6264;
 const CODEC_DELAY: u32 = 0x56aa;
 const SEEK_PRE_ROLL: u32 = 0x56bb;
 const DEFAULT_DURATION: u32 = 0x23e383;
@@ -62,6 +63,7 @@ struct Track {
     codec_private: Vec<u8>,
     sampling_frequency: Option<f64>,
     channels: Option<u16>,
+    bit_depth: Option<u16>,
     codec_delay_ns: u64,
     seek_pre_roll_ns: u64,
     default_duration_ns: Option<u64>,
@@ -491,6 +493,7 @@ impl WebmStream {
                     id,
                     SAMPLING_FREQUENCY
                         | CHANNELS
+                        | BIT_DEPTH
                         | CODEC_DELAY
                         | SEEK_PRE_ROLL
                         | DEFAULT_DURATION
@@ -511,7 +514,7 @@ impl WebmStream {
             let payload = &input[header_len..header_len + len];
             match id {
                 DOC_TYPE => {
-                    if payload != b"webm" {
+                    if payload != b"webm" && payload != b"matroska" {
                         return Err(MediaDecodeError::Unsupported);
                     }
                     self.doc_type = Some(payload.to_vec());
@@ -560,6 +563,12 @@ impl WebmStream {
                     if let Some(track) = &mut self.track {
                         track.sampling_frequency = Some(rate);
                     }
+                }
+                BIT_DEPTH => {
+                    let bits = u16::try_from(unsigned(payload)?)
+                        .ok().filter(|bits| *bits != 0)
+                        .ok_or_else(|| invalid("invalid PCM bit depth"))?;
+                    if let Some(track) = &mut self.track { track.bit_depth = Some(bits); }
                 }
                 CHANNELS => {
                     let channels = u16::try_from(unsigned(payload)?)
@@ -687,6 +696,7 @@ impl WebmStream {
                         codec,
                         sampling_frequency: track.sampling_frequency.unwrap_or(8000.0),
                         channels: track.channels.unwrap_or(1),
+                        bit_depth: track.bit_depth,
                         codec_private: track.codec_private,
                         codec_delay_ns: track.codec_delay_ns,
                         seek_pre_roll_ns: track.seek_pre_roll_ns,
@@ -2535,6 +2545,7 @@ mod tests {
             match codec {
                 WebmAudioCodec::Opus => b"A_OPUS" as &[u8],
                 WebmAudioCodec::Vorbis => b"A_VORBIS",
+                _ => unreachable!("compressed audio fixture"),
             },
         ));
         track.extend(element(&[0x63, 0xa2], b"codec configuration"));
@@ -2772,6 +2783,7 @@ mod tests {
                     books.len()
                 );
             }
+            _ => panic!("compressed audio audit requires Opus or Vorbis"),
         }
         if let Ok(expected) = std::env::var("WEBMEDIA_AUDIO_EXPECTED_PACKETS") {
             assert_eq!(packets, expected.parse::<usize>().unwrap());

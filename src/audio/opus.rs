@@ -1,9 +1,9 @@
 //! Opus stream identification (RFC 7845 section 5.1) and packet framing
 //! (RFC 6716 section 3), entropy and CELT spectral synthesis stages.
 //! `music::MusicPacketDecoder` reconstructs music and silence for mapping-family
-//! zero, matching mono/stereo, single-frame configuration-31 packets (fullband
+//! zero, matching mono/stereo, configuration-31 packets (fullband
 //! CELT, 20 ms at 48 kHz). Whole-track stereo Partyfire PCM is oracle-verified.
-//! Other configurations, multi-frame packets, SILK/hybrid, and multistream
+//! All packet framing codes retain sequential frame synthesis. Other configurations, SILK/hybrid, and multistream
 //! decoding remain unsupported. Container trimming is the caller's responsibility.
 
 use crate::video::backend::MediaDecodeError;

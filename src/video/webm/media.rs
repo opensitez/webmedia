@@ -1,5 +1,8 @@
 //! One shared WebM demuxer feeding independent audio and video codec states.
 
+#[cfg(test)]
+mod pcm_tests;
+
 use super::{CodecDecoder, PendingPacket, WebmPacket, WebmStream, decode_video_packet};
 use crate::audio::{
     opus, vorbis,
@@ -28,6 +31,7 @@ struct AudioPacketPlan {
 
 enum AudioState {
     New,
+    Pcm { format: crate::audio::pcm::Format, delay_ns: u64 },
     Vorbis {
         decoder: vorbis::decoder::Decoder,
         delay_ns: u64,
@@ -88,6 +92,22 @@ impl WebmMediaDecoder {
 
     fn initialize_audio(track: &WebmAudioTrack) -> Result<AudioState, MediaDecodeError> {
         match track.codec {
+            WebmAudioCodec::PcmLittleEndian | WebmAudioCodec::PcmBigEndian | WebmAudioCodec::PcmFloat => {
+                use crate::audio::pcm::{Encoding, Format};
+                let bits = track.bit_depth.ok_or_else(||
+                    MediaDecodeError::InvalidData("missing PCM BitDepth".into()))?;
+                if track.sampling_frequency.fract() != 0.0 {
+                    return Err(MediaDecodeError::Unsupported);
+                }
+                let encoding = match track.codec {
+                    WebmAudioCodec::PcmFloat => Encoding::FloatLittleEndian,
+                    _ if bits == 8 => Encoding::Unsigned,
+                    WebmAudioCodec::PcmLittleEndian => Encoding::SignedLittleEndian,
+                    _ => Encoding::SignedBigEndian,
+                };
+                Ok(AudioState::Pcm { format: Format::new(encoding,bits,track.channels,
+                    track.sampling_frequency as u32)?, delay_ns: track.codec_delay_ns })
+            }
             WebmAudioCodec::Vorbis => {
                 let headers = vorbis::Headers::from_webm(&track.codec_private)?;
                 if u16::from(headers.identification.channels) != track.channels
@@ -128,6 +148,7 @@ impl WebmMediaDecoder {
             })?)?;
         }
         let (delay_ns, sample_rate) = match &self.audio {
+            AudioState::Pcm { format, delay_ns } => (*delay_ns, format.sample_rate()),
             AudioState::Vorbis { delay_ns, sample_rate, .. } => (*delay_ns, *sample_rate),
             AudioState::Opus { delay_ns, .. } => (*delay_ns, 48_000),
             _ => return Ok((None, true)),
@@ -144,6 +165,10 @@ impl WebmMediaDecoder {
             plan.reserve(pending.block.packets.len());
             for packet in &pending.block.packets {
                 let (duration, output) = match &self.audio {
+                    AudioState::Pcm { format, .. } => {
+                        let duration = format.frames(packet)?;
+                        (duration, duration)
+                    }
                     AudioState::Vorbis { decoder, .. } => {
                         let window = decoder.packet_window_frames(packet)?;
                         let duration = window.map_or(0, |window| {
@@ -194,6 +219,7 @@ impl WebmMediaDecoder {
         };
         let plan = &pending.plan.as_ref().unwrap()[pending.next_packet];
         let samples = match &mut self.audio {
+            AudioState::Pcm { format, .. } => Some(format.decode(packet)?),
             AudioState::Vorbis { decoder, .. } => decoder.decode(packet)?,
             AudioState::Opus { decoder, .. } => Some(decoder.decode_packet(packet)?),
             _ => unreachable!(),

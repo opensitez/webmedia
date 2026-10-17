@@ -348,33 +348,14 @@ fn parse_format(bytes: &[u8]) -> Result<Format, MediaDecodeError> {
 }
 
 fn decode(bytes: &[u8], format: Format) -> Result<AudioSamples, MediaDecodeError> {
-    let width = usize::from(format.bits / 8);
-    let mut samples = Vec::with_capacity(bytes.len() / width);
-    for sample in bytes.chunks_exact(width) {
-        let value = match (format.tag, format.bits) {
-            (1, 8) => (f32::from(sample[0]) - 128.0) / 128.0,
-            (1, 16) => f32::from(i16::from_le_bytes(sample.try_into().unwrap())) / 32768.0,
-            (1, 24) => {
-                let signed = i32::from_le_bytes([0, sample[0], sample[1], sample[2]]) >> 8;
-                signed as f32 / 8388608.0
-            }
-            (1, 32) => i32::from_le_bytes(sample.try_into().unwrap()) as f32 / 2147483648.0,
-            (3, 32) => {
-                let value = f32::from_le_bytes(sample.try_into().unwrap());
-                if !value.is_finite() {
-                    return Err(invalid("nonfinite WAVE float sample"));
-                }
-                value.clamp(-1.0, 1.0)
-            }
-            _ => return Err(MediaDecodeError::Unsupported),
-        };
-        samples.push(value);
-    }
-    Ok(AudioSamples {
-        sample_rate: format.rate,
-        channels: format.channels,
-        samples,
-    })
+    use super::pcm::{Encoding, Format as PcmFormat};
+    let encoding = match (format.tag, format.bits) {
+        (1,8) => Encoding::Unsigned,
+        (1,_) => Encoding::SignedLittleEndian,
+        (3,_) => Encoding::FloatLittleEndian,
+        _ => return Err(MediaDecodeError::Unsupported),
+    };
+    PcmFormat::new(encoding, format.bits, format.channels, format.rate)?.decode(bytes)
 }
 
 #[cfg(test)]
