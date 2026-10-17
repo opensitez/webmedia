@@ -19,7 +19,7 @@ font = ["dep:brotli", "dep:flate2", "dep:url"]
 audio-symphonia = ["video", "dep:symphonia"]
 
 [dependencies]
-accelerate = { version = "0.1.0", path = "../accelerate", optional = true }
+accelerate = { version = "0.2.0", path = "../accelerate", optional = true }
 jxl = { version = "0.7.4", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"], optional = true }
 brotli = { version = "8", optional = true }
